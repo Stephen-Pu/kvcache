@@ -115,7 +115,11 @@ typedef struct __attribute__((packed, aligned(8))) {
     uint64_t  dst_iova;         /* FETCH destination (NIXL-registered)      */
 } ShmemSqEntry;
 
+#ifdef __cplusplus
+static_assert (sizeof(ShmemSqEntry) == 128, "ShmemSqEntry must be 128 bytes");
+#else
 _Static_assert(sizeof(ShmemSqEntry) == 128, "ShmemSqEntry must be 128 bytes");
+#endif
 
 /* ------------------------------------------------------------------------- */
 /* Completion Queue entry — 64 bytes                                         */
@@ -135,7 +139,11 @@ typedef struct __attribute__((packed, aligned(8))) {
     uint64_t  pad0;
 } ShmemCqEntry;
 
-_Static_assert(sizeof(ShmemCqEntry) == 64, "ShmemCqEntry must be 64 bytes");
+#ifdef __cplusplus
+static_assert (sizeof(ShmemCqEntry) == 64,  "ShmemCqEntry must be 64 bytes");
+#else
+_Static_assert(sizeof(ShmemCqEntry) == 64,  "ShmemCqEntry must be 64 bytes");
+#endif
 
 /* ------------------------------------------------------------------------- */
 /* Flags                                                                     */

@@ -84,8 +84,15 @@ typedef struct {
     uint32_t  flags;
 } kv_locator_t;
 
+/* Portable static assertion: `_Static_assert` is C11, `static_assert` is
+ * C++11. Use the right one based on language. */
+#ifdef __cplusplus
+static_assert(sizeof(kv_locator_t) == KV_LOCATOR_SIZE,
+              "kv_locator_t must be exactly 64 bytes (LLD §2.1)");
+#else
 _Static_assert(sizeof(kv_locator_t) == KV_LOCATOR_SIZE,
                "kv_locator_t must be exactly 64 bytes (LLD §2.1)");
+#endif
 
 /* ------------------------------------------------------------------------- */
 /* Events — surfaced via kv_subscribe_events (LLD §2.2 KV Event schema).     */
