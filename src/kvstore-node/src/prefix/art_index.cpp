@@ -5,6 +5,7 @@
 #include "prefix/art_index.h"
 
 #include <cstring>
+#include <mutex>  // std::unique_lock — not transitively included by <shared_mutex>
 
 namespace kvcache::node::prefix {
 
