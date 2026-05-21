@@ -38,6 +38,12 @@ class HeadlessNode {
         std::string rocksdb_path;
         // NIXL backend selection. "loopback" is the unit-test / demo default.
         std::string nixl_backend = "loopback";
+        // Optional ART snapshot file. If set and the file exists at Init
+        // time, the in-memory ART is restored from it — faster than the
+        // RocksDB sealed-chunks scan. If the file is missing or invalid,
+        // Init falls back to a fresh empty ART (and logs to err). If the
+        // path is empty, no snapshot work happens.
+        std::string art_snapshot_path;
     };
 
     static HeadlessNode* GetOrCreate(const Options& opts, std::string* err);
@@ -64,6 +70,11 @@ class HeadlessNode {
     int Wait(kv_completion_t cid, uint32_t timeout_ms);
     int Seal(kv_handle_t handle, const uint32_t* tokens, std::size_t n_tokens);
     int Release(kv_handle_t handle);
+
+    // Persist the in-memory ART to `path` (atomic write-temp + rename).
+    // Caller-driven — typical use is on graceful drain, or on a periodic
+    // checkpoint timer. Returns true on success; sets *err otherwise.
+    bool WriteArtSnapshot(const std::string& path, std::string* err);
 
    private:
     HeadlessNode() = default;

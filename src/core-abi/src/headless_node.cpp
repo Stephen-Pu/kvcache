@@ -1,9 +1,12 @@
 // HeadlessNode — in-process backend for the Core ABI.
 #include "headless_node.h"
 
+#include <sys/stat.h>
+
 #include <cstring>
 
 #include "kvcache/kv_errors.h"
+#include "prefix/art_snapshot.h"
 
 namespace kvcache::abi {
 
@@ -63,7 +66,26 @@ bool HeadlessNode::Init(const Options& opts, std::string* err) {
     bo.start_sweeper = true;
     buffers_ = std::make_unique<node::ingest::MutableBufferPool>(tm_.get(), bo);
     wm_      = std::make_unique<node::ingest::WatermarkTracker>();
-    art_     = std::make_unique<node::prefix::ArtIndex>();
+
+    // Try the snapshot path first; fall back to a fresh ART on any failure.
+    // The fall-back is intentional — a stale/corrupt snapshot must never
+    // block boot, because RocksDB still holds the authoritative seal log
+    // (LLD §7.3 crash recovery). The legacy RocksDB rebuild path can be
+    // re-introduced here later as the second fall-back; for Phase D-1 the
+    // contract is "fast restore if a clean snapshot is on disk, otherwise
+    // start empty and let the warm-up window rebuild lazily".
+    if (!opts.art_snapshot_path.empty()) {
+        struct ::stat st{};
+        if (::stat(opts.art_snapshot_path.c_str(), &st) == 0) {
+            std::string snap_err;
+            auto restored = node::prefix::ArtSnapshot::Read(
+                opts.art_snapshot_path, nullptr, &snap_err);
+            if (restored) {
+                art_ = std::move(restored);
+            }
+        }
+    }
+    if (!art_) art_ = std::make_unique<node::prefix::ArtIndex>();
     events_  = std::make_unique<node::prefix::EventStream>();
 
     node::transport::BackendOptions bo2;
@@ -302,6 +324,14 @@ int HeadlessNode::Release(kv_handle_t handle) {
         st.leaf->refcount.Release();
     }
     return KV_OK;
+}
+
+bool HeadlessNode::WriteArtSnapshot(const std::string& path, std::string* err) {
+    if (!art_) {
+        if (err) *err = "ART not initialised";
+        return false;
+    }
+    return node::prefix::ArtSnapshot::Write(*art_, path, nullptr, err);
 }
 
 }  // namespace kvcache::abi

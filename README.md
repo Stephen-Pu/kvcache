@@ -154,13 +154,13 @@ sudo apt-get install cmake ninja-build g++ python3-venv golang-1.22
 python3 -m venv .venv && source .venv/bin/activate
 pip install cffi pytest
 
-make all      # zero warnings, 136/136 tests pass, ~4 minutes cold start
+make all      # zero warnings, 143/143 tests pass, ~4 minutes cold start
 ```
 
 Expected end of `make all`:
 
 ```
-100% tests passed, 0 tests failed out of 136
+100% tests passed, 0 tests failed out of 143
 ...
 src/adapters/vllm/tests/test_e2e_demo.py::test_prefix_reuse_across_two_requests PASSED
 src/adapters/vllm/tests/test_e2e_demo.py::test_lookup_miss_returns_none PASSED
@@ -198,8 +198,9 @@ LLD section it implements.
 
 **Working end-to-end** (run `make all` to verify):
 
-- 12 subsystems, 29 gtest binaries, **136 unit tests** (including
-  multi-thread ART stress and cross-instance TCP Pull)
+- 12 subsystems, 30 gtest binaries, **143 unit tests** (including
+  multi-thread ART stress, cross-instance TCP Pull, and persistent ART
+  round-trip)
 - In-process headless backend — the Python demo runs the **full LPM →
   fetch → tier promotion → seal → cross-request reuse** flow
 - **Real BLAKE3** (BLAKE3-team reference C library, vendored via
@@ -217,6 +218,14 @@ LLD section it implements.
   `INixlBackend` distributed surface (`ExportMr` + `ImportRemoteMr` +
   remote `Pull`); UCX/RDMA backends in Phase C-2 must pass the same
   contract tests.
+- **Persistent ART** — whole-tree snapshot to disk with BLAKE3-256
+  body integrity (atomic write-temp + fsync + rename). Boot path tries
+  the snapshot first; on missing / corrupt file it falls back to a
+  fresh empty ART so a bad checkpoint never blocks startup. Exposed via
+  `ArtSnapshot::Write` / `Read` and through `HeadlessNode::Options::
+  art_snapshot_path` for the in-process backend. Replaces the legacy
+  "scan sealed_chunks CF and re-Insert every leaf" boot rebuild
+  (LLD §7.3); RocksDB stays as the authoritative seal log.
 - Real etcd integration (embedded etcd v3.5 in Go tests; via
   `IEtcdClient` abstraction in C++)
 - Real Helm chart that renders a deployable K8s manifest
@@ -247,7 +256,9 @@ end-to-end; production hardening is the next phase.
 **Phase 2** (next 6–12 months):
 
 - SPDK NVMe-oF for cross-node direct access
-- Persistent ART (replace RocksDB rebuild on boot)
+- Persistent ART **D-2**: WAL of sealed/unsealed events between
+  snapshots, mmap-backed node arena, copy-on-write (Phase D-1 ships
+  full-tree snapshot/restore only)
 - OpenTelemetry tracing
 - AWS EFA / Azure InfiniBand / GCP TCPx certification
 - NVIDIA Dynamo / LMDeploy / TGI / DeepSpeed-MII adapters

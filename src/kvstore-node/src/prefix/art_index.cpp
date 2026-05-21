@@ -8,54 +8,12 @@
 //     The caller's EpochGuard (see ReaderGuard) pins reclamation for the
 //     pointers it returns.
 #include "prefix/art_index.h"
+#include "prefix/art_index_internal.h"
 
 #include <cstring>
 #include <utility>
 
 namespace kvcache::node::prefix {
-
-// ---------------------------------------------------------------------------
-// Internal node types
-// ---------------------------------------------------------------------------
-
-enum class ArtNodeTag : uint8_t { Inner256 = 0, Leaf = 1 };
-
-struct ArtNode {
-    ArtNodeTag tag;
-
-    // Edge label = the 7 trailing bytes of the ChunkHash that selected this
-    // node from its parent. (The first byte is the slot index in the parent.)
-    std::array<uint8_t, 7> edge_tail{};
-    bool                   edge_tail_valid = false;
-
-    explicit ArtNode(ArtNodeTag t) : tag(t) {}
-    virtual ~ArtNode() = default;
-};
-
-struct ArtInner256 : ArtNode {
-    // Child pointers are atomic so readers can walk them without locking.
-    // Each pointer is either nullptr, an ArtInner256*, or an ArtLeaf*.
-    // Writers own these atoms (under writer_mu_) and publish via release.
-    std::array<std::atomic<ArtNode*>, 256> children{};
-
-    ArtInner256() : ArtNode(ArtNodeTag::Inner256) {
-        for (auto& c : children) c.store(nullptr, std::memory_order_relaxed);
-    }
-
-    // Destructor: walks children and frees the tree. Only safe when no
-    // readers remain (called from ArtIndex destructor after epoch flush).
-    ~ArtInner256() override {
-        for (auto& c : children) {
-            ArtNode* p = c.load(std::memory_order_relaxed);
-            delete p;  // nullptr OK
-        }
-    }
-};
-
-struct ArtLeaf : ArtNode {
-    std::unique_ptr<LeafData> data;
-    ArtLeaf() : ArtNode(ArtNodeTag::Leaf) {}
-};
 
 // ---------------------------------------------------------------------------
 // Helpers

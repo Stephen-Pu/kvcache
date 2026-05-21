@@ -147,6 +147,11 @@ class ArtIndex {
     EpochManager& epoch_manager() const noexcept { return epochs_; }
 
    private:
+    // The snapshot serializer reaches into the tree directly — it walks the
+    // raw node graph under writer_mu_ and, on restore, builds a fresh tree
+    // by allocating internal node types declared in art_index_internal.h.
+    friend class ArtSnapshot;
+
     mutable std::mutex            writer_mu_;
     mutable EpochManager          epochs_;
     std::unique_ptr<ArtInner256>  root_;

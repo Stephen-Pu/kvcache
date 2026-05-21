@@ -16,6 +16,7 @@ set(NODE_CORE_SRCS
     src/prefix/lpm.cpp
     src/prefix/refcount.cpp
     src/prefix/kv_event_stream.cpp
+    src/prefix/art_snapshot.cpp
     # ingest
     src/ingest/mutable_buffer.cpp
     src/ingest/watermark.cpp

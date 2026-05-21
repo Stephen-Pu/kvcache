@@ -58,6 +58,14 @@ class Refcount {
         return v_.load(std::memory_order_acquire);
     }
 
+    // Used by snapshot restore: blow away the current count and replace
+    // it with `v`. Not safe to call while other threads hold references —
+    // restore runs against a freshly-constructed leaf that no caller has
+    // observed yet.
+    void Reset(uint32_t v) noexcept {
+        v_.store(v, std::memory_order_release);
+    }
+
     bool IsZero() const noexcept { return Load() == 0; }
 
    private:
