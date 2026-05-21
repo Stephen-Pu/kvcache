@@ -40,8 +40,19 @@ Digest256 Blake3_256(std::span<const uint8_t> data) noexcept {
     return out;
 }
 
+// Apply SplitMix64 finalizer to FNV-1a output. FNV-1a alone has poor avalanche
+// for short, similar inputs (the kind HRW feeds it: "node_id || key"), which
+// breaks the uniform-random-weight assumption. The finalizer is a known good
+// mixer (Stafford 2014) that gives us acceptable distribution for the
+// placeholder while the real BLAKE3 is being vendored.
+static inline uint64_t SplitMix64Finalize(uint64_t z) noexcept {
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+    return z ^ (z >> 31);
+}
+
 uint64_t Blake3_64(std::span<const uint8_t> data) noexcept {
-    return fnv1a(data.data(), data.size());
+    return SplitMix64Finalize(fnv1a(data.data(), data.size()));
 }
 
 Hasher::Hasher()  { std::memset(state_, 0, sizeof(state_)); }

@@ -67,9 +67,11 @@ TEST(PrioritySchedulerTest, OnCompleteFreesCredit) {
     o.total_window_bytes = 200;
     o.p0_pct = 50; o.p1_pct = 40; o.p2_pct = 10;
     PriorityScheduler s(o);
-    auto id1 = s.Submit(Priority::P0, 90, nullptr);
-    s.Submit(Priority::P0, 90, nullptr);
-    s.Submit(Priority::P0, 90, nullptr);
+    // P0 reservation = 100 bytes. Three 40-byte items: first two fit
+    // (40+40=80 ≤ 100), the third would overflow (120 > 100).
+    auto id1 = s.Submit(Priority::P0, 40, nullptr);
+    s.Submit(Priority::P0, 40, nullptr);
+    s.Submit(Priority::P0, 40, nullptr);
 
     auto a = s.TryNext();
     auto b = s.TryNext();

@@ -7,7 +7,9 @@
 syntax = "proto3";
 package kvcache.proto;
 
-import "events.proto";
+// events.proto isn't directly referenced here yet; node.proto already imports
+// it where the shared types are used. Add the import back when cp.proto
+// itself references one of those messages.
 
 option go_package = "github.com/alluxio/kvcache/control-plane/internal/pb";
 

@@ -106,7 +106,8 @@ class InMemoryEtcdClient final : public IEtcdClient {
     struct Options {
         std::chrono::milliseconds lease_sweep_interval{100};
     };
-    explicit InMemoryEtcdClient(const Options& opts = {});
+    InMemoryEtcdClient();
+    explicit InMemoryEtcdClient(const Options& opts);
     ~InMemoryEtcdClient() override;
 
     std::string Backend() const override { return "in-memory"; }

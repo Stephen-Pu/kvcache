@@ -14,6 +14,8 @@ const char* NodeStateName(NodeState s) {
     return "?";
 }
 
+MembershipFsm::MembershipFsm() : MembershipFsm(Options{}) {}
+
 MembershipFsm::MembershipFsm(const Options& opts)
     : joined_at_(std::chrono::steady_clock::now()), warmup_(opts.warmup) {}
 

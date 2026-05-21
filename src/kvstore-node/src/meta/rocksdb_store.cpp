@@ -17,6 +17,9 @@
 
 namespace kvcache::node::meta {
 
+#if defined(KVCACHE_HAVE_ROCKSDB)
+// These helpers are only referenced inside the KVCACHE_HAVE_ROCKSDB branch
+// below; gate them out of the facade build to silence -Wunused-function.
 namespace {
 
 inline std::string BeU64(uint64_t v) {
@@ -35,6 +38,7 @@ constexpr std::string_view kKeyClusterEpoch  = "cluster_epoch";
 constexpr std::string_view kKeySchemaVersion = "schema_version";
 
 }  // namespace
+#endif  // KVCACHE_HAVE_ROCKSDB
 
 // ---------------------------------------------------------------------------
 // SealedChunkKey

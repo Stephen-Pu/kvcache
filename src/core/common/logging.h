@@ -51,7 +51,9 @@ class Logger {
 
    private:
     friend Logger& Get(std::string_view);
-    void* impl_ = nullptr;  // spdlog::logger*; opaque to keep the header clean
+    // pImpl slot for the eventual spdlog::logger*. Marked maybe_unused so the
+    // placeholder build doesn't warn before the spdlog dep is vendored in.
+    [[maybe_unused]] void* impl_ = nullptr;
 };
 
 }  // namespace kvcache::log

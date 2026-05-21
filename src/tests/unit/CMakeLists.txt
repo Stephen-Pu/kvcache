@@ -1,12 +1,6 @@
-# Unit tests — gtest. Built only when KVCACHE_BUILD_TESTS is ON and gtest is
-# discoverable on the system (find_package(GTest)) or vendored.
-
-find_package(GTest QUIET)
-if(NOT GTest_FOUND)
-    message(STATUS "GTest not found; skipping tests/unit. "
-                   "Install gtest (or vendor it) to enable unit tests.")
-    return()
-endif()
+# Unit tests — gtest. The parent CMakeLists has already resolved GTest::gtest
+# (via find_package or FetchContent), so the targets are guaranteed to exist
+# by the time we get here.
 
 include(GoogleTest)
 
@@ -74,7 +68,9 @@ function(kvcache_add_test name)
         ${CMAKE_SOURCE_DIR}/include
         ${CMAKE_SOURCE_DIR}/core/common
     )
-    target_link_libraries(${name} PRIVATE kvcache_common GTest::gtest GTest::gtest_main)
+    # gtest_main already transitively depends on gtest, so listing both pulls
+    # in libgtest.a twice on macOS (ld warns "ignoring duplicate libraries").
+    target_link_libraries(${name} PRIVATE kvcache_common GTest::gtest_main)
     gtest_discover_tests(${name})
 endfunction()
 
@@ -93,10 +89,14 @@ kvcache_add_test(test_nvme_tier        tier/nvme_tier_test.cpp          ${NODE_T
 kvcache_add_test(test_cold_tier        tier/cold_tier_test.cpp          ${NODE_TIER_SRCS})
 kvcache_add_test(test_tier_manager     tier/tier_manager_test.cpp       ${NODE_TIER_SRCS})
 
+# NODE_INGEST_SRCS contains seal.cpp which depends on meta + prefix, so the
+# ingest-side tests all need meta + prefix sources to link cleanly.
 kvcache_add_test(test_mutable_buffer   ingest/mutable_buffer_test.cpp
-                 ${NODE_INGEST_SRCS} ${NODE_TIER_SRCS})
+                 ${NODE_INGEST_SRCS} ${NODE_TIER_SRCS}
+                 ${NODE_META_SRCS}   ${NODE_PREFIX_SRCS})
 kvcache_add_test(test_watermark        ingest/watermark_test.cpp
-                 ${NODE_INGEST_SRCS} ${NODE_TIER_SRCS})
+                 ${NODE_INGEST_SRCS} ${NODE_TIER_SRCS}
+                 ${NODE_META_SRCS}   ${NODE_PREFIX_SRCS})
 kvcache_add_test(test_seal             ingest/seal_test.cpp
                  ${NODE_INGEST_SRCS} ${NODE_TIER_SRCS}
                  ${NODE_META_SRCS}   ${NODE_PREFIX_SRCS})

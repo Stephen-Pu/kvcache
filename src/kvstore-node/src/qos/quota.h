@@ -45,10 +45,12 @@ enum class QuotaResult {
 class QuotaManager {
    public:
     struct Options {
-        std::chrono::seconds window{1};
+        // Use milliseconds so tests can drive a sub-second window.
+        std::chrono::milliseconds window{1000};
     };
 
-    explicit QuotaManager(const Options& opts = {});
+    QuotaManager();  // uses default Options{}
+    explicit QuotaManager(const Options& opts);
 
     void        SetLimits  (uint64_t tenant_hash, const QuotaLimits& limits);
     bool        RemoveTenant(uint64_t tenant_hash);
@@ -76,7 +78,7 @@ class QuotaManager {
 
     mutable std::mutex                                       tenants_mu_;
     std::unordered_map<uint64_t, std::unique_ptr<Counter>>   tenants_;
-    std::chrono::seconds                                     window_;
+    std::chrono::milliseconds                                window_;
 };
 
 }  // namespace kvcache::node::qos

@@ -8,6 +8,8 @@
 
 namespace kvcache::node::routing {
 
+HrwRing::HrwRing() : HrwRing(Options{}) {}
+
 HrwRing::HrwRing(const Options& opts)
     : nodes_(std::make_shared<std::vector<NodeEntry>>()),
       overlap_alpha_(opts.overlap_alpha) {}

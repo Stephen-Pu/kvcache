@@ -121,7 +121,8 @@ class DramTier {
 
     uint64_t capacity_bytes_   = 0;
     uint64_t a1in_capacity_    = 0;  // 25% of total
-    uint64_t am_capacity_      = 0;  // 75% of total
+    // Note: Am capacity is implied by (capacity_bytes_ - a1in_bytes_used_)
+    // in EvictToFit; an explicit am_capacity_ field would be redundant.
     uint32_t a1out_max_        = 0;
 
     uint64_t a1in_bytes_used_  = 0;

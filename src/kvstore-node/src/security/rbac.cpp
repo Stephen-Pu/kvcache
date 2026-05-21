@@ -20,6 +20,7 @@ const char* ActionName(Action a) {
     return "?";
 }
 
+Rbac::Rbac() : Rbac(Options{}) {}
 Rbac::Rbac(const Options& opts) : ttl_(opts.cache_ttl) {}
 
 Decision Rbac::Evaluate(const Identity& peer, Action a, uint64_t target_tenant,

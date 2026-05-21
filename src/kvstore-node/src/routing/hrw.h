@@ -53,7 +53,8 @@ class HrwRing {
         double overlap_alpha = 0.2;
     };
 
-    explicit HrwRing(const Options& opts = {});
+    HrwRing();
+    explicit HrwRing(const Options& opts);
 
     // Replace the current node set (copy-on-write). Thread-safe.
     void SetNodes(std::vector<NodeEntry> nodes);

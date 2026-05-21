@@ -1,5 +1,6 @@
 // Shared hashing utilities (BLAKE3-128, FNV-1a placeholders).
 // TODO(stephen): integrate the BLAKE3 reference implementation.
+#include <cstddef>  // std::size_t — not transitively provided by libc++
 #include <cstdint>
 
 namespace kvcache {

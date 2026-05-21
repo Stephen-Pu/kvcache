@@ -26,3 +26,6 @@ __pycache__/
 *.pb.go
 *.pb.cc
 *.pb.h
+src/kvctl/kvctl
+src/operator/manager
+src/control-plane/cp

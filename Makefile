@@ -51,8 +51,10 @@ go-it:
 
 py-test: build
 	@command -v pytest >/dev/null 2>&1 || { echo "pytest not installed; pip install cffi pytest"; exit 1; }
-	KVCACHE_LIB=$$PWD/$(BUILD_DIR)/core-abi/libkvcache.so \
-	  pytest src/adapters/vllm/tests -v
+	@LIB=$$(ls $(BUILD_DIR)/core-abi/libkvcache.dylib $(BUILD_DIR)/core-abi/libkvcache.so 2>/dev/null | head -1); \
+	 if [ -z "$$LIB" ]; then echo "libkvcache.{so,dylib} not found under $(BUILD_DIR)/core-abi/"; exit 1; fi; \
+	 echo "Using $$LIB"; \
+	 KVCACHE_LIB=$$PWD/$$LIB pytest src/adapters/vllm/tests -v
 
 all: test go go-test py-test
 

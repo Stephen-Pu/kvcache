@@ -56,7 +56,8 @@ class MembershipFsm {
 
     using StateChangeCallback = std::function<void(NodeState old_s, NodeState new_s)>;
 
-    explicit MembershipFsm(const Options& opts = {});
+    MembershipFsm();
+    explicit MembershipFsm(const Options& opts);
 
     NodeState State() const noexcept {
         return state_.load(std::memory_order_acquire);

@@ -8,7 +8,6 @@ namespace kvcache::node::tier {
 DramTier::DramTier(const Options& opts)
     : capacity_bytes_(opts.capacity_bytes),
       a1in_capacity_(opts.capacity_bytes / 4),
-      am_capacity_  (opts.capacity_bytes - (opts.capacity_bytes / 4)),
       a1out_max_   (opts.a1out_max_entries) {}
 
 DramTier::~DramTier() = default;
@@ -126,9 +125,10 @@ void DramTier::GhostInsert(const DramKey& key) {
 void DramTier::EvictToFit(std::size_t incoming_bytes) {
     // Bring A1in within budget first (it's where new entries land; if the new
     // entry is going to Am it still has to share the global capacity).
+    // We add `incoming_bytes` to the budget check so that adding a new entry
+    // can push existing A1in tails into the ghost queue.
     while (!a1in_.empty() &&
-           a1in_bytes_used_ + (a1in_.empty() ? 0 : 0) >
-           a1in_capacity_) {
+           a1in_bytes_used_ + incoming_bytes > a1in_capacity_) {
         // Evict the FIFO tail of A1in into the ghost queue.
         const Entry& victim = a1in_.back();
         a1in_bytes_used_ -= victim.data.size();

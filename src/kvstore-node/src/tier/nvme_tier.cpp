@@ -118,7 +118,14 @@ bool NvmeTier::Put(const DramKey& key, const uint8_t* data, std::size_t n,
         return false;
     }
     if (fdatasync_) {
-        if (::fdatasync(fd_) != 0) {
+        // fdatasync is Linux-only; macOS falls back to fsync (slightly more
+        // work — also flushes inode metadata — but functionally correct).
+#if defined(__APPLE__)
+        const int rc = ::fsync(fd_);
+#else
+        const int rc = ::fdatasync(fd_);
+#endif
+        if (rc != 0) {
             if (err) *err = std::string("nvme_tier: fdatasync: ") + std::strerror(errno);
             return false;
         }

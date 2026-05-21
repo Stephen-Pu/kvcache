@@ -3,6 +3,7 @@
 
 namespace kvcache::node::qos {
 
+QuotaManager::QuotaManager() : QuotaManager(Options{}) {}
 QuotaManager::QuotaManager(const Options& opts) : window_(opts.window) {}
 
 void QuotaManager::SetLimits(uint64_t tenant_hash, const QuotaLimits& limits) {

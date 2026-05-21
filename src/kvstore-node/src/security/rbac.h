@@ -55,7 +55,8 @@ class Rbac {
         std::chrono::milliseconds cache_ttl{1000};
     };
 
-    explicit Rbac(const Options& opts = {});
+    Rbac();
+    explicit Rbac(const Options& opts);
 
     // Step 1-5: full evaluation. Step 6: cached for `cache_ttl` per
     // (cn, action, tenant_hash) triple.

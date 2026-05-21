@@ -9,6 +9,8 @@ namespace kvcache::node::cluster {
 // InMemoryEtcdClient — semantic-faithful etcd v3 surface for tests / demos.
 // ===========================================================================
 
+InMemoryEtcdClient::InMemoryEtcdClient() : InMemoryEtcdClient(Options{}) {}
+
 InMemoryEtcdClient::InMemoryEtcdClient(const Options& opts)
     : sweep_interval_(opts.lease_sweep_interval) {
     sweeper_ = std::thread([this] { SweeperLoop(); });

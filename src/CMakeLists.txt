@@ -11,6 +11,13 @@
 #     OpenSSL, abseil, spdlog, prometheus-cpp, gtest, benchmark.
 
 cmake_minimum_required(VERSION 3.22)
+
+# CMP0135: use extraction-time timestamps for FetchContent URL downloads,
+# so re-extracting bumps mtimes and dependent rules re-run as expected.
+if(POLICY CMP0135)
+    cmake_policy(SET CMP0135 NEW)
+endif()
+
 project(kvcache LANGUAGES C CXX VERSION 0.1.0)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -80,6 +87,7 @@ if(KVCACHE_BUILD_TESTS)
       googletest
       URL      https://github.com/google/googletest/archive/refs/tags/v1.14.0.tar.gz
       URL_HASH SHA256=8ad598c73ad796e0d8280b082cebd82a630d73e73cd3c70057938a6501bba5d7
+      DOWNLOAD_EXTRACT_TIMESTAMP TRUE
     )
     set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
     FetchContent_MakeAvailable(googletest)

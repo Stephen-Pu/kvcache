@@ -151,11 +151,14 @@ class RocksdbStore {
     uint64_t CurrentEpoch() const noexcept;
 
    private:
-    rocksdb::DB* db_ = nullptr;
-    rocksdb::ColumnFamilyHandle* cf_default_ = nullptr;
-    rocksdb::ColumnFamilyHandle* cf_sealed_  = nullptr;
-    rocksdb::ColumnFamilyHandle* cf_quota_   = nullptr;
-    rocksdb::ColumnFamilyHandle* cf_audit_   = nullptr;
+    // These handles are only touched when KVCACHE_HAVE_ROCKSDB is defined.
+    // The facade build (no rocksdb linked) keeps the fields present so the
+    // class layout is stable across translation units.
+    [[maybe_unused]] rocksdb::DB* db_ = nullptr;
+    [[maybe_unused]] rocksdb::ColumnFamilyHandle* cf_default_ = nullptr;
+    [[maybe_unused]] rocksdb::ColumnFamilyHandle* cf_sealed_  = nullptr;
+    [[maybe_unused]] rocksdb::ColumnFamilyHandle* cf_quota_   = nullptr;
+    [[maybe_unused]] rocksdb::ColumnFamilyHandle* cf_audit_   = nullptr;
 
     mutable uint64_t cached_epoch_ = 0;
 };
