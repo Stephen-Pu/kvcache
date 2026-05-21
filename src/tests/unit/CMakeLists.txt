@@ -44,6 +44,7 @@ set(NODE_TRANSPORT_SRCS
 
 set(NODE_CLUSTER_SRCS
     ${KVCACHE_NODE_SRC}/cluster/etcd_client.cpp
+    ${KVCACHE_NODE_SRC}/cluster/http_etcd_client.cpp
     ${KVCACHE_NODE_SRC}/cluster/membership_fsm.cpp
 )
 
@@ -115,7 +116,11 @@ kvcache_add_test(test_priority_scheduler transport/priority_scheduler_test.cpp $
 kvcache_add_test(test_tcp_backend       transport/tcp_backend_test.cpp       ${NODE_TRANSPORT_SRCS})
 
 kvcache_add_test(test_etcd_client       cluster/etcd_client_test.cpp         ${NODE_CLUSTER_SRCS})
+target_link_libraries(test_etcd_client PRIVATE CURL::libcurl nlohmann_json::nlohmann_json)
 kvcache_add_test(test_membership_fsm    cluster/membership_fsm_test.cpp      ${NODE_CLUSTER_SRCS})
+target_link_libraries(test_membership_fsm PRIVATE CURL::libcurl nlohmann_json::nlohmann_json)
+kvcache_add_test(test_http_etcd_client  cluster/http_etcd_client_test.cpp    ${NODE_CLUSTER_SRCS})
+target_link_libraries(test_http_etcd_client PRIVATE CURL::libcurl nlohmann_json::nlohmann_json)
 kvcache_add_test(test_hrw               routing/hrw_test.cpp                 ${NODE_ROUTING_SRCS})
 kvcache_add_test(test_bloom_sketch      routing/bloom_sketch_test.cpp        ${NODE_ROUTING_SRCS})
 

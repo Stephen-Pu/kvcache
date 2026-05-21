@@ -37,6 +37,7 @@ set(NODE_CORE_SRCS
     src/security/audit.cpp
     # cluster
     src/cluster/etcd_client.cpp
+    src/cluster/http_etcd_client.cpp
     src/cluster/membership_fsm.cpp
     # routing
     src/routing/hrw.cpp
@@ -57,6 +58,8 @@ target_include_directories(kvstore_node_core
 target_link_libraries(kvstore_node_core
     PUBLIC
         kvcache_common
+        CURL::libcurl
+        nlohmann_json::nlohmann_json
     # TODO: rocksdb, nixl, ucx, uring, grpc++, protobuf, prometheus-cpp,
     # spdlog, abseil, openssl, $<IF:$<BOOL:${KVCACHE_ENABLE_SPDK}>,spdk,>.
 )

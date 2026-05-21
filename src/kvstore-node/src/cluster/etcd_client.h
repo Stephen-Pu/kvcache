@@ -158,6 +158,73 @@ class InMemoryEtcdClient final : public IEtcdClient {
 };
 
 // ---------------------------------------------------------------------------
+// HttpEtcdClient — real etcd v3 client over the HTTP/JSON gateway (Phase F-1).
+//
+// Etcd v3 exposes the same KV/Lease/Watch surface as a JSON-over-HTTP REST
+// gateway alongside the canonical gRPC API. This is slower than gRPC for
+// hot-path traffic, but for the cluster-coordination workload (membership,
+// quota updates, bloom-sketch sync) it's well within the latency budget,
+// and it lets the C++ side talk to a real etcd cluster without dragging in
+// grpc++ and the etcd .proto vendoring chain (deferred to a future
+// GrpcEtcdClient revision).
+//
+// Wire format:
+//   * All keys and values are base64-encoded in JSON request / response.
+//   * Operations follow `/v3/kv/{put,range,deleterange,txn}`,
+//     `/v3/lease/{grant,keepalive,revoke}`.
+//   * CompareAndSwap is expressed via `/v3/kv/txn` with a "MOD" compare.
+//
+// Watch is implemented via background polling against `/v3/kv/range` with
+// the prefix's max mod_revision tracked locally — the etcd v3 gRPC watch
+// stream is not available over the HTTP gateway in a way that's easy to
+// drive from libcurl. Polling is best-effort and may miss transient values
+// that are overwritten between polls; this matches how the bloom-sketch
+// sync and membership paths use watches (next-revision idempotent reads).
+// ---------------------------------------------------------------------------
+
+class HttpEtcdClient final : public IEtcdClient {
+   public:
+    struct Options {
+        // Single endpoint, including scheme. e.g. "http://127.0.0.1:2379".
+        std::string endpoint;
+        std::chrono::milliseconds dial_timeout{5000};
+        std::chrono::milliseconds watch_poll_interval{500};
+        // Optional mTLS material (libcurl). Empty = http://... insecure.
+        std::string ca_pem_path;
+        std::string client_cert_pem_path;
+        std::string client_key_pem_path;
+    };
+
+    static std::unique_ptr<HttpEtcdClient> Create(const Options& opts,
+                                                    std::string* err);
+    ~HttpEtcdClient() override;
+
+    std::string Backend() const override { return "http-etcd"; }
+
+    bool Put(const std::string&, const std::string&, LeaseId, Revision*, std::string*) override;
+    std::optional<KeyValue> Get(const std::string&, std::string*) override;
+    std::vector<KeyValue> GetPrefix(const std::string&, std::string*) override;
+    bool Delete(const std::string&, std::string*) override;
+    bool PutIfRevision(const std::string&, const std::string&,
+                        Revision, LeaseId, Revision*, std::string*) override;
+    LeaseId  LeaseGrant(uint32_t, std::string*) override;
+    bool     LeaseKeepAlive(LeaseId, std::string*) override;
+    bool     LeaseRevoke   (LeaseId, std::string*) override;
+    uint32_t LeaseTTLRemaining(LeaseId) const override;
+    WatchHandle WatchPrefix(const std::string&, WatchCallback) override;
+    void        Unwatch(WatchHandle) override;
+
+    // pImpl publicly exposed (still a forward-declared type) only so the
+    // .cpp's anonymous-namespace helpers can manipulate the impl directly
+    // without each one needing to be befriended individually.
+    struct Impl;
+
+   private:
+    HttpEtcdClient() = default;
+    std::unique_ptr<Impl> impl_;
+};
+
+// ---------------------------------------------------------------------------
 // GrpcEtcdClient — real etcd v3 client. Skeleton; .cpp gated on
 // KVCACHE_ENABLE_ETCD (requires vendored etcd protos + grpc++).
 // ---------------------------------------------------------------------------

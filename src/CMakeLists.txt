@@ -95,6 +95,31 @@ endif()
 
 include_directories(${CMAKE_SOURCE_DIR}/include)
 
+# --------------------------------------------------------------------------
+# HttpEtcdClient deps — libcurl (system) + nlohmann/json (FetchContent).
+# Both are consumed only by src/kvstore-node/src/cluster/http_etcd_client.cpp
+# and a single test binary. Pulled in here so any TU under kvstore-node can
+# pick them up via the standard include path.
+# --------------------------------------------------------------------------
+find_package(CURL REQUIRED)
+
+find_package(nlohmann_json 3 QUIET CONFIG)
+if(NOT nlohmann_json_FOUND)
+    message(STATUS "nlohmann_json not found locally; fetching v3.11.3 via FetchContent")
+    include(FetchContent)
+    FetchContent_Declare(
+        nlohmann_json
+        GIT_REPOSITORY https://github.com/nlohmann/json.git
+        GIT_TAG        v3.11.3
+        GIT_SHALLOW    TRUE
+    )
+    set(JSON_BuildTests OFF CACHE INTERNAL "")
+    set(JSON_Install    OFF CACHE INTERNAL "")
+    set(CMAKE_WARN_DEPRECATED OFF CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(nlohmann_json)
+    set(CMAKE_WARN_DEPRECATED ON CACHE BOOL "" FORCE)
+endif()
+
 add_subdirectory(core/common)
 
 # core/proto is optional: only build when Protobuf is available. This keeps the

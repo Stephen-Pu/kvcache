@@ -165,13 +165,13 @@ sudo apt-get install cmake ninja-build g++ python3-venv golang-1.22
 python3 -m venv .venv && source .venv/bin/activate
 pip install cffi pytest
 
-make all      # zero warnings, 151/151 tests pass, ~4 minutes cold start
+make all      # zero warnings, 159/159 tests pass, ~4 minutes cold start
 ```
 
 Expected end of `make all`:
 
 ```
-100% tests passed, 0 tests failed out of 151
+100% tests passed, 0 tests failed out of 159
 ...
 src/adapters/vllm/tests/test_e2e_demo.py::test_prefix_reuse_across_two_requests PASSED
 src/adapters/vllm/tests/test_e2e_demo.py::test_lookup_miss_returns_none PASSED
@@ -209,10 +209,12 @@ LLD section it implements.
 
 **Working end-to-end** (run `make all` to verify):
 
-- 12 subsystems, 30 gtest binaries, **151 unit tests** (including
+- 12 subsystems, 31 gtest binaries, **159 unit tests** (including
   multi-thread ART stress, cross-instance TCP Pull, persistent ART
-  round-trip, concurrent PriorityScheduler stress, and concurrent
-  ScheduledPull through the NIXL dispatcher)
+  round-trip, concurrent PriorityScheduler stress, concurrent
+  ScheduledPull through the NIXL dispatcher, and HttpEtcdClient
+  error-path coverage; integration tests against a live etcd run
+  opt-in via `ETCD_ENDPOINT=...`)
 - In-process headless backend — the Python demo runs the **full LPM →
   fetch → tier promotion → seal → cross-request reuse** flow
 - **Real BLAKE3** (BLAKE3-team reference C library, vendored via
@@ -238,8 +240,12 @@ LLD section it implements.
   art_snapshot_path` for the in-process backend. Replaces the legacy
   "scan sealed_chunks CF and re-Insert every leaf" boot rebuild
   (LLD §7.3); RocksDB stays as the authoritative seal log.
-- Real etcd integration (embedded etcd v3.5 in Go tests; via
-  `IEtcdClient` abstraction in C++)
+- Real etcd integration on **both sides**: embedded etcd v3.5 in Go
+  tests, and a real `HttpEtcdClient` (KV + Lease + polling Watch) in
+  C++ that talks to a live etcd cluster via the v3 JSON gateway —
+  no grpc++ or proto-vendoring dep. The `IEtcdClient` abstraction
+  lets the in-memory and HTTP backends plug in interchangeably; a
+  future `GrpcEtcdClient` slots in the same way.
 - Real Helm chart that renders a deployable K8s manifest
 - 7-job CI on every push
 
@@ -251,9 +257,11 @@ LLD section it implements.
   hardware (Mellanox CX-6/7 + IB or RoCE fabric) which is being
   procured. The interface (`INixlBackend` + `RemoteMrDescriptor`) is
   designed so they slot in without changing call sites.
-- `GrpcEtcdClient` (C++) skeleton compiles only when etcd v3 protos are
-  vendored; `InMemoryEtcdClient` is semantically faithful and used in
-  tests.
+- `GrpcEtcdClient` (C++) is still a skeleton — the real etcd path
+  goes through `HttpEtcdClient` for now, which is fine for the
+  control-plane traffic shape (membership, quota, bloom-sketch sync)
+  but not for sub-ms hot-path roundtrips. Phase F-2 will land a true
+  gRPC client once etcd v3 protos are vendored.
 - Engine adapters: only vLLM has a working Python connector skeleton;
   SGLang / AIBrix / TRT-LLM are stubs.
 - K8s operator scaffolds CRDs but does not yet emit StatefulSets.
