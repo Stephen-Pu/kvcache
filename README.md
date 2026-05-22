@@ -241,6 +241,11 @@ LLD section it implements.
   `IEtcdClient` abstraction lets in-memory, HTTP, and a future gRPC
   backend plug in interchangeably.
 - Real Helm chart that renders a deployable K8s manifest.
+- **K8s operator** with a working reconcile loop: each `KVCacheCluster`
+  CR emits a `ServiceAccount`, `ConfigMap`, headless `Service`, and
+  `StatefulSet` (per-pod PVC when the NVMe tier is configured). Drift,
+  idempotency, and OwnerReference cascade verified by 11 unit tests
+  against the controller-runtime fake client.
 - 7-job CI on every push.
 
 **Honestly not done yet** (called out so nobody is misled):
@@ -260,7 +265,11 @@ LLD section it implements.
   three adapters are ~50 LOC shells on top of a shared
   `kvcache_core` package that holds the `cffi` substrate. TRT-LLM
   is still a stub (C++ engine; needs a different binding path).
-- **K8s operator** scaffolds CRDs but doesn't yet emit StatefulSets.
+- **K8s operator** — the in-cluster etcd StatefulSet (when
+  `byoEtcd: false`), the control-plane StatefulSet, the cert-manager-
+  driven mTLS Secret, and etcd-backed membership status breakdown are
+  still on the punch-list. Today's reconciler emits the kvstore-node
+  tree (SA + ConfigMap + Service + StatefulSet) end-to-end.
 
 This is an **honest MVP**: the architecture is complete and verified
 end-to-end; production hardening is the next phase.
