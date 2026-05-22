@@ -142,6 +142,17 @@ kvcache_add_test(test_audit             security/audit_test.cpp              ${N
 kvcache_add_test(test_metrics           obs/metrics_test.cpp)
 kvcache_add_test(test_node_runtime      runtime/node_runtime_test.cpp
                  ${KVCACHE_NODE_SRC}/runtime/node_runtime.cpp)
+
+# Phase M-1: gRPC NodeData service tests. Only built when grpc is
+# present (the service impl + its headers don't exist otherwise).
+if(KVCACHE_HAVE_GRPC)
+    kvcache_add_test(test_node_data_service
+                      grpc/node_data_service_test.cpp)
+    target_link_libraries(test_node_data_service PRIVATE
+        kvstore_node_grpc
+        kvcache
+    )
+endif()
 kvcache_add_test(test_trace             obs/trace_test.cpp)
 kvcache_add_test(test_trace_otlp        obs/trace_otlp_test.cpp)
 target_link_libraries(test_trace_otlp PRIVATE kvcache_otlp CURL::libcurl nlohmann_json::nlohmann_json)

@@ -74,8 +74,36 @@ target_link_libraries(kvstore_node_core
 if(KVCACHE_HAVE_GRPC)
     target_link_libraries(kvstore_node_core PUBLIC kvcache_etcd_proto)
     target_compile_definitions(kvstore_node_core PUBLIC KVCACHE_HAVE_GRPC=1)
+
+    # Phase M-1: NodeData gRPC service + a thin Server wrapper. Built
+    # only when grpc is present; otherwise the binary stays on the
+    # NodeRuntime accept-and-close placeholder.
+    add_library(kvstore_node_grpc STATIC
+        src/grpc/node_data_service.cpp
+        src/grpc/grpc_server.cpp
+    )
+    target_include_directories(kvstore_node_grpc
+        PUBLIC
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_SOURCE_DIR}/include
+    )
+    target_link_libraries(kvstore_node_grpc
+        PUBLIC
+            kvcache_proto
+            gRPC::grpc++
+    )
 endif()
 
 # ---- Node binary ----
 add_executable(kvstore-node src/main.cpp)
 target_link_libraries(kvstore-node PRIVATE kvstore_node_core)
+if(KVCACHE_HAVE_GRPC)
+    # The binary owns the NodeData service + a GrpcServer wired to it,
+    # plus the public C ABI shared lib so it can open a kv_ctx_t for
+    # the default tenant. main.cpp gates the wiring on KVCACHE_HAVE_GRPC.
+    target_link_libraries(kvstore-node PRIVATE
+        kvstore_node_grpc
+        kvcache
+    )
+    target_compile_definitions(kvstore-node PRIVATE KVCACHE_HAVE_GRPC=1)
+endif()

@@ -43,6 +43,11 @@ class NodeRuntime {
         std::string bind_host    = "0.0.0.0";
         uint16_t    grpc_port    = 7000;
         uint16_t    metrics_port = 9090;
+        // When true, NodeRuntime does NOT bind / accept on the grpc
+        // port — the caller (main.cpp, when grpc++ is compiled in)
+        // claims it with a real grpc::Server instead. NodeRuntime
+        // still owns the metrics port + signal handling regardless.
+        bool        skip_grpc_listener = false;
     };
 
     // Construct + bind both listeners. On failure `Ok()` returns false

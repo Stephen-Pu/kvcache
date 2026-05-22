@@ -167,13 +167,13 @@ sudo apt-get install cmake ninja-build g++ python3-venv golang-1.22
 python3 -m venv .venv && source .venv/bin/activate
 pip install cffi pytest
 
-make all      # zero warnings, 203/203 tests pass, ~4 minutes cold start
+make all      # zero warnings, 207/207 tests pass, ~4 minutes cold start
 ```
 
 Expected end of `make all`:
 
 ```
-100% tests passed, 0 tests failed out of 203
+100% tests passed, 0 tests failed out of 207
 ...
 src/adapters/vllm/tests/test_e2e_demo.py::test_prefix_reuse_across_two_requests PASSED
 src/adapters/vllm/tests/test_e2e_demo.py::test_lookup_miss_returns_none PASSED
@@ -214,16 +214,18 @@ LLD section it implements.
 
 **Working end-to-end** (run `make all` to verify):
 
-- 12 subsystems, 37 gtest binaries, **203 unit tests** — multi-thread
+- 12 subsystems, 38 gtest binaries, **207 unit tests** — multi-thread
   ART stress, cross-instance TCP Pull, persistent ART round-trip,
   WAL-incremental ART durability with torn-write recovery,
   concurrent PriorityScheduler, ScheduledPull through the NIXL
   dispatcher, HttpEtcdClient error-path coverage, TRT-LLM C++
   backend round-trip, OTel-shaped trace facade, OTLP/HTTP exporter
-  encoder, and the kvstore-node `NodeRuntime` (TCP readiness probe
-  + Prometheus `/metrics` + `/healthz`). Live-etcd integration
-  tests run opt-in via `ETCD_ENDPOINT=...`; live-OTel-collector
-  ones run via `OTLP_ENDPOINT=...`.
+  encoder, the kvstore-node `NodeRuntime` (TCP readiness probe +
+  Prometheus `/metrics` + `/healthz`), and the `NodeData` gRPC
+  service driven through a real `grpc::Server` (`Lookup`,
+  `Reserve`, `Publish`, `Fetch`, `Seal`, `Release` over the wire).
+  Live-etcd integration tests run opt-in via `ETCD_ENDPOINT=...`;
+  live-OTel-collector ones run via `OTLP_ENDPOINT=...`.
 - In-process headless backend — the Python demo runs the full LPM →
   fetch → tier promotion → seal → cross-request reuse flow.
 - **Real BLAKE3** for prefix hashing, chunk identity, and HRW

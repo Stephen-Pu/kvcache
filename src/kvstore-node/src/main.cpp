@@ -1,31 +1,39 @@
 // kvstore-node entrypoint.
 //
-// Phase L-1 scope: bring the binary up to the smallest "Ready pod"
-// surface so the operator's StatefulSet + TCPSocket probe actually
-// pass when run under kind / production. Real boot sequence (etcd
-// register, tier init, NIXL register, gRPC handlers) is layered on top
-// of this in later phases.
+// Phase M-1 scope: bind the NodeData gRPC service (LLD §3) onto the
+// container's grpc port. The agent talks to the binary through this
+// service; metadata flows over gRPC, KV bytes flow over NIXL.
 //
 // What this binary does today:
 //
-//   1. Parses --config (kvcache-node.yaml path). We don't open the
-//      file yet — the operator-emitted ConfigMap is correct shape,
-//      the consumer just hasn't been wired through. Stored for
-//      future use; printed at startup for log breadcrumbs.
-//   2. Starts a NodeRuntime: TCP accept-loop on the grpc port (passes
-//      the operator readiness probe) + tiny HTTP server on the
-//      metrics port (/metrics + /healthz).
-//   3. Blocks until SIGTERM (K8s pod evict) or SIGINT (Ctrl-C).
+//   1. Parses --config / --grpc-port / --metrics-port flags. The
+//      operator-emitted ConfigMap path is stored for future use; the
+//      consumer isn't wired yet (Phase M-2 reads it).
+//   2. Opens a kv_ctx_t for the "default" tenant — the agent's
+//      auth context is bound at ctx-open time inside libkvcache.
+//      For Phase M-1 we use a single default ctx for all RPCs.
+//   3. Starts a NodeData gRPC server bound to the grpc port and a
+//      NodeRuntime running the metrics / healthz HTTP server on
+//      the metrics port. NodeRuntime is told to skip the grpc-port
+//      placeholder so the grpc::Server can claim it.
+//   4. Blocks on SIGTERM (K8s pod evict) / SIGINT (Ctrl-C).
 //
-// Anything else from the historical TODO docblock (RocksDB replay,
-// tier init, NIXL register, etcd join, warm-up window, draining) is
-// the explicit next layer.
+// Builds without grpc still produce a working binary — the grpc
+// section is gated on KVCACHE_HAVE_GRPC. Without grpc the binary
+// falls back to the L-1 accept-and-close placeholder (pods still
+// pass readiness; the agent just can't talk to it).
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
 
 #include "runtime/node_runtime.h"
+
+#if defined(KVCACHE_HAVE_GRPC)
+#include "kvcache/kv_abi.h"
+#include "grpc/grpc_server.h"
+#include "grpc/node_data_service.h"
+#endif
 
 namespace {
 
@@ -70,9 +78,43 @@ int main(int argc, char** argv) {
         "kvstore-node: starting (config=%s grpc=%u metrics=%u)\n",
         o.config_path.c_str(), o.grpc_port, o.metrics_port);
 
+#if defined(KVCACHE_HAVE_GRPC)
+    // Open a default kv_ctx_t for the agent — Phase M-2 will cache one
+    // per (tenant, model) keyed off the request fields. The default
+    // tenant_id / model_id are placeholders today.
+    kv_ctx_config_t cfg{};
+    cfg.abi_version    = KVCACHE_ABI_VERSION;
+    cfg.agent_endpoint = nullptr;
+    cfg.tenant_id      = "kvstore-node-default";
+    cfg.model_id       = "kvstore-node-default";
+    cfg.flags          = 0;
+    kv_ctx_t* ctx = nullptr;
+    if (const int rc = kv_ctx_open(&cfg, &ctx); rc != 0 || !ctx) {
+        std::fprintf(stderr,
+            "kvstore-node: kv_ctx_open failed (status=%d)\n", rc);
+        return 1;
+    }
+
+    kvcache::node::grpc_server::NodeDataServiceImpl svc(ctx);
+    kvcache::node::grpc_server::GrpcServer::Options grpc_opts;
+    grpc_opts.bind_host = o.bind_host;
+    grpc_opts.port      = o.grpc_port;
+    kvcache::node::grpc_server::GrpcServer grpc(grpc_opts, &svc);
+    if (!grpc.Ok()) {
+        std::fprintf(stderr, "kvstore-node: grpc: %s\n", grpc.error().c_str());
+        kv_ctx_close(ctx);
+        return 1;
+    }
+    o.skip_grpc_listener = true;
+    o.grpc_port          = grpc.BoundPort();  // for log clarity
+#endif
+
     kvcache::node::runtime::NodeRuntime rt(o);
     if (!rt.Ok()) {
         std::fprintf(stderr, "kvstore-node: %s\n", rt.error().c_str());
+#if defined(KVCACHE_HAVE_GRPC)
+        kv_ctx_close(ctx);
+#endif
         return 1;
     }
     rt.Start();
@@ -81,5 +123,10 @@ int main(int argc, char** argv) {
         rt.GrpcPort(), rt.MetricsPort());
     const int sig = rt.Wait();
     std::fprintf(stderr, "kvstore-node: stopped (signal=%d)\n", sig);
+
+#if defined(KVCACHE_HAVE_GRPC)
+    grpc.Stop();
+    kv_ctx_close(ctx);
+#endif
     return 0;
 }

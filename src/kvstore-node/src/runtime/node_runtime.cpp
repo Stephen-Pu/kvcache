@@ -136,14 +136,24 @@ void WriteHttpResponse(int fd, int status, std::string_view content_type,
 }  // namespace
 
 NodeRuntime::NodeRuntime(const Options& opts) : opts_(opts) {
-    grpc_fd_ = BindListener(opts_.bind_host, opts_.grpc_port,
-                              &grpc_port_resolved_, &error_);
-    if (grpc_fd_ < 0) return;
+    // grpc port: bind iff the caller hasn't reserved it for an external
+    // grpc::Server (Phase M-1 main.cpp opts into this when KVCACHE_HAVE_GRPC).
+    if (!opts_.skip_grpc_listener) {
+        grpc_fd_ = BindListener(opts_.bind_host, opts_.grpc_port,
+                                  &grpc_port_resolved_, &error_);
+        if (grpc_fd_ < 0) return;
+    } else {
+        // Reflect the caller-supplied port back so GrpcPort() reports
+        // something useful in logs / tests.
+        grpc_port_resolved_ = opts_.grpc_port;
+    }
     metrics_fd_ = BindListener(opts_.bind_host, opts_.metrics_port,
                                   &metrics_port_resolved_, &error_);
     if (metrics_fd_ < 0) {
-        ::close(grpc_fd_);
-        grpc_fd_ = -1;
+        if (grpc_fd_ >= 0) {
+            ::close(grpc_fd_);
+            grpc_fd_ = -1;
+        }
         return;
     }
     ok_ = true;
@@ -166,7 +176,12 @@ void NodeRuntime::Start() {
         ::sigaction(SIGINT,  &sa, nullptr);
     }
 
-    grpc_thread_    = std::thread(&NodeRuntime::GrpcAcceptLoop,    this);
+    // The grpc accept loop is just a placeholder TCP listener for the
+    // readiness probe. When the caller hands the grpc port to a real
+    // grpc::Server (skip_grpc_listener), we skip the thread entirely.
+    if (!opts_.skip_grpc_listener) {
+        grpc_thread_ = std::thread(&NodeRuntime::GrpcAcceptLoop, this);
+    }
     metrics_thread_ = std::thread(&NodeRuntime::MetricsAcceptLoop, this);
 }
 
