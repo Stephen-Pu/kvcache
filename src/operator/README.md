@@ -65,14 +65,35 @@ go build ./...
 go test ./internal/controller -v
 ```
 
-The 11 controller tests run against the controller-runtime fake
-client — no kube-apiserver or kind cluster required.
+The 17 controller tests run against the controller-runtime fake
+client — no kube-apiserver or kind cluster required, ~2 seconds end
+to end.
+
+### Opt-in kind e2e
+
+A separate, slower test suite (`src/operator/test/e2e/`, build tag
+`e2e`) brings up a real kind cluster, applies the CRDs, runs the
+operator in-process against the kind apiserver, and asserts:
+
+- the eight-resource fan-out (SA / ConfigMap / nodes-Svc / nodes-STS
+  + etcd-Svc / etcd-STS + cp-Svc / cp-STS) actually appears on a real
+  apiserver;
+- foreground cascade deletion through K8s' garbage collector removes
+  child StatefulSets when the parent CR goes away — a path the fake
+  client can't simulate.
+
+Pods CrashLoopBackOff (kvstore-node `main.cpp` is a stub) — the
+e2e only checks object shape, not workload liveness. Invocation:
+
+```bash
+make e2e-operator          # ~45s; requires docker + kind + kubectl
+```
 
 ## Try it out
 
 ```bash
-# 1. Apply the CRDs (regenerate with `make manifests` once Helm chart lands).
-kubectl apply -f config/crd/bases/
+# 1. Apply the CRDs.
+kubectl apply -f config/crd/
 
 # 2. Start the operator (or run out-of-cluster: go run ./cmd/manager).
 kubectl apply -f config/deploy/operator.yaml

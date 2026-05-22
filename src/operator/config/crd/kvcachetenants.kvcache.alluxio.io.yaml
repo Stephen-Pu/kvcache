@@ -1,0 +1,57 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: kvcachetenants.kvcache.alluxio.io
+spec:
+  group: kvcache.alluxio.io
+  scope: Namespaced
+  names:
+    kind: KVCacheTenant
+    listKind: KVCacheTenantList
+    singular: kvcachetenant
+    plural: kvcachetenants
+    shortNames: [kvt]
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required: [clusterRef, tenantID, quota]
+              properties:
+                clusterRef:
+                  type: string
+                tenantID:
+                  type: string
+                  pattern: "^[0-9a-fA-F]{32}$"
+                quota:
+                  type: object
+                  required: [capacityBytes, qps, bandwidthBytesPerSecond]
+                  properties:
+                    capacityBytes:           {type: string}
+                    qps:                     {type: integer, minimum: 0}
+                    bandwidthBytesPerSecond: {type: string}
+                defaultPriority:
+                  type: string
+                  enum: [P0, P1, P2]
+                deletionPending:
+                  type: boolean
+            status:
+              type: object
+              x-kubernetes-preserve-unknown-fields: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Cluster
+          type: string
+          jsonPath: .spec.clusterRef
+        - name: Priority
+          type: string
+          jsonPath: .spec.defaultPriority
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp

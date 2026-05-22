@@ -1,0 +1,8 @@
+# Single-node kind cluster. We don't need workers — the operator runs
+# out-of-cluster (as a go test process on the host), and we don't wait
+# for any pod to reach Ready. The apiserver + etcd on the control plane
+# are all we use.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane

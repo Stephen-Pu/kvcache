@@ -1,0 +1,82 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: kvcacheclusters.kvcache.alluxio.io
+spec:
+  group: kvcache.alluxio.io
+  scope: Namespaced
+  names:
+    kind: KVCacheCluster
+    listKind: KVCacheClusterList
+    singular: kvcachecluster
+    plural: kvcacheclusters
+    shortNames: [kvcc]
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required: [nodeReplicas, image, tier]
+              properties:
+                nodeReplicas:
+                  type: integer
+                  minimum: 1
+                image:
+                  type: string
+                tier:
+                  type: object
+                  required: [pinnedBytes, dramBytes]
+                  properties:
+                    pinnedBytes:  {type: string}
+                    dramBytes:    {type: string}
+                    nvmePath:     {type: string}
+                    nvmeBytes:    {type: string}
+                    enableCold:   {type: boolean}
+                nixlBackend:
+                  type: string
+                  enum: [ucx, gdr, gds, tcp, nvlink, loopback]
+                byoEtcd:
+                  type: boolean
+                etcdEndpoints:
+                  type: array
+                  items: {type: string}
+                etcd:
+                  type: object
+                  properties:
+                    image:        {type: string}
+                    replicas:     {type: integer, minimum: 1}
+                    storageBytes: {type: string}
+                controlPlane:
+                  type: object
+                  properties:
+                    image:    {type: string}
+                    replicas: {type: integer, minimum: 1}
+                alluxioBinding:
+                  type: object
+                  required: [mountPath]
+                  properties:
+                    mountPath: {type: string}
+                    subdir:    {type: string}
+                nodeResources:
+                  type: object
+                  x-kubernetes-preserve-unknown-fields: true
+            status:
+              type: object
+              x-kubernetes-preserve-unknown-fields: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: "Node Replicas"
+          type: integer
+          jsonPath: .spec.nodeReplicas
+        - name: "Active"
+          type: integer
+          jsonPath: .status.nodesActive
+        - name: "Age"
+          type: date
+          jsonPath: .metadata.creationTimestamp

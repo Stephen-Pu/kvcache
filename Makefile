@@ -20,7 +20,7 @@ CMAKE        ?= cmake
 GENERATOR    ?= Ninja
 JOBS         ?= $(shell nproc 2>/dev/null || sysctl -n hw.ncpu)
 
-.PHONY: help build configure compile test go go-test go-it py-test clean all
+.PHONY: help build configure compile test go go-test go-it py-test clean all e2e-operator
 
 help:
 	@grep -E '^# +' Makefile | head -20
@@ -57,6 +57,17 @@ py-test: build
 	 KVCACHE_LIB=$$PWD/$$LIB pytest src/adapters -v
 
 all: test go go-test py-test
+
+# Opt-in: kind cluster e2e for the operator. Spins up a real kind
+# cluster, applies the CRDs, runs the operator in-process against the
+# kind apiserver, asserts the Reconcile fan-out + cascade-delete
+# behavior. NOT included in `make all` because it requires docker +
+# kind on the host and takes ~45s end-to-end.
+e2e-operator:
+	@command -v kind     >/dev/null 2>&1 || { echo "kind not installed; brew install kind";     exit 1; }
+	@command -v kubectl  >/dev/null 2>&1 || { echo "kubectl not installed; brew install kubectl"; exit 1; }
+	@command -v docker   >/dev/null 2>&1 || { echo "docker not installed";                       exit 1; }
+	bash src/operator/test/e2e/run.sh
 
 clean:
 	rm -rf $(BUILD_DIR)

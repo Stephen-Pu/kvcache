@@ -265,7 +265,10 @@ LLD section it implements.
   StatefulSet-ReadyReplicas fallback when it isn't. Drift,
   idempotency, OwnerReference cascade, etcd-status override, and
   tenant validation paths are covered by 29 unit tests against the
-  controller-runtime fake client.
+  controller-runtime fake client, **plus an opt-in `make
+  e2e-operator` target** that spins a real kind cluster, applies the
+  CRDs, and verifies the full eight-resource fan-out + cascade
+  delete against a real apiserver.
 - 7-job CI on every push.
 
 **Honestly not done yet** (called out so nobody is misled):
