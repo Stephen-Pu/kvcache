@@ -107,6 +107,9 @@ func (in *KVCacheClusterStatus) DeepCopyInto(out *KVCacheClusterStatus) {
 			in.Conditions[i].DeepCopyInto(&out.Conditions[i])
 		}
 	}
+	if in.MtlsCertNotAfter != nil {
+		out.MtlsCertNotAfter = in.MtlsCertNotAfter.DeepCopy()
+	}
 }
 
 func (in *KVCacheClusterStatus) DeepCopy() *KVCacheClusterStatus {

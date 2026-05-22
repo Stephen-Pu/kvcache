@@ -24,6 +24,7 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
+	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -40,12 +41,21 @@ import (
 type KVCacheTenantReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+
+	// Publisher pushes validated tenant CRs into the per-cluster etcd
+	// (Phase H-4). Production binding is EtcdTenantPublisher; tests
+	// inject a fake. nil = skip the publish step entirely (no-op),
+	// useful for environments where etcd is wired separately.
+	Publisher TenantPublisher
 }
 
 // +kubebuilder:rbac:groups=kvcache.alluxio.io,resources=kvcachetenants,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=kvcache.alluxio.io,resources=kvcachetenants/status,verbs=get;update;patch
 
-const validatedConditionType = "Validated"
+const (
+	validatedConditionType = "Validated"
+	publishedConditionType = "Published"
+)
 
 func (r *KVCacheTenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	var tenant kvcachev1alpha1.KVCacheTenant
@@ -54,22 +64,66 @@ func (r *KVCacheTenantReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	reason, msg := validateTenant(ctx, r.Client, &tenant)
-	cond := metav1.Condition{
+	validated := metav1.Condition{
 		Type:               validatedConditionType,
 		LastTransitionTime: metav1.Now(),
 	}
 	if reason == "" {
-		cond.Status = metav1.ConditionTrue
-		cond.Reason = "Accepted"
+		validated.Status = metav1.ConditionTrue
+		validated.Reason = "Accepted"
 	} else {
-		cond.Status = metav1.ConditionFalse
-		cond.Reason = reason
-		cond.Message = msg
+		validated.Status = metav1.ConditionFalse
+		validated.Reason = reason
+		validated.Message = msg
 	}
-	if !replaceCondition(&tenant.Status.Conditions, cond) {
-		return ctrl.Result{}, nil  // no change → skip status round-trip
+	changed := replaceCondition(&tenant.Status.Conditions, validated)
+
+	// Publish step: only when validation succeeded and a Publisher is
+	// wired in. Failure here surfaces as Published=False with the
+	// underlying error — we requeue so the next reconcile retries
+	// against a possibly-now-reachable etcd.
+	requeue := false
+	if validated.Status == metav1.ConditionTrue && r.Publisher != nil {
+		// Resolve the parent cluster — already verified to exist by
+		// validateTenant, but we need its spec for endpoint discovery.
+		var cluster kvcachev1alpha1.KVCacheCluster
+		if err := r.Get(ctx, types.NamespacedName{
+			Name:      tenant.Spec.ClusterRef,
+			Namespace: tenant.Namespace,
+		}, &cluster); err == nil {
+			pubCond := metav1.Condition{
+				Type:               publishedConditionType,
+				LastTransitionTime: metav1.Now(),
+			}
+			if err := r.Publisher.Publish(ctx, &cluster, &tenant); err != nil {
+				pubCond.Status  = metav1.ConditionFalse
+				pubCond.Reason  = "EtcdPutFailed"
+				pubCond.Message = err.Error()
+				requeue = true
+			} else {
+				pubCond.Status = metav1.ConditionTrue
+				pubCond.Reason = "Published"
+			}
+			if replaceCondition(&tenant.Status.Conditions, pubCond) {
+				changed = true
+			}
+		}
 	}
-	return ctrl.Result{}, r.Status().Update(ctx, &tenant)
+
+	if !changed {
+		// No status drift; nothing to write back.
+		if requeue {
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+		}
+		return ctrl.Result{}, nil
+	}
+	if err := r.Status().Update(ctx, &tenant); err != nil {
+		return ctrl.Result{}, err
+	}
+	if requeue {
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+	return ctrl.Result{}, nil
 }
 
 func (r *KVCacheTenantReconciler) SetupWithManager(mgr ctrl.Manager) error {

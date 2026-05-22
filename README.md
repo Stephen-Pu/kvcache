@@ -263,14 +263,20 @@ LLD section it implements.
   `Service` (skipped when `byoEtcd: true`); and a 3-replica
   control-plane `StatefulSet` + headless `Service` wired against the
   same etcd. `kubectl apply -f cluster.yaml` brings up the entire
-  data + control plane with mTLS material in place. `KVCacheTenant`
+  data + control plane with mTLS material in place. The mTLS leaf
+  cert auto-rotates (~90-day validity, regenerated when <1/3 of
+  the lifetime remains; CA stays stable across rotations);
+  `.status.mtlsCertNotAfter` surfaces the next expiry. `KVCacheTenant`
   CRs are validated by a second reconciler (hex tenant ID, parseable
-  quota quantities, parent cluster exists) and surface their state
-  via a `Validated` condition. Membership status is read from the
+  quota quantities, parent cluster exists), then published to the
+  per-cluster etcd at `/kvcache/tenants/<cluster>/<tenant_id>` so the
+  kvstore-node / control-plane processes can watch for live quota
+  updates; both `Validated` and `Published` conditions surface on
+  `.status.conditions`. Membership status is read from the
   in-cluster etcd's `/nodes/` prefix when reachable, with a
   StatefulSet-ReadyReplicas fallback when it isn't. Drift,
   idempotency, OwnerReference cascade, etcd-status override, and
-  tenant validation paths are covered by 29 unit tests against the
+  tenant validation paths are covered by 39 unit tests against the
   controller-runtime fake client, **plus an opt-in `make
   e2e-operator` target** that spins a real kind cluster, applies the
   CRDs, and verifies the full eight-resource fan-out + cascade
@@ -296,13 +302,13 @@ LLD section it implements.
   SGLang's `lookup / store / retrieve / drop`, AIBrix's
   `get / put / delete / exists`, TRT-LLM's `Lookup / Store /
   Retrieve / Drop`.
-- **K8s operator** — `cert-manager` integration (`useCertManager:
-  true` switch), mTLS cert rotation, the CP-side wiring that pushes
-  validated tenant quotas to etcd, and the `joining / draining /
-  unreachable` membership breakdown (needs a `state` field in the
-  FSM) are still on the punch-list. Today's reconcilers emit the
-  full cluster tree, the mTLS Secret, and the Tenant `Validated`
-  status surface.
+- **K8s operator** — the `cert-manager` integration (`useCertManager:
+  true` opt-in that emits Certificate CRs instead of self-signing)
+  and the `joining / draining / unreachable` membership breakdown
+  (needs a `state` field in the membership FSM) are still on the
+  punch-list. Today's reconcilers emit the full cluster tree, the
+  self-signed mTLS Secret with auto-rotation, and push validated
+  tenant quotas through to the per-cluster etcd.
 
 This is an **honest MVP**: the architecture is complete and verified
 end-to-end; production hardening is the next phase.

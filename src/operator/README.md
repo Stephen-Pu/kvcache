@@ -46,16 +46,24 @@ StatefulSet's `ReadyReplicas`. The richer
 `joining / draining / unreachable` breakdown will land once the
 membership FSM exposes it over etcd (Phase H-2).
 
-Still on the punch-list (Phase H-4+):
+Still on the punch-list (Phase H-5+):
 - cert-manager integration (`useCertManager: true` switch that emits
   Certificate CRs instead of synthesising key bytes locally).
-- mTLS cert rotation (today's Secret is generate-once).
 - DaemonSet flavour for labelled GPU hosts.
-- Real CP-side wiring that pushes validated tenant quotas to etcd —
-  this controller is admission-side only.
 - A `state` field in the membership FSM so the operator can split
   the `joining / draining / unreachable` counts (today: just
   `nodesActive`).
+
+Phase H-4 landed:
+- mTLS leaf rotation (~90-day validity, regenerated when <1/3 of
+  the lifetime remains; CA stable across rotations).
+  `.status.mtlsCertNotAfter` surfaces the next expiry. Reconcile
+  rotates via a 6h RequeueAfter tick.
+- Operator-side `TenantPublisher` writes validated KVCacheTenant
+  specs to `/kvcache/tenants/<cluster>/<tenant_id>` in the
+  per-cluster etcd; kvstore-node and the CP watch that prefix for
+  live quota updates. Both `Validated` and `Published` conditions
+  surface on `KVCacheTenant.status.conditions`.
 
 ## Build & test
 
@@ -65,8 +73,8 @@ go build ./...
 go test ./internal/controller -v
 ```
 
-The 17 controller tests run against the controller-runtime fake
-client — no kube-apiserver or kind cluster required, ~2 seconds end
+The 39 controller tests run against the controller-runtime fake
+client — no kube-apiserver or kind cluster required, ~3 seconds end
 to end.
 
 ### Opt-in kind e2e

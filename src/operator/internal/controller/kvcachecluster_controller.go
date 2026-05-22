@@ -22,6 +22,7 @@ package controller
 import (
 	"context"
 	"reflect"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -66,11 +67,12 @@ func (r *KVCacheClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, err
 	}
 
-	// 1b. mTLS Secret (self-signed, generate-once). We GET first so we
-	// only synthesise material when the Secret is missing; once it
-	// exists the operator never touches it. Phase H-4 will add
-	// rotation + cert-manager opt-in here.
-	if err := r.ensureMtlsSecret(ctx, &cluster); err != nil {
+	// 1b. mTLS Secret (self-signed, leaf rotates ~90 days; CA stable).
+	// PlanMtlsSecret inspects the live Secret and either creates,
+	// no-ops, or rotates just the leaf. We capture the resulting
+	// NotAfter to surface on .status.
+	leafNotAfter, err := r.ensureMtlsSecret(ctx, &cluster)
+	if err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -114,22 +116,25 @@ func (r *KVCacheClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, err
 	}
 
-	// 7. Status — current implementation reads from the StatefulSet's
-	//    Ready/Current/UpdatedReplicas. The richer "joining / draining /
-	//    unreachable" breakdown waits for etcd-backed membership in
-	//    Phase H-2.
-	if err := r.updateStatus(ctx, &cluster, sts); err != nil {
+	// 7. Status — StatefulSet ReadyReplicas + etcd-backed counts when
+	//    available + the mTLS leaf NotAfter from step 1b.
+	if err := r.updateStatus(ctx, &cluster, sts, leafNotAfter); err != nil {
 		logger.Error(err, "status update failed (non-fatal)")
 	}
 
-	return ctrl.Result{}, nil
+	// Schedule the next reconcile so the cert rotation reconciler runs
+	// even when nothing else on the cluster changes. The interval is
+	// far below the leaf validity so we wake up many times before the
+	// rotation window opens.
+	return ctrl.Result{RequeueAfter: mtlsRotationCheckInterval}, nil
 }
 
-// ensureMtlsSecret creates the per-cluster mTLS Secret iff none with all
-// four expected keys exists. Generate-once semantics — rotation is
-// deferred to Phase H-4.
+// ensureMtlsSecret creates the per-cluster mTLS Secret on first
+// reconcile and rotates the leaf cert (keeping the CA stable) once the
+// live cert enters its rotation window. Returns the leaf's NotAfter so
+// the caller can surface it on .status.
 func (r *KVCacheClusterReconciler) ensureMtlsSecret(
-	ctx context.Context, cluster *kvcachev1alpha1.KVCacheCluster) error {
+	ctx context.Context, cluster *kvcachev1alpha1.KVCacheCluster) (time.Time, error) {
 	var existing corev1.Secret
 	err := r.Get(ctx,
 		client.ObjectKey{Name: MtlsSecretName(cluster.Name), Namespace: cluster.Namespace},
@@ -138,20 +143,36 @@ func (r *KVCacheClusterReconciler) ensureMtlsSecret(
 	if err == nil {
 		live = &existing
 	} else if !apierrors.IsNotFound(err) {
-		return err
+		return time.Time{}, err
 	}
 
-	desired, err := DesiredMtlsSecret(cluster, live)
+	plan, err := PlanMtlsSecret(cluster, live)
 	if err != nil {
-		return err
+		return time.Time{}, err
 	}
-	if desired == nil {
-		return nil  // existing material is complete; leave it alone
+	switch plan.Action {
+	case MtlsNoop:
+		return plan.LeafNotAfter, nil
+
+	case MtlsCreate:
+		if err := controllerutil.SetControllerReference(cluster, plan.Desired, r.Scheme); err != nil {
+			return time.Time{}, err
+		}
+		if err := r.Create(ctx, plan.Desired); err != nil {
+			return time.Time{}, err
+		}
+		return plan.LeafNotAfter, nil
+
+	case MtlsRotateLeaf:
+		// Live Secret is preserved; only tls.crt + tls.key change.
+		existing.Data[mtlsKeyTLSCert] = plan.Desired.Data[mtlsKeyTLSCert]
+		existing.Data[mtlsKeyTLSKey]  = plan.Desired.Data[mtlsKeyTLSKey]
+		if err := r.Update(ctx, &existing); err != nil {
+			return time.Time{}, err
+		}
+		return plan.LeafNotAfter, nil
 	}
-	if err := controllerutil.SetControllerReference(cluster, desired, r.Scheme); err != nil {
-		return err
-	}
-	return r.Create(ctx, desired)
+	return plan.LeafNotAfter, nil
 }
 
 // ensureOwned is the GET / CREATE / PATCH loop shared by every dependent
@@ -240,6 +261,7 @@ func (r *KVCacheClusterReconciler) updateStatus(
 	ctx context.Context,
 	cluster *kvcachev1alpha1.KVCacheCluster,
 	sts *appsv1.StatefulSet,
+	mtlsLeafNotAfter time.Time,
 ) error {
 	// Re-fetch the StatefulSet so .Status fields reflect what the apps
 	// controller has reported (the `sts` we built is desired-state only).
@@ -282,6 +304,13 @@ func (r *KVCacheClusterReconciler) updateStatus(
 		readyCondition.Message = ""
 	}
 	newStatus.Conditions = []metav1.Condition{readyCondition}
+
+	// Surface the mTLS leaf NotAfter so operators can `kubectl get`
+	// the rotation cadence at a glance.
+	if !mtlsLeafNotAfter.IsZero() {
+		t := metav1.NewTime(mtlsLeafNotAfter)
+		newStatus.MtlsCertNotAfter = &t
+	}
 
 	if reflect.DeepEqual(cluster.Status, newStatus) {
 		return nil

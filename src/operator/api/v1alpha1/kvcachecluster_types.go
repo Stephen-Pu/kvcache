@@ -87,6 +87,11 @@ type KVCacheClusterStatus struct {
 	NodesJoining     int32 `json:"nodesJoining"`
 	NodesUnreachable int32 `json:"nodesUnreachable"`
 	NodesDraining    int32 `json:"nodesDraining"`
+	// NotAfter timestamp of the currently-issued mTLS leaf certificate
+	// (Phase H-4). When unset, no Secret has been issued yet. The
+	// rotation reconciler regenerates the leaf when this drops below
+	// `RotationFraction` of the configured lifetime.
+	MtlsCertNotAfter *metav1.Time `json:"mtlsCertNotAfter,omitempty"`
 }
 
 // +kubebuilder:object:root=true
