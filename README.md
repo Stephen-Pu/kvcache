@@ -167,13 +167,13 @@ sudo apt-get install cmake ninja-build g++ python3-venv golang-1.22
 python3 -m venv .venv && source .venv/bin/activate
 pip install cffi pytest
 
-make all      # zero warnings, 181/181 tests pass, ~4 minutes cold start
+make all      # zero warnings, 189/189 tests pass, ~4 minutes cold start
 ```
 
 Expected end of `make all`:
 
 ```
-100% tests passed, 0 tests failed out of 181
+100% tests passed, 0 tests failed out of 189
 ...
 src/adapters/vllm/tests/test_e2e_demo.py::test_prefix_reuse_across_two_requests PASSED
 src/adapters/vllm/tests/test_e2e_demo.py::test_lookup_miss_returns_none PASSED
@@ -214,14 +214,15 @@ LLD section it implements.
 
 **Working end-to-end** (run `make all` to verify):
 
-- 12 subsystems, 34 gtest binaries, **181 unit tests** — multi-thread
+- 12 subsystems, 35 gtest binaries, **189 unit tests** — multi-thread
   ART stress, cross-instance TCP Pull, persistent ART round-trip,
+  WAL-incremental ART durability with torn-write recovery,
   concurrent PriorityScheduler, ScheduledPull through the NIXL
   dispatcher, HttpEtcdClient error-path coverage, TRT-LLM C++
-  backend round-trip, the OTel-shaped trace facade, and the
-  OTLP/HTTP exporter encoder. Live-etcd integration tests run
-  opt-in via `ETCD_ENDPOINT=...`; live-OTel-collector ones run
-  via `OTLP_ENDPOINT=...`.
+  backend round-trip, OTel-shaped trace facade, and the OTLP/HTTP
+  exporter encoder. Live-etcd integration tests run opt-in via
+  `ETCD_ENDPOINT=...`; live-OTel-collector ones run via
+  `OTLP_ENDPOINT=...`.
 - In-process headless backend — the Python demo runs the full LPM →
   fetch → tier promotion → seal → cross-request reuse flow.
 - **Real BLAKE3** for prefix hashing, chunk identity, and HRW
@@ -235,11 +236,16 @@ LLD section it implements.
   instances bind distinct ports, exchange opaque MR descriptors, and
   `Pull` moves bytes through a real socket. Future UCX / RDMA
   backends slot into the same `INixlBackend` interface.
-- **Persistent ART** — whole-tree snapshot to disk with BLAKE3-256
-  body integrity (atomic write-temp + fsync + rename). Boot loads
-  the snapshot if present; falls back to a fresh ART so a bad
-  checkpoint never blocks startup. RocksDB stays as the authoritative
-  seal log.
+- **Persistent ART with WAL-incremental durability** — every
+  Insert / Remove is appended (and `fdatasync`'d) to an append-only
+  WAL file before the in-memory tree mutates; periodic
+  `Checkpoint()` writes a fresh whole-tree snapshot with BLAKE3-256
+  body integrity and truncates the WAL. Boot replays
+  `snapshot + WAL tail` instead of rebuilding from the seal log,
+  so a node carrying 10M sealed chunks is up in ms, not minutes.
+  Torn writes (partial fsync before crash) are detected by the
+  per-record CRC32 and silently truncated at the last-good offset
+  on the next replay.
 - **PriorityScheduler on the NIXL data path** with per-tenant fair
   queueing. Tenant identity flows from `kv_ctx_open(tenant_id="...")`
   through FNV-1a-64 into per-tenant FIFOs, so two clients in the same
@@ -309,11 +315,10 @@ end-to-end; production hardening is the next phase.
 
 - UCX / GDR / GDS / NVLink NIXL backends once RDMA hardware arrives
 - gRPC etcd client (etcd v3 protos vendored)
-- Incremental persistent ART — WAL of sealed/unsealed events between
-  snapshots, mmap-backed node arena, copy-on-write (today's snapshot
-  is whole-tree)
+- mmap-backed persistent-ART node arena + copy-on-write replication
+  (D-2 today is snapshot + record-level WAL — already incremental,
+  but the tree itself still rebuilds in memory at boot)
 - SPDK NVMe-oF for cross-node direct access
-- OpenTelemetry tracing
 - AWS EFA / Azure InfiniBand / GCP TCPx certification
 - SGLang / TRT-LLM / NVIDIA Dynamo / LMDeploy / TGI / DeepSpeed-MII adapters
 

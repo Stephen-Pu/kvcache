@@ -20,6 +20,7 @@
 #include "kvcache/kv_types.h"
 #include "meta/rocksdb_store.h"
 #include "prefix/art_index.h"
+#include "prefix/art_wal.h"
 #include "prefix/kv_event_stream.h"
 #include "prefix/lpm.h"
 #include "tier/tier_manager.h"
@@ -44,6 +45,13 @@ class HeadlessNode {
         // Init falls back to a fresh empty ART (and logs to err). If the
         // path is empty, no snapshot work happens.
         std::string art_snapshot_path;
+        // Optional ART WAL file (Phase D-2). When set, every Insert /
+        // Remove is appended (and fsynced) to this file before the
+        // in-memory ART mutates, and the file is replayed on top of
+        // the snapshot at Init. Together with art_snapshot_path this
+        // gives incremental durability: boot is O(snapshot + WAL tail)
+        // instead of O(every-ever-seen-chunk).
+        std::string art_wal_path;
     };
 
     static HeadlessNode* GetOrCreate(const Options& opts, std::string* err);
@@ -110,6 +118,10 @@ class HeadlessNode {
     std::unique_ptr<node::ingest::MutableBufferPool>   buffers_;
     std::unique_ptr<node::ingest::WatermarkTracker>    wm_;
     std::unique_ptr<node::prefix::ArtIndex>            art_;
+    // Optional wrapper that funnels Insert / Remove through a WAL +
+    // periodic snapshot (Phase D-2). When `art_wal_path` is unset in
+    // Options the wrapper is nullptr and writes go straight to art_.
+    std::unique_ptr<node::prefix::ArtWal>              art_wal_;
     std::unique_ptr<node::prefix::EventStream>         events_;
     std::unique_ptr<node::transport::NixlWrapper>      nixl_;
 };

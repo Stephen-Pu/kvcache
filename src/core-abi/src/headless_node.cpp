@@ -7,6 +7,7 @@
 
 #include "kvcache/kv_errors.h"
 #include "prefix/art_snapshot.h"
+#include "prefix/art_wal.h"
 #include "trace.h"
 
 namespace kvcache::abi {
@@ -75,7 +76,28 @@ bool HeadlessNode::Init(const Options& opts, std::string* err) {
     // re-introduced here later as the second fall-back; for Phase D-1 the
     // contract is "fast restore if a clean snapshot is on disk, otherwise
     // start empty and let the warm-up window rebuild lazily".
-    if (!opts.art_snapshot_path.empty()) {
+    // ART durability — three modes:
+    //   1. No persistence (both paths empty): fresh in-memory ART.
+    //   2. Snapshot-only (Phase D-1): restore from snapshot at boot,
+    //      no on-disk durability until the next WriteArtSnapshot().
+    //   3. Snapshot + WAL (Phase D-2): ArtWal owns the ART; every
+    //      Insert / Remove is appended-and-fsynced to art_wal_path
+    //      before mutating the in-memory tree, and the WAL is
+    //      replayed on top of the snapshot at Init.
+    if (!opts.art_wal_path.empty()) {
+        node::prefix::ArtWal::Options wo{};
+        wo.snapshot_path     = opts.art_snapshot_path;
+        wo.wal_path          = opts.art_wal_path;
+        wo.fsync_each_write  = true;
+        std::string wal_err;
+        art_wal_ = node::prefix::ArtWal::Open(wo, &wal_err);
+        if (art_wal_) {
+            // Transfer ownership of the ART into our local handle so
+            // Lookup / Reserve / Seal / etc. don't need to know about
+            // the WAL. Mutators below funnel through art_wal_.
+            art_ = nullptr;  // owned by art_wal_
+        }
+    } else if (!opts.art_snapshot_path.empty()) {
         struct ::stat st{};
         if (::stat(opts.art_snapshot_path.c_str(), &st) == 0) {
             std::string snap_err;
@@ -86,7 +108,7 @@ bool HeadlessNode::Init(const Options& opts, std::string* err) {
             }
         }
     }
-    if (!art_) art_ = std::make_unique<node::prefix::ArtIndex>();
+    if (!art_ && !art_wal_) art_ = std::make_unique<node::prefix::ArtIndex>();
     events_  = std::make_unique<node::prefix::EventStream>();
 
     node::transport::BackendOptions bo2;
@@ -117,8 +139,11 @@ int HeadlessNode::Lookup(const char* /*tenant_id*/, uint64_t /*model_id_hash*/,
         span.SetError("invalid argument");
         return KV_E_INVAL;
     }
-    auto g = art_->EnterRead();
-    auto r = node::prefix::LongestPrefixMatch(*art_, {tokens, n}, g);
+    // ART is owned either by art_wal_ (Phase D-2) or art_ directly
+    // (Phase D-1 / no persistence). Pick whichever is live.
+    node::prefix::ArtIndex& art_ref = art_wal_ ? art_wal_->art() : *art_;
+    auto g = art_ref.EnterRead();
+    auto r = node::prefix::LongestPrefixMatch(art_ref, {tokens, n}, g);
     if (r.matched_tokens == 0 || !r.leaf) {
         span.SetAttribute("kv.hit", false);
         return KV_E_NOT_FOUND;
@@ -309,8 +334,11 @@ int HeadlessNode::Seal(kv_handle_t handle,
         leaf->tier_residency_bitmap = req.tier_residency_bitmap;
         leaf->bytes_total           = watermark;
         leaf->refcount.Acquire();
-        auto ins = art_->Insert({req.chunk_path.data(), req.chunk_path.size()},
-                                  std::move(leaf));
+        std::span<const node::prefix::ChunkHash> chunk_path{
+            req.chunk_path.data(), req.chunk_path.size()};
+        auto ins = art_wal_
+            ? art_wal_->Insert(chunk_path, std::move(leaf))
+            : art_->Insert(chunk_path, std::move(leaf));
         if (ins == node::prefix::ArtIndex::InsertResult::kPathConflict) {
             return KV_E_INTERNAL;
         }
@@ -353,6 +381,13 @@ int HeadlessNode::Release(kv_handle_t handle) {
 }
 
 bool HeadlessNode::WriteArtSnapshot(const std::string& path, std::string* err) {
+    // Under Phase D-2 (WAL active) Checkpoint() writes the snapshot
+    // AND truncates the WAL atomically — that's the durable next
+    // checkpoint. Without WAL we fall back to the D-1 best-effort
+    // snapshot path (callers lose any unflushed mutations).
+    if (art_wal_) {
+        return art_wal_->Checkpoint(path, err);
+    }
     if (!art_) {
         if (err) *err = "ART not initialised";
         return false;

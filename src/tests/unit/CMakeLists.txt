@@ -16,6 +16,7 @@ set(NODE_PREFIX_SRCS
     ${KVCACHE_NODE_SRC}/prefix/kv_event_stream.cpp
     ${KVCACHE_NODE_SRC}/prefix/refcount.cpp
     ${KVCACHE_NODE_SRC}/prefix/art_snapshot.cpp
+    ${KVCACHE_NODE_SRC}/prefix/art_wal.cpp
 )
 
 set(NODE_META_SRCS
@@ -85,6 +86,7 @@ kvcache_add_test(test_lpm              prefix/lpm_test.cpp              ${NODE_P
 kvcache_add_test(test_epoch            prefix/epoch_test.cpp            ${NODE_PREFIX_SRCS})
 kvcache_add_test(test_art_concurrent   prefix/art_concurrent_test.cpp   ${NODE_PREFIX_SRCS})
 kvcache_add_test(test_art_snapshot     prefix/art_snapshot_test.cpp     ${NODE_PREFIX_SRCS})
+kvcache_add_test(test_art_wal          prefix/art_wal_test.cpp          ${NODE_PREFIX_SRCS})
 kvcache_add_test(test_rocksdb_store    meta/rocksdb_store_test.cpp      ${NODE_META_SRCS})
 if(KVCACHE_ENABLE_ROCKSDB)
     target_link_libraries(test_rocksdb_store PRIVATE RocksDB::rocksdb)
