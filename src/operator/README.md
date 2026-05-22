@@ -29,22 +29,21 @@ Each `KVCacheCluster` drives a four-resource desired-state tree:
 A second controller reconciles `KVCacheTenant` CRs: it validates the
 spec (`tenantID` hex, parseable quota quantities, allowed
 `defaultPriority`, parent `clusterRef` in the same namespace) and
-writes a `Validated` condition into `.status`. The real "push quotas
-to nodes" path through the control-plane lands in Phase H-4.
+publishes the validated entry to `/kvcache/tenants/<cluster>/<tenant_id>`
+in the per-cluster etcd. Both `Validated` and `Published` conditions
+land on `.status.conditions`; nodes and CP watch that prefix for
+live quota updates.
 
 Membership status (`.status.nodesActive` etc.) is sourced from the
 in-cluster etcd's `/nodes/` prefix when reachable; the operator falls
 back to the kvstore-node StatefulSet's `ReadyReplicas` when etcd is
 slow / unreachable so a cold start still surfaces something useful.
+The richer `joining / draining / unreachable` breakdown needs a
+`state` field on the membership FSM keys (Phase H-5+).
 
 The reconcile loop is GET → CREATE-if-absent → PATCH-on-drift, scoped
 to the spec subset the operator owns. Child resources carry an
 `OwnerReference` back to the parent CR so deletion cascades.
-
-Status (`.status.nodesActive`, `Ready` condition) is derived from the
-StatefulSet's `ReadyReplicas`. The richer
-`joining / draining / unreachable` breakdown will land once the
-membership FSM exposes it over etcd (Phase H-2).
 
 Still on the punch-list (Phase H-5+):
 - cert-manager integration (`useCertManager: true` switch that emits

@@ -60,21 +60,18 @@ ship "first-come-first-served" data planes; this project takes the
 constraint seriously.
 
 Concretely: a 3-queue (P0 / P1 / P2) **PriorityScheduler sits inside
-`NixlWrapper`**, with reserved 20% / 75% / 5% bandwidth windows,
+`NixlWrapper`** with reserved 20% / 75% / 5% bandwidth windows,
 idle-credit lending for anti-starvation, and per-tenant round-robin
-within each class. Every Pull goes through the scheduler's dispatcher
-thread, so admission decisions actually throttle the data plane —
-not just an in-memory bookkeeping exercise. Per-tenant FIFOs are
-populated by hashing each caller's `tenant_id` at the C ABI
-boundary, so two clients in the same class round-robin instead of
-one starving the other. Admissions, forced admissions, and queue
-depth are exposed as Prometheus counters / gauges, and `kv.lookup` /
-`kv.fetch` / `nixl.scheduled_pull` spans are emitted through an
-OTel-shaped tracing facade — with a built-in OTLP/HTTP exporter
-(`kvcache_otlp` library) so spans land in any standard OTel
-collector (Tempo / Jaeger / alloy / Honeycomb refinery) without
-extra glue. An operator can answer "why is this particular Fetch
-slow" — not just "how often are Fetches slow".
+inside each class. Every Pull is dispatched through the scheduler,
+so admission decisions actually throttle the data plane — not an
+in-memory bookkeeping exercise. Per-tenant FIFOs are populated from
+each caller's `tenant_id` at the C ABI boundary, so two clients in
+the same priority round-robin instead of one starving the other.
+Admissions, forced admissions, and queue depth land as Prometheus
+counters / gauges; `kv.lookup` / `kv.fetch` / `nixl.scheduled_pull`
+spans flow through an OTLP/HTTP exporter into any standard OTel
+collector. An operator can answer "why is *this* Fetch slow", not
+just "how often are Fetches slow".
 
 ### 3. Five-tier storage with lazy promotion and cross-tenant eviction
 
@@ -170,17 +167,26 @@ pip install cffi pytest
 make all      # zero warnings, 207/207 tests pass, ~4 minutes cold start
 ```
 
-Expected end of `make all`:
+Expected end of `make all` (one block per language):
 
 ```
+# C++ ctest
 100% tests passed, 0 tests failed out of 207
-...
-src/adapters/vllm/tests/test_e2e_demo.py::test_prefix_reuse_across_two_requests PASSED
-src/adapters/vllm/tests/test_e2e_demo.py::test_lookup_miss_returns_none PASSED
-src/adapters/sglang/tests/test_sglang_backend.py::test_store_then_retrieve_round_trip PASSED
-src/adapters/aibrix/tests/test_aibrix_backend.py::test_put_then_get_round_trip PASSED
-... (12 more SGLang / AIBrix backend tests)
-============================== 14 passed in 0.1s ===============================
+
+# Go (control-plane + operator)
+ok  github.com/alluxio/kvcache/control-plane/internal/membership   …
+ok  github.com/alluxio/kvcache/operator/internal/controller        …
+
+# Python adapter / E2E
+... (14 adapter tests + 2 Python E2E across vLLM / SGLang / AIBrix)
+============================== 16 passed in 0.2s ===============================
+```
+
+Two opt-in extras (require docker + kind):
+
+```
+make e2e-operator           # ~45s, operator object-shape against kind
+make e2e-operator-workload  # ~3-5min cold, builds image + waits for pod Ready
 ```
 
 Full setup including troubleshooting: [BUILD.md](./BUILD.md).
@@ -263,36 +269,40 @@ LLD section it implements.
   same `IEtcdClient` surface (KV + Lease + polling Watch), so
   swapping is a one-line construction change. The Go side uses
   embedded etcd v3.5 in tests.
-- Real Helm chart that renders a deployable K8s manifest.
-- **K8s operator** with two reconcilers: `KVCacheCluster` emits the
-  full nine-resource tree per cluster — kvstore-node `StatefulSet` +
-  headless `Service` + `ServiceAccount` + `ConfigMap` + self-signed
-  mTLS `Secret`; a 3-replica in-cluster etcd `StatefulSet` + headless
-  `Service` (skipped when `byoEtcd: true`); and a 3-replica
-  control-plane `StatefulSet` + headless `Service` wired against the
-  same etcd. `kubectl apply -f cluster.yaml` brings up the entire
-  data + control plane with mTLS material in place. The mTLS leaf
-  cert auto-rotates (~90-day validity, regenerated when <1/3 of
-  the lifetime remains; CA stays stable across rotations);
-  `.status.mtlsCertNotAfter` surfaces the next expiry. `KVCacheTenant`
-  CRs are validated by a second reconciler (hex tenant ID, parseable
-  quota quantities, parent cluster exists), then published to the
-  per-cluster etcd at `/kvcache/tenants/<cluster>/<tenant_id>` so the
-  kvstore-node / control-plane processes can watch for live quota
-  updates; both `Validated` and `Published` conditions surface on
-  `.status.conditions`. Membership status is read from the
-  in-cluster etcd's `/nodes/` prefix when reachable, with a
-  StatefulSet-ReadyReplicas fallback when it isn't. Drift,
-  idempotency, OwnerReference cascade, etcd-status override, and
-  tenant validation paths are covered by 39 unit tests against the
-  controller-runtime fake client, **plus two opt-in kind e2e
-  flavours**: `make e2e-operator` (~45s) for object-shape regression
-  against a real apiserver, and `make e2e-operator-workload` (~3-5 min
-  cold) which builds the multi-stage `kvstore-node` image, loads it
-  into kind via `kind load docker-image`, and waits for the
-  StatefulSet's `ReadyReplicas` to hit the target — proving the
-  L-1 `NodeRuntime` + M-1 `NodeData` gRPC server actually come up
-  inside a real container.
+- **Engine adapters** — vLLM, SGLang, AIBrix, and TRT-LLM all ship
+  working adapters against the Core ABI. The three Python adapters
+  are ~50 LOC shells on top of a shared `kvcache_core` package that
+  holds the `cffi` substrate; the C++ TRT-LLM adapter links
+  `libkvcache.{so,dylib}` directly. Each surface mirrors its
+  engine's expected verbs — SGLang's `lookup / store / retrieve /
+  drop`, AIBrix's `get / put / delete / exists`, TRT-LLM's
+  `Lookup / Store / Retrieve / Drop`.
+- **Real Helm chart** that renders a deployable K8s manifest.
+- **K8s operator — nine-resource cluster fan-out.** A single
+  `kubectl apply -f cluster.yaml` brings up `StatefulSet + headless
+  Service + ConfigMap + ServiceAccount` for kvstore-node, a 3-replica
+  in-cluster etcd (skipped under `byoEtcd: true`), a 3-replica
+  control-plane wired against the same etcd, and a self-signed mTLS
+  Secret mounted into every pod. The leaf cert auto-rotates around
+  the 1/3-lifetime mark; the CA stays stable across rotations and
+  the next expiry surfaces on `.status.mtlsCertNotAfter`.
+- **K8s operator — tenant CRD propagation.** `KVCacheTenant` CRs are
+  validated (hex tenant ID, parseable quotas, parent cluster exists)
+  and published to per-cluster etcd at
+  `/kvcache/tenants/<cluster>/<tenant_id>`, where nodes and CP can
+  watch for live quota updates. `.status.conditions` carries both
+  `Validated` and `Published`. Membership counts (`nodesActive`,
+  etc.) come from etcd's `/nodes/` prefix when reachable, with a
+  StatefulSet-ReadyReplicas fallback when it isn't.
+- **K8s operator — kind-cluster e2e in two flavours.**
+  `make e2e-operator` (~45s) validates the reconcile object-shape +
+  cascade-GC against a real apiserver; `make e2e-operator-workload`
+  (~3-5 min cold) builds the multi-stage `kvstore-node` Docker
+  image, loads it into kind via `kind load docker-image`, and waits
+  for the StatefulSet's `ReadyReplicas` to hit the target. The
+  second one is what proves the binary plus gRPC server actually
+  come up inside a real container — not just under gtest. The fake
+  client unit tests still cover 39 controller paths underneath.
 - 7-job CI on every push.
 
 **Honestly not done yet** (called out so nobody is misled):
@@ -301,22 +311,20 @@ LLD section it implements.
   RDMA-capable hardware (Mellanox CX-6/7 + IB or RoCE fabric). The
   `INixlBackend` interface is built so they slot in alongside
   `TcpBackend` without touching call sites.
-- **Engine adapters** — vLLM, SGLang, AIBrix, and TRT-LLM all ship
-  working adapters against the Core ABI. The three Python adapters
-  (vLLM / SGLang / AIBrix) are ~50 LOC shells on top of a shared
-  `kvcache_core` package that holds the `cffi` substrate; the C++
-  adapter (TRT-LLM) is a static archive linking `libkvcache.{so,dylib}`
-  directly. Each surface mirrors its engine's expected verbs —
-  SGLang's `lookup / store / retrieve / drop`, AIBrix's
-  `get / put / delete / exists`, TRT-LLM's `Lookup / Store /
-  Retrieve / Drop`.
-- **K8s operator** — the `cert-manager` integration (`useCertManager:
-  true` opt-in that emits Certificate CRs instead of self-signing)
-  and the `joining / draining / unreachable` membership breakdown
-  (needs a `state` field in the membership FSM) are still on the
-  punch-list. Today's reconcilers emit the full cluster tree, the
-  self-signed mTLS Secret with auto-rotation, and push validated
-  tenant quotas through to the per-cluster etcd.
+- **K8s operator follow-ups** — `cert-manager` opt-in (emit
+  `Certificate` CRs instead of self-signing), the
+  `joining / draining / unreachable` membership breakdown
+  (needs a `state` field on the membership FSM keys), and a
+  separate CP image (today the CP pod reuses the kvstore-node
+  image as a placeholder and CrashLoopBackOffs in the workload
+  e2e — pod-shape is right, command is wrong).
+- **mTLS on the wire** — the operator mounts the Secret and the
+  binary records the cert paths, but `grpc::ServerCredentials` is
+  still insecure. Wiring those paths into `SslServerCredentials`
+  is a one-PR follow-up.
+- **Streaming Watch on `GrpcEtcdClient`** — both etcd clients poll
+  today. The bidi `Watch` stream against the vendored protos lands
+  in F-3.
 
 This is an **honest MVP**: the architecture is complete and verified
 end-to-end; production hardening is the next phase.
@@ -328,15 +336,14 @@ end-to-end; production hardening is the next phase.
 **Next** (6–12 months):
 
 - UCX / GDR / GDS / NVLink NIXL backends once RDMA hardware arrives
-- Streaming-Watch path on `GrpcEtcdClient` (today both etcd clients
-  poll; the bidirectional Watch stream is a clean follow-up against
-  the vendored protos)
+- Streaming `Watch` on `GrpcEtcdClient` (both etcd clients poll today)
 - mmap-backed persistent-ART node arena + copy-on-write replication
-  (D-2 today is snapshot + record-level WAL — already incremental,
-  but the tree itself still rebuilds in memory at boot)
+  (today's WAL is incremental but the tree itself still rebuilds
+  in memory at boot)
 - SPDK NVMe-oF for cross-node direct access
 - AWS EFA / Azure InfiniBand / GCP TCPx certification
-- SGLang / TRT-LLM / NVIDIA Dynamo / LMDeploy / TGI / DeepSpeed-MII adapters
+- NVIDIA Dynamo / LMDeploy / TGI / DeepSpeed-MII adapters
+  (vLLM / SGLang / AIBrix / TRT-LLM already ship)
 
 **Phase 3** (12–24 months):
 
