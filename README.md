@@ -285,10 +285,14 @@ LLD section it implements.
   StatefulSet-ReadyReplicas fallback when it isn't. Drift,
   idempotency, OwnerReference cascade, etcd-status override, and
   tenant validation paths are covered by 39 unit tests against the
-  controller-runtime fake client, **plus an opt-in `make
-  e2e-operator` target** that spins a real kind cluster, applies the
-  CRDs, and verifies the full eight-resource fan-out + cascade
-  delete against a real apiserver.
+  controller-runtime fake client, **plus two opt-in kind e2e
+  flavours**: `make e2e-operator` (~45s) for object-shape regression
+  against a real apiserver, and `make e2e-operator-workload` (~3-5 min
+  cold) which builds the multi-stage `kvstore-node` image, loads it
+  into kind via `kind load docker-image`, and waits for the
+  StatefulSet's `ReadyReplicas` to hit the target — proving the
+  L-1 `NodeRuntime` + M-1 `NodeData` gRPC server actually come up
+  inside a real container.
 - 7-job CI on every push.
 
 **Honestly not done yet** (called out so nobody is misled):

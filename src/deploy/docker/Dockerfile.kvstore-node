@@ -1,0 +1,98 @@
+# Phase L-2 — kvstore-node container image.
+#
+# Multi-stage Debian Bookworm build. The build stage compiles libkvcache.so
+# + the kvstore-node binary inside the container; the runtime stage is a
+# tiny image with only the .so / binary + the handful of shared libs the
+# binary dlopen's at startup.
+#
+# Build context is the project root (NOT this directory) so the COPY
+# expressions can reach src/ and third_party/. Tag convention:
+# `kvcache/kvstore-node:e2e` for local kind workflows; release builds
+# retag to `ghcr.io/alluxio/kvcache:<version>` upstream.
+#
+# Build (from the repo root):
+#   docker build -f src/deploy/docker/Dockerfile.kvstore-node \
+#       -t kvcache/kvstore-node:e2e .
+#
+# Load into kind:
+#   kind load docker-image kvcache/kvstore-node:e2e
+#
+# Both flows are wired into the top-level Makefile (`make docker-image`,
+# `make e2e-operator-workload`).
+
+# -----------------------------------------------------------------------
+# Stage 1: build
+# -----------------------------------------------------------------------
+FROM debian:bookworm-slim AS build
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Build tooling + the full set of dev dependencies our CMake graph
+# discovers. nlohmann-json3-dev is a header-only package; libgrpc++-dev
+# pulls in libprotobuf-dev transitively.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        cmake \
+        ninja-build \
+        git \
+        pkg-config \
+        libgrpc++-dev \
+        libgrpc-dev \
+        protobuf-compiler \
+        protobuf-compiler-grpc \
+        libprotobuf-dev \
+        libcurl4-openssl-dev \
+        libssl-dev \
+        nlohmann-json3-dev \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /work
+# Copy only what the build needs — avoids invalidating cache on docs /
+# Go / Helm churn.
+COPY src/         src/
+COPY third_party/ third_party/
+
+# Disable BLAKE3 FetchContent — the apt-installed protobuf already
+# satisfies the protobuf find_package, but BLAKE3 has no Debian package
+# yet, so the build will FetchContent it via cmake (single network call
+# during the docker build).
+RUN cmake -S src -B build \
+        -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DKVCACHE_BUILD_TESTS=OFF \
+    && cmake --build build --parallel
+
+# -----------------------------------------------------------------------
+# Stage 2: runtime
+# -----------------------------------------------------------------------
+FROM debian:bookworm-slim AS runtime
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Runtime-only equivalents of what the build stage compiled against.
+# The bookworm package suffix numbers (e.g. libgrpc++1.51) drift on point
+# releases, so we install the dev packages as a robust shortcut — they
+# pull in the same runtime SOs the binary needs. Image is ~120 MB; an
+# explicit-name slim variant lives in the punch list.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libgrpc++-dev \
+        libprotobuf-dev \
+        libcurl4 \
+        libssl3 \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Public ABI shared lib + the binary. libkvcache.so is dlopen'd by the
+# kvstore-node binary at startup (via the linker's runtime search path).
+COPY --from=build /work/build/core-abi/libkvcache.so       /usr/local/lib/libkvcache.so
+COPY --from=build /work/build/kvstore-node/kvstore-node    /usr/local/bin/kvstore-node
+
+RUN ldconfig
+
+EXPOSE 7000 9090
+
+# The operator passes --config /etc/kvcache/kvcache-node.yaml via the
+# StatefulSet args. We don't bake a default config in here — the path is
+# satisfied at deploy time by the operator-emitted ConfigMap mount.
+ENTRYPOINT ["/usr/local/bin/kvstore-node"]

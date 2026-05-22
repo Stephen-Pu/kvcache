@@ -231,6 +231,91 @@ func TestReconcilerFanout(t *testing.T) {
 	}
 }
 
+// TestRealWorkloadPodReady — Phase L-2. Only runs when the env var
+// `E2E_IMAGE` is set (typically by `make e2e-operator-workload`,
+// which builds + kind-loads the kvstore-node image first). The test:
+//
+//   1. Applies a KVCacheCluster whose `.spec.image` points at the
+//      pre-loaded image, downsizing the rest of the cluster to one
+//      replica each so we don't fight kind's tiny default node for
+//      scheduling slots.
+//   2. Waits for the kvstore-node StatefulSet to report
+//      ReadyReplicas == NodeReplicas. That validates: the image was
+//      built right, the binary starts, the readiness TCP probe on
+//      the grpc port passes — i.e. the L-1 + M-1 work is real, not
+//      just unit-tested.
+//   3. Tears the cluster down.
+//
+// Skipped when E2E_IMAGE is unset so a `make e2e-operator` run still
+// completes in ~45s.
+func TestRealWorkloadPodReady(t *testing.T) {
+	image := os.Getenv("E2E_IMAGE")
+	if image == "" {
+		t.Skip("E2E_IMAGE not set; skipping the kvstore-node workload check")
+	}
+
+	c, teardown := setup(t)
+	defer teardown()
+
+	ns := uniqueNS(t)
+	dropNS := ensureNamespace(t, c, ns)
+	defer dropNS()
+
+	cluster := sampleCluster(ns)
+	cluster.Spec.Image = image
+	// kind's default control-plane node has limited CPU/memory; the
+	// default 3-replica STS + 3-replica etcd + 3-replica CP exceeds
+	// what fits without tuning. Shrink to 1 each for the workload
+	// liveness probe — the shape is the same.
+	cluster.Spec.NodeReplicas = 1
+	cluster.Spec.Etcd = &kvcachev1alpha1.EtcdSpec{Replicas: 1}
+	cluster.Spec.ControlPlane = &kvcachev1alpha1.ControlPlaneSpec{
+		Image:    image, // reuse — the binary inside ignores `--cp-mode`
+		Replicas: 1,
+	}
+
+	ctx := context.Background()
+	if err := c.Create(ctx, cluster); err != nil {
+		t.Fatalf("create cluster: %v", err)
+	}
+
+	// 5 minutes is generous — kind pulls each image off the host's
+	// docker once, then containerd starts the pod (~5s). The slow
+	// case is the FIRST run on a cold machine: kind itself bootstraps
+	// (~30s) before we even get here.
+	stsKey := types.NamespacedName{Name: "e2e-nodes", Namespace: ns}
+	err := pollUntil(t, 5*time.Minute, func() error {
+		var sts appsv1.StatefulSet
+		if err := c.Get(ctx, stsKey, &sts); err != nil {
+			return err
+		}
+		want := cluster.Spec.NodeReplicas
+		if sts.Status.ReadyReplicas != want {
+			return fmt.Errorf("ReadyReplicas=%d, want %d",
+				sts.Status.ReadyReplicas, want)
+		}
+		return nil
+	})
+	if err != nil {
+		// Drop the pod's logs into the test output so kubectl-less
+		// debugging is feasible from CI.
+		var pods corev1.PodList
+		_ = c.List(ctx, &pods, client.InNamespace(ns))
+		for _, p := range pods.Items {
+			t.Logf("pod %s: phase=%s reason=%s",
+				p.Name, p.Status.Phase, p.Status.Reason)
+			for _, cs := range p.Status.ContainerStatuses {
+				if cs.State.Waiting != nil {
+					t.Logf("  %s waiting: %s — %s",
+						cs.Name, cs.State.Waiting.Reason,
+						cs.State.Waiting.Message)
+				}
+			}
+		}
+		t.Fatalf("kvstore-node pod never reached Ready: %v", err)
+	}
+}
+
 // TestCascadeDeleteRemovesChildren: real apiserver-driven test that the
 // fake client can't simulate. Apply a CR, wait for an STS, delete the
 // CR with foreground cascading, expect the STS to disappear.

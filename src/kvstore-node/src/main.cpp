@@ -58,10 +58,19 @@ int main(int argc, char** argv) {
     kvcache::node::runtime::NodeRuntime::Options o;
     std::string grpc_port_s    = "7000";
     std::string metrics_port_s = "9090";
+    // mTLS paths — the operator-emitted StatefulSet passes the trio
+    // because Phase H-3 wired a self-signed Secret into the pod spec.
+    // The kvstore-node binary records the paths for diagnostics today;
+    // actual TLS termination is a future phase (a follow-up will pass
+    // these into the grpc::ServerCredentials at server start).
+    std::string tls_ca, tls_cert, tls_key;
     for (int i = 1; i < argc; ++i) {
         if (TryFlag(i, argc, argv, "--config",       &o.config_path)) continue;
         if (TryFlag(i, argc, argv, "--grpc-port",    &grpc_port_s))   continue;
         if (TryFlag(i, argc, argv, "--metrics-port", &metrics_port_s)) continue;
+        if (TryFlag(i, argc, argv, "--tls-ca",       &tls_ca))   continue;
+        if (TryFlag(i, argc, argv, "--tls-cert",     &tls_cert)) continue;
+        if (TryFlag(i, argc, argv, "--tls-key",      &tls_key))  continue;
         if (std::strcmp(argv[i], "-h") == 0 ||
             std::strcmp(argv[i], "--help") == 0) {
             Usage(argv[0]);
@@ -70,6 +79,12 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "unknown arg: %s\n", argv[i]);
         Usage(argv[0]);
         return 2;
+    }
+    if (!tls_ca.empty() || !tls_cert.empty() || !tls_key.empty()) {
+        std::fprintf(stderr,
+            "kvstore-node: mTLS paths recorded (ca=%s cert=%s key=%s) "
+            "but TLS termination not yet wired into the grpc server\n",
+            tls_ca.c_str(), tls_cert.c_str(), tls_key.c_str());
     }
     o.grpc_port    = static_cast<uint16_t>(std::atoi(grpc_port_s.c_str()));
     o.metrics_port = static_cast<uint16_t>(std::atoi(metrics_port_s.c_str()));

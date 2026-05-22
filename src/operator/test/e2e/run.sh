@@ -30,6 +30,18 @@ export KUBECONFIG="$KUBECONFIG_PATH"
 echo "==> applying CRDs"
 kubectl apply -f "$REPO_ROOT/src/operator/config/crd/"
 
+# Phase L-2: when E2E_IMAGE is set (typically by
+# `make e2e-operator-workload`) load the image into the kind cluster so
+# the StatefulSet pods can pull it locally. Without this the workload
+# test would land in ImagePullBackOff against a registry that doesn't
+# exist.
+if [ -n "${E2E_IMAGE:-}" ]; then
+    echo "==> loading $E2E_IMAGE into kind cluster $CLUSTER_NAME"
+    kind load docker-image "$E2E_IMAGE" --name "$CLUSTER_NAME"
+fi
+
 echo "==> running e2e tests"
 cd "$REPO_ROOT/src/operator"
-go test -tags=e2e -count=1 -timeout=5m ./test/e2e/...
+# The workload test reads E2E_IMAGE itself; export it through so the go
+# test process inherits the env.
+E2E_IMAGE="${E2E_IMAGE:-}" go test -tags=e2e -count=1 -timeout=10m ./test/e2e/...

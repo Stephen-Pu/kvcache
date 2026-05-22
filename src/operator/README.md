@@ -90,17 +90,26 @@ operator in-process against the kind apiserver, and asserts:
   child StatefulSets when the parent CR goes away — a path the fake
   client can't simulate.
 
-Pods land in `ImagePullBackOff` because the operator's default image
-(`ghcr.io/alluxio/kvcache:e2e`) isn't published yet — Phase L-2 will
-add the multi-stage Dockerfile + `kind load docker-image`. The
-kvstore-node binary itself is no longer a stub (Phase L-1 added a
-real `NodeRuntime` with TCP readiness + `/metrics` + `/healthz`),
-so once an image lands the same kind cluster will run real pods.
-Today's e2e checks object shape only, not workload liveness.
-Invocation:
+Two flavours of the e2e:
+
+* **Object-shape only** (`make e2e-operator`, ~45s): pods land in
+  `ImagePullBackOff` because no image is loaded. We only assert
+  the operator emitted the eight expected K8s objects with the
+  right spec + OwnerReferences. Good for CR-schema / RBAC / GC
+  regression coverage.
+
+* **Workload-Ready** (`make e2e-operator-workload`, ~3-5 min cold):
+  builds the kvstore-node container image from the multi-stage
+  Dockerfile (`src/deploy/docker/Dockerfile.kvstore-node`), loads
+  it into kind, and the e2e suite additionally waits for the
+  StatefulSet's `ReadyReplicas` to hit the desired count. That
+  validates the L-1 `NodeRuntime` (TCP readiness probe) + M-1
+  `NodeData` gRPC server actually come up inside a real pod, not
+  just under gtest.
 
 ```bash
-make e2e-operator          # ~45s; requires docker + kind + kubectl
+make e2e-operator           # quick path
+make e2e-operator-workload  # full path; needs docker + kind
 ```
 
 ## Try it out

@@ -20,7 +20,7 @@ CMAKE        ?= cmake
 GENERATOR    ?= Ninja
 JOBS         ?= $(shell nproc 2>/dev/null || sysctl -n hw.ncpu)
 
-.PHONY: help build configure compile test go go-test go-it py-test clean all e2e-operator
+.PHONY: help build configure compile test go go-test go-it py-test clean all e2e-operator docker-image e2e-operator-workload
 
 help:
 	@grep -E '^# +' Makefile | head -20
@@ -68,6 +68,26 @@ e2e-operator:
 	@command -v kubectl  >/dev/null 2>&1 || { echo "kubectl not installed; brew install kubectl"; exit 1; }
 	@command -v docker   >/dev/null 2>&1 || { echo "docker not installed";                       exit 1; }
 	bash src/operator/test/e2e/run.sh
+
+# Phase L-2: build the kvstore-node container image from the
+# multi-stage Dockerfile. Tag matches what the workload e2e expects.
+KVSTORE_NODE_IMAGE ?= kvcache/kvstore-node:e2e
+
+docker-image:
+	@command -v docker >/dev/null 2>&1 || { echo "docker not installed"; exit 1; }
+	docker build \
+		-f src/deploy/docker/Dockerfile.kvstore-node \
+		-t $(KVSTORE_NODE_IMAGE) \
+		.
+
+# Phase L-2: opt-in workload e2e — builds the image, loads into kind,
+# runs the operator e2e suite with the workload-Ready test enabled.
+e2e-operator-workload:
+	@command -v kind     >/dev/null 2>&1 || { echo "kind not installed";    exit 1; }
+	@command -v kubectl  >/dev/null 2>&1 || { echo "kubectl not installed"; exit 1; }
+	@command -v docker   >/dev/null 2>&1 || { echo "docker not installed";  exit 1; }
+	$(MAKE) docker-image KVSTORE_NODE_IMAGE=$(KVSTORE_NODE_IMAGE)
+	E2E_IMAGE=$(KVSTORE_NODE_IMAGE) bash src/operator/test/e2e/run.sh
 
 clean:
 	rm -rf $(BUILD_DIR)
