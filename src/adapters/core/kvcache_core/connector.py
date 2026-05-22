@@ -1,10 +1,10 @@
 """Engine-agnostic Python wrapper around the Core ABI.
 
-Same shape as the vLLM adapter's ``KVCacheConnector`` — both adapters use
-the same C ABI. The SGLang-flavoured ``SGLangKVBackend`` in ``backend.py``
-wraps this class with the lookup / store / retrieve method names that
-SGLang's RadixAttention L2 connector interface expects, so this file is
-the thin substrate and ``backend.py`` is the engine-facing surface.
+This is the shared substrate every engine adapter (vLLM, SGLang, AIBrix,
+TRT-LLM, ad-hoc demos) builds on. The engine-flavoured surfaces live in
+sibling packages — e.g. ``kvcache_sglang.SGLangKVBackend`` wraps this
+class with the lookup/store/retrieve method names SGLang's
+RadixAttention connector expects.
 
 LLD reference: §6.1.2 (Core ABI) and §6.1.4 (engine adapter strategy).
 """

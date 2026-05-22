@@ -54,7 +54,7 @@ py-test: build
 	@LIB=$$(ls $(BUILD_DIR)/core-abi/libkvcache.dylib $(BUILD_DIR)/core-abi/libkvcache.so 2>/dev/null | head -1); \
 	 if [ -z "$$LIB" ]; then echo "libkvcache.{so,dylib} not found under $(BUILD_DIR)/core-abi/"; exit 1; fi; \
 	 echo "Using $$LIB"; \
-	 KVCACHE_LIB=$$PWD/$$LIB pytest src/adapters/vllm/tests src/adapters/sglang/tests -v
+	 KVCACHE_LIB=$$PWD/$$LIB pytest src/adapters -v
 
 all: test go go-test py-test
 

@@ -18,7 +18,8 @@ Implementation of the enterprise-grade, vendor-neutral KV Cache data layer.
 | `control-plane/`             | Go             | Etcd / K8s ecosystem; not on hot path; lease-based leader election.       |
 | `operator/`                  | Go             | Built with `operator-sdk` / `controller-runtime`.                         |
 | `kvctl/`                     | Go             | Shares CP gRPC client code.                                               |
-| `adapters/vllm,sglang,aibrix`| Python         | Match host engine language; bind Core ABI via `cffi`.                     |
+| `adapters/core/`             | Python         | Shared `cffi` wrapper over libkvcache.so; engine adapters depend on it.   |
+| `adapters/vllm,sglang,aibrix`| Python         | Match host engine language; thin shells over `adapters/core/`.            |
 | `adapters/trtllm/`           | C++            | TRT-LLM `KVCacheManager` backend is C++.                                  |
 | `tests/unit/`                | C++ (gtest)    | Micro-benchmarks, hot-path assertions.                                    |
 | `tests/e2e/`                 | Python (pytest)| End-to-end scenarios (100K RAG, multi-tenant, cross-node).                |
@@ -55,6 +56,7 @@ cd src/kvctl        && go build ./...
 cd src/operator     && go build ./...
 
 # Python adapters
+pip install -e src/adapters/core      # shared cffi substrate
 pip install -e src/adapters/vllm
 pip install -e src/adapters/sglang
 pip install -e src/adapters/aibrix

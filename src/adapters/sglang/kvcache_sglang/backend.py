@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from typing import Optional, Sequence
 
-from .connector import KVCacheConnector
+from kvcache_core import KVCacheConnector
 
 
 class SGLangKVBackend:
