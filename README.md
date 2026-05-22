@@ -171,9 +171,10 @@ Expected end of `make all`:
 ...
 src/adapters/vllm/tests/test_e2e_demo.py::test_prefix_reuse_across_two_requests PASSED
 src/adapters/vllm/tests/test_e2e_demo.py::test_lookup_miss_returns_none PASSED
-src/adapters/sglang/tests/test_backend.py::test_store_then_retrieve_round_trip PASSED
-... (6 more SGLangKVBackend tests)
-============================== 8 passed in 0.1s ================================
+src/adapters/sglang/tests/test_sglang_backend.py::test_store_then_retrieve_round_trip PASSED
+src/adapters/aibrix/tests/test_aibrix_backend.py::test_put_then_get_round_trip PASSED
+... (12 more SGLang / AIBrix backend tests)
+============================== 14 passed in 0.1s ===============================
 ```
 
 Full setup including troubleshooting: [BUILD.md](./BUILD.md).
@@ -252,10 +253,13 @@ LLD section it implements.
   the gRPC variant lands once etcd v3 protos are vendored. Fine for
   control-plane traffic (membership, quota, bloom-sketch sync); not
   yet for sub-ms hot-path roundtrips.
-- **Engine adapters** — vLLM and SGLang both have working Python
-  connectors against the Core ABI (SGLang exposes the RadixAttention-
-  shaped `lookup / store / retrieve / drop` surface); AIBrix and
-  TRT-LLM are stubs.
+- **Engine adapters** — vLLM, SGLang, and AIBrix all ship working
+  Python connectors against the Core ABI. SGLang exposes
+  RadixAttention's `lookup / store / retrieve / drop`; AIBrix
+  exposes KVCache Connector v1's `get / put / delete / exists`. All
+  three adapters are ~50 LOC shells on top of a shared
+  `kvcache_core` package that holds the `cffi` substrate. TRT-LLM
+  is still a stub (C++ engine; needs a different binding path).
 - **K8s operator** scaffolds CRDs but doesn't yet emit StatefulSets.
 
 This is an **honest MVP**: the architecture is complete and verified

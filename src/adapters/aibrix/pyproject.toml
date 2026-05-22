@@ -7,7 +7,7 @@ name = "kvcache-aibrix-adapter"
 version = "0.1.0"
 description = "aibrix adapter for KV Cache (calls libkvcache.so via cffi)"
 requires-python = ">=3.10"
-dependencies = ["cffi>=1.16"]
+dependencies = ["kvcache-core"]
 
 [tool.setuptools.packages.find]
 where = ["."]
