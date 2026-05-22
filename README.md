@@ -70,8 +70,11 @@ boundary, so two clients in the same class round-robin instead of
 one starving the other. Admissions, forced admissions, and queue
 depth are exposed as Prometheus counters / gauges, and `kv.lookup` /
 `kv.fetch` / `nixl.scheduled_pull` spans are emitted through an
-OTel-shaped tracing facade so an operator can answer "why is this
-particular Fetch slow" — not just "how often are Fetches slow".
+OTel-shaped tracing facade — with a built-in OTLP/HTTP exporter
+(`kvcache_otlp` library) so spans land in any standard OTel
+collector (Tempo / Jaeger / alloy / Honeycomb refinery) without
+extra glue. An operator can answer "why is this particular Fetch
+slow" — not just "how often are Fetches slow".
 
 ### 3. Five-tier storage with lazy promotion and cross-tenant eviction
 
@@ -164,13 +167,13 @@ sudo apt-get install cmake ninja-build g++ python3-venv golang-1.22
 python3 -m venv .venv && source .venv/bin/activate
 pip install cffi pytest
 
-make all      # zero warnings, 174/174 tests pass, ~4 minutes cold start
+make all      # zero warnings, 181/181 tests pass, ~4 minutes cold start
 ```
 
 Expected end of `make all`:
 
 ```
-100% tests passed, 0 tests failed out of 174
+100% tests passed, 0 tests failed out of 181
 ...
 src/adapters/vllm/tests/test_e2e_demo.py::test_prefix_reuse_across_two_requests PASSED
 src/adapters/vllm/tests/test_e2e_demo.py::test_lookup_miss_returns_none PASSED
@@ -211,12 +214,14 @@ LLD section it implements.
 
 **Working end-to-end** (run `make all` to verify):
 
-- 12 subsystems, 33 gtest binaries, **174 unit tests** — multi-thread
+- 12 subsystems, 34 gtest binaries, **181 unit tests** — multi-thread
   ART stress, cross-instance TCP Pull, persistent ART round-trip,
   concurrent PriorityScheduler, ScheduledPull through the NIXL
   dispatcher, HttpEtcdClient error-path coverage, TRT-LLM C++
-  backend round-trip, and the OTel-shaped trace facade. Live-etcd
-  integration tests run opt-in via `ETCD_ENDPOINT=...`.
+  backend round-trip, the OTel-shaped trace facade, and the
+  OTLP/HTTP exporter encoder. Live-etcd integration tests run
+  opt-in via `ETCD_ENDPOINT=...`; live-OTel-collector ones run
+  via `OTLP_ENDPOINT=...`.
 - In-process headless backend — the Python demo runs the full LPM →
   fetch → tier promotion → seal → cross-request reuse flow.
 - **Real BLAKE3** for prefix hashing, chunk identity, and HRW

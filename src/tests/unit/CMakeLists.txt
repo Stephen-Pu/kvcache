@@ -133,3 +133,5 @@ kvcache_add_test(test_audit             security/audit_test.cpp              ${N
 
 kvcache_add_test(test_metrics           obs/metrics_test.cpp)
 kvcache_add_test(test_trace             obs/trace_test.cpp)
+kvcache_add_test(test_trace_otlp        obs/trace_otlp_test.cpp)
+target_link_libraries(test_trace_otlp PRIVATE kvcache_otlp CURL::libcurl nlohmann_json::nlohmann_json)

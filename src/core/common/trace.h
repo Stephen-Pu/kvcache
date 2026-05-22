@@ -168,4 +168,73 @@ class JsonStderrExporter final : public Exporter {
 // multiple times; only the first install takes effect.
 void InstallFromEnv();
 
+// ---------------------------------------------------------------------------
+// OTLP/HTTP exporter (Phase J-2)
+//
+// Streams spans as OpenTelemetry's ExportTraceServiceRequest JSON to a
+// configured ``/v1/traces`` endpoint — i.e. a real OTel collector
+// (Tempo, Jaeger, Honeycomb refinery, alloy, ...). The exporter
+// batches spans on a background worker thread so the calling thread
+// only pays the cost of dropping a SpanData onto a queue.
+//
+// Lives in the sibling ``kvcache_otlp`` static library (not in
+// ``kvcache_common``) so the libcurl + nlohmann/json link dependency
+// stays opt-in: callers that don't need OTLP keep the lean build.
+// ---------------------------------------------------------------------------
+
+class OtlpHttpExporter final : public Exporter {
+   public:
+    struct Options {
+        // OTel collector endpoint. Example: ``http://localhost:4318/v1/traces``.
+        std::string endpoint;
+        // Reported as ``service.name`` resource attribute. Default: "kvcache".
+        std::string service_name = "kvcache";
+        // Reported alongside service.name. Empty string disables.
+        std::string service_version;
+        // How long the worker waits between flushes when the queue is
+        // non-empty but below ``max_batch_size``. Smaller = lower
+        // latency; larger = fewer HTTP roundtrips.
+        std::chrono::milliseconds flush_interval{500};
+        // Hard cap on a single HTTP POST. The worker drains up to this
+        // many spans per flush and POSTs them as one request.
+        std::size_t max_batch_size = 512;
+        // libcurl connect + total timeout.
+        std::chrono::milliseconds dial_timeout{5000};
+        // Optional TLS material (libcurl). Empty = insecure / system CA.
+        std::string ca_pem_path;
+        std::string client_cert_pem_path;
+        std::string client_key_pem_path;
+    };
+
+    static std::unique_ptr<OtlpHttpExporter> Create(const Options& opts,
+                                                     std::string* err);
+    ~OtlpHttpExporter() override;
+
+    // Enqueues `span` for asynchronous export. Non-blocking; the
+    // worker thread does the HTTP POST.
+    void Export(const SpanData& span) override;
+
+    // Block until the queue is empty (or until the worker has POSTed
+    // every span queued before the call). Used by tests and by
+    // graceful-shutdown paths.
+    void Flush();
+
+    // pImpl publicly exposed (forward-declared only) so the .cpp's
+    // anonymous-namespace helpers can manipulate the impl directly
+    // without each being befriended individually. Mirrors
+    // HttpEtcdClient::Impl in cluster/etcd_client.h.
+    struct Impl;
+
+   private:
+    OtlpHttpExporter() = default;
+    std::unique_ptr<Impl> impl_;
+};
+
+// Pure encoder, public so tests can drive it without an HTTP round-trip.
+// Produces the JSON body of an OpenTelemetry ExportTraceServiceRequest
+// covering every span in ``spans`` under the given resource attributes.
+std::string EncodeOtlpTracesJson(const std::vector<SpanData>& spans,
+                                   const std::string& service_name,
+                                   const std::string& service_version);
+
 }  // namespace kvcache::trace
