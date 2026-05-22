@@ -55,10 +55,18 @@ func main() {
 	}
 
 	if err := (&controller.KVCacheClusterReconciler{
+		Client:  mgr.GetClient(),
+		Scheme:  mgr.GetScheme(),
+		Members: &controller.EtcdMemberCounter{},
+	}).SetupWithManager(mgr); err != nil {
+		setupExit("unable to set up KVCacheCluster controller", err)
+	}
+
+	if err := (&controller.KVCacheTenantReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
 	}).SetupWithManager(mgr); err != nil {
-		setupExit("unable to set up KVCacheCluster controller", err)
+		setupExit("unable to set up KVCacheTenant controller", err)
 	}
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {

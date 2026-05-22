@@ -8,7 +8,10 @@
 package controller
 
 import (
+	"bytes"
 	"context"
+	"crypto/x509"
+	"encoding/pem"
 	"strconv"
 	"strings"
 	"testing"
@@ -439,6 +442,160 @@ func TestControlPlaneRespectsOverrides(t *testing.T) {
 	}
 	if got := sts.Spec.Template.Spec.Containers[0].Image; got != cluster.Spec.ControlPlane.Image {
 		t.Errorf("expected CP image %q, got %q", cluster.Spec.ControlPlane.Image, got)
+	}
+}
+
+// ---- Phase H-3 A: self-signed mTLS Secret --------------------------------
+
+func TestReconcileEmitsMtlsSecret(t *testing.T) {
+	cluster := sampleCluster()
+	r, cli := newReconciler(t, cluster)
+	reconcileOnce(t, r, cluster)
+
+	var s corev1.Secret
+	key := client.ObjectKey{Name: MtlsSecretName(cluster.Name), Namespace: cluster.Namespace}
+	if err := cli.Get(context.Background(), key, &s); err != nil {
+		t.Fatalf("mTLS Secret missing: %v", err)
+	}
+	if s.Type != corev1.SecretTypeTLS {
+		t.Errorf("expected SecretTypeTLS, got %q", s.Type)
+	}
+	for _, k := range []string{"ca.crt", "ca.key", "tls.crt", "tls.key"} {
+		if len(s.Data[k]) == 0 {
+			t.Errorf("Secret missing key %q", k)
+		}
+	}
+	// Leaf cert should be CA-signed and carry the cluster's service DNS
+	// SANs.
+	caBlock, _ := pem.Decode(s.Data["ca.crt"])
+	caCert, err := x509.ParseCertificate(caBlock.Bytes)
+	if err != nil {
+		t.Fatalf("ca.crt not parseable: %v", err)
+	}
+	leafBlock, _ := pem.Decode(s.Data["tls.crt"])
+	leaf, err := x509.ParseCertificate(leafBlock.Bytes)
+	if err != nil {
+		t.Fatalf("tls.crt not parseable: %v", err)
+	}
+	if err := leaf.CheckSignatureFrom(caCert); err != nil {
+		t.Errorf("leaf is not signed by CA: %v", err)
+	}
+	wantSAN := childName(cluster.Name, "nodes") + "." + cluster.Namespace +
+		".svc.cluster.local"
+	found := false
+	for _, d := range leaf.DNSNames {
+		if d == wantSAN {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("leaf SANs missing %s; got %v", wantSAN, leaf.DNSNames)
+	}
+}
+
+func TestMtlsSecretIsGenerateOnce(t *testing.T) {
+	cluster := sampleCluster()
+	r, cli := newReconciler(t, cluster)
+	reconcileOnce(t, r, cluster)
+
+	key := client.ObjectKey{Name: MtlsSecretName(cluster.Name), Namespace: cluster.Namespace}
+	var first corev1.Secret
+	_ = cli.Get(context.Background(), key, &first)
+
+	// Reconcile again — the bytes must not churn (generate-once).
+	reconcileOnce(t, r, cluster)
+	var second corev1.Secret
+	_ = cli.Get(context.Background(), key, &second)
+	if !bytes.Equal(first.Data["tls.crt"], second.Data["tls.crt"]) {
+		t.Error("mTLS cert regenerated on second reconcile (must be one-shot)")
+	}
+}
+
+func TestNodeStatefulSetMountsMtlsSecret(t *testing.T) {
+	cluster := sampleCluster()
+	r, cli := newReconciler(t, cluster)
+	reconcileOnce(t, r, cluster)
+
+	var sts appsv1.StatefulSet
+	_ = cli.Get(context.Background(),
+		client.ObjectKey{Name: childName(cluster.Name, "nodes"), Namespace: cluster.Namespace}, &sts)
+
+	foundVolume := false
+	for _, v := range sts.Spec.Template.Spec.Volumes {
+		if v.Secret != nil && v.Secret.SecretName == MtlsSecretName(cluster.Name) {
+			foundVolume = true
+		}
+	}
+	if !foundVolume {
+		t.Errorf("kvstore-node StatefulSet missing mTLS volume; got %+v",
+			sts.Spec.Template.Spec.Volumes)
+	}
+	foundMount := false
+	for _, m := range sts.Spec.Template.Spec.Containers[0].VolumeMounts {
+		if m.MountPath == "/etc/kvcache/tls" {
+			foundMount = true
+		}
+	}
+	if !foundMount {
+		t.Errorf("kvstore-node container missing /etc/kvcache/tls mount")
+	}
+}
+
+// ---- Phase H-3 C: etcd-backed membership status --------------------------
+
+type fakeMembers struct{ counts MemberCounts }
+
+func (f *fakeMembers) Count(ctx context.Context,
+	cluster *kvcachev1alpha1.KVCacheCluster) (MemberCounts, error) {
+	return f.counts, nil
+}
+
+func TestStatusUsesEtcdCountsWhenAvailable(t *testing.T) {
+	cluster := sampleCluster()
+	r, cli := newReconciler(t, cluster)
+	r.Members = &fakeMembers{counts: MemberCounts{
+		Active: 2, Joining: 1,
+	}}
+	reconcileOnce(t, r, cluster)
+
+	// Mark all replicas Ready on the STS side so the K8s fallback
+	// would say Active=3. The etcd-side fake reports 2/1; that wins.
+	var sts appsv1.StatefulSet
+	key := client.ObjectKey{Name: childName(cluster.Name, "nodes"), Namespace: cluster.Namespace}
+	_ = cli.Get(context.Background(), key, &sts)
+	sts.Status.Replicas = cluster.Spec.NodeReplicas
+	sts.Status.ReadyReplicas = cluster.Spec.NodeReplicas
+	_ = cli.Status().Update(context.Background(), &sts)
+
+	reconcileOnce(t, r, cluster)
+	_ = cli.Get(context.Background(),
+		client.ObjectKey{Name: cluster.Name, Namespace: cluster.Namespace}, cluster)
+	if cluster.Status.NodesActive != 2 || cluster.Status.NodesJoining != 1 {
+		t.Errorf("expected etcd counts (2/1), got active=%d joining=%d",
+			cluster.Status.NodesActive, cluster.Status.NodesJoining)
+	}
+}
+
+func TestStatusFallsBackToStsWhenEtcdReportsZero(t *testing.T) {
+	cluster := sampleCluster()
+	r, cli := newReconciler(t, cluster)
+	r.Members = &fakeMembers{} // all zeros → "etcd not yet observed"
+	reconcileOnce(t, r, cluster)
+
+	var sts appsv1.StatefulSet
+	key := client.ObjectKey{Name: childName(cluster.Name, "nodes"), Namespace: cluster.Namespace}
+	_ = cli.Get(context.Background(), key, &sts)
+	sts.Status.Replicas = cluster.Spec.NodeReplicas
+	sts.Status.ReadyReplicas = cluster.Spec.NodeReplicas
+	_ = cli.Status().Update(context.Background(), &sts)
+	reconcileOnce(t, r, cluster)
+
+	_ = cli.Get(context.Background(),
+		client.ObjectKey{Name: cluster.Name, Namespace: cluster.Namespace}, cluster)
+	if cluster.Status.NodesActive != cluster.Spec.NodeReplicas {
+		t.Errorf("expected STS-fallback active=%d, got %d",
+			cluster.Spec.NodeReplicas, cluster.Status.NodesActive)
 	}
 }
 

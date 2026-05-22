@@ -213,6 +213,13 @@ func DesiredStatefulSet(cluster *kvcachev1alpha1.KVCacheCluster) *appsv1.Statefu
 			FailureThreshold: 6,
 		},
 	}
+	mtlsVol, mtlsMount := MtlsVolume(cluster)
+	container.VolumeMounts = append(container.VolumeMounts, mtlsMount)
+	container.Args = append(container.Args,
+		"--tls-ca", mtlsMountPath+"/"+mtlsKeyCACert,
+		"--tls-cert", mtlsMountPath+"/"+mtlsKeyTLSCert,
+		"--tls-key", mtlsMountPath+"/"+mtlsKeyTLSKey,
+	)
 	volumes := []corev1.Volume{
 		{
 			Name: configMapVolume,
@@ -224,6 +231,7 @@ func DesiredStatefulSet(cluster *kvcachev1alpha1.KVCacheCluster) *appsv1.Statefu
 				},
 			},
 		},
+		mtlsVol,
 	}
 
 	// PVC for the NVMe tier — only when the user opted in. We model it
@@ -349,6 +357,7 @@ func DesiredEtcdStatefulSet(cluster *kvcachev1alpha1.KVCacheCluster) *appsv1.Sta
 	}
 
 	storageQty := resource.MustParse(storage)
+	mtlsVol, mtlsMount := MtlsVolume(cluster)
 	container := corev1.Container{
 		Name:            etcdContainerName,
 		Image:           image,
@@ -366,6 +375,12 @@ func DesiredEtcdStatefulSet(cluster *kvcachev1alpha1.KVCacheCluster) *appsv1.Sta
 			"--initial-cluster=" + initialCluster.String(),
 			"--initial-cluster-state=new",
 			"--initial-cluster-token=" + cluster.Name + "-etcd",
+			// mTLS material is mounted but etcd 3.5 still runs with the
+			// HTTP-listen flags above so the in-cluster control-plane
+			// (which doesn't speak TLS yet) keeps working. Phase H-4
+			// flips this to --listen-client-urls=https://... once every
+			// caller is mTLS-aware.
+			"--peer-trusted-ca-file=" + mtlsMountPath + "/" + mtlsKeyCACert,
 		},
 		Env: []corev1.EnvVar{
 			{Name: "POD_NAME", ValueFrom: &corev1.EnvVarSource{
@@ -378,6 +393,7 @@ func DesiredEtcdStatefulSet(cluster *kvcachev1alpha1.KVCacheCluster) *appsv1.Sta
 		},
 		VolumeMounts: []corev1.VolumeMount{
 			{Name: etcdDataVolume, MountPath: etcdDataPath},
+			mtlsMount,
 		},
 		ReadinessProbe: &corev1.Probe{
 			ProbeHandler: corev1.ProbeHandler{
@@ -403,6 +419,7 @@ func DesiredEtcdStatefulSet(cluster *kvcachev1alpha1.KVCacheCluster) *appsv1.Sta
 				ObjectMeta: metav1.ObjectMeta{Labels: labels},
 				Spec: corev1.PodSpec{
 					Containers: []corev1.Container{container},
+					Volumes:    []corev1.Volume{mtlsVol},
 				},
 			},
 			VolumeClaimTemplates: []corev1.PersistentVolumeClaim{{
@@ -465,6 +482,7 @@ func DesiredControlPlaneStatefulSet(cluster *kvcachev1alpha1.KVCacheCluster) *ap
 	cpName := childName(cluster.Name, "cp")
 	endpoints := strings.Join(EtcdEndpointsFor(cluster), ",")
 
+	mtlsVol, mtlsMount := MtlsVolume(cluster)
 	container := corev1.Container{
 		Name:            cpContainerName,
 		Image:           image,
@@ -473,7 +491,11 @@ func DesiredControlPlaneStatefulSet(cluster *kvcachev1alpha1.KVCacheCluster) *ap
 		Args: []string{
 			"--etcd-endpoints=" + endpoints,
 			"--listen=:" + portStr(cpGrpcPort),
+			"--tls-ca=" + mtlsMountPath + "/" + mtlsKeyCACert,
+			"--tls-cert=" + mtlsMountPath + "/" + mtlsKeyTLSCert,
+			"--tls-key=" + mtlsMountPath + "/" + mtlsKeyTLSKey,
 		},
+		VolumeMounts: []corev1.VolumeMount{mtlsMount},
 		Env: []corev1.EnvVar{
 			{Name: "KVCACHE_CLUSTER_NAME", Value: cluster.Name},
 			{Name: "KVCACHE_POD_NAME", ValueFrom: &corev1.EnvVarSource{
@@ -508,6 +530,7 @@ func DesiredControlPlaneStatefulSet(cluster *kvcachev1alpha1.KVCacheCluster) *ap
 				Spec: corev1.PodSpec{
 					ServiceAccountName: childName(cluster.Name, "sa"),
 					Containers:         []corev1.Container{container},
+					Volumes:            []corev1.Volume{mtlsVol},
 				},
 			},
 			PodManagementPolicy: appsv1.ParallelPodManagement,

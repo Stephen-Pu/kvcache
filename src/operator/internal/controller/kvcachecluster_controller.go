@@ -40,6 +40,12 @@ import (
 type KVCacheClusterReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+
+	// Members reports per-cluster membership counts from etcd. The
+	// production binding (`EtcdMemberCounter`) dials the in-cluster
+	// etcd Service; unit tests swap a fake. Nil falls back to the
+	// StatefulSet-only status path.
+	Members MemberCounter
 }
 
 // +kubebuilder:rbac:groups=kvcache.alluxio.io,resources=kvcacheclusters,verbs=get;list;watch;create;update;patch;delete
@@ -57,6 +63,14 @@ func (r *KVCacheClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	// 1. ServiceAccount
 	sa := DesiredServiceAccount(&cluster)
 	if err := r.ensureOwned(ctx, &cluster, sa, mergeServiceAccount); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// 1b. mTLS Secret (self-signed, generate-once). We GET first so we
+	// only synthesise material when the Secret is missing; once it
+	// exists the operator never touches it. Phase H-4 will add
+	// rotation + cert-manager opt-in here.
+	if err := r.ensureMtlsSecret(ctx, &cluster); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -109,6 +123,35 @@ func (r *KVCacheClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// ensureMtlsSecret creates the per-cluster mTLS Secret iff none with all
+// four expected keys exists. Generate-once semantics — rotation is
+// deferred to Phase H-4.
+func (r *KVCacheClusterReconciler) ensureMtlsSecret(
+	ctx context.Context, cluster *kvcachev1alpha1.KVCacheCluster) error {
+	var existing corev1.Secret
+	err := r.Get(ctx,
+		client.ObjectKey{Name: MtlsSecretName(cluster.Name), Namespace: cluster.Namespace},
+		&existing)
+	var live *corev1.Secret
+	if err == nil {
+		live = &existing
+	} else if !apierrors.IsNotFound(err) {
+		return err
+	}
+
+	desired, err := DesiredMtlsSecret(cluster, live)
+	if err != nil {
+		return err
+	}
+	if desired == nil {
+		return nil  // existing material is complete; leave it alone
+	}
+	if err := controllerutil.SetControllerReference(cluster, desired, r.Scheme); err != nil {
+		return err
+	}
+	return r.Create(ctx, desired)
 }
 
 // ensureOwned is the GET / CREATE / PATCH loop shared by every dependent
@@ -212,6 +255,18 @@ func (r *KVCacheClusterReconciler) updateStatus(
 		NodesActive:  live.Status.ReadyReplicas,
 		NodesJoining: live.Status.Replicas - live.Status.ReadyReplicas,
 	}
+	// Etcd-backed override: when a MemberCounter is wired in, use its
+	// view (it's the authoritative source). On unreachable etcd the
+	// counter returns zeros and we keep the STS fallback.
+	if r.Members != nil {
+		if mc, err := r.Members.Count(ctx, cluster); err == nil &&
+			(mc.Active+mc.Joining+mc.Draining+mc.Unreachable) > 0 {
+			newStatus.NodesActive = mc.Active
+			newStatus.NodesJoining = mc.Joining
+			newStatus.NodesDraining = mc.Draining
+			newStatus.NodesUnreachable = mc.Unreachable
+		}
+	}
 	// Refresh a single Ready condition so kubectl prints it nicely.
 	readyCondition := metav1.Condition{
 		Type:               "Ready",
@@ -241,6 +296,7 @@ func (r *KVCacheClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&corev1.ServiceAccount{}).
 		Owns(&corev1.ConfigMap{}).
 		Owns(&corev1.Service{}).
+		Owns(&corev1.Secret{}).
 		Owns(&appsv1.StatefulSet{}).
 		Complete(r)
 }

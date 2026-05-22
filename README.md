@@ -241,15 +241,22 @@ LLD section it implements.
   `IEtcdClient` abstraction lets in-memory, HTTP, and a future gRPC
   backend plug in interchangeably.
 - Real Helm chart that renders a deployable K8s manifest.
-- **K8s operator** with a working reconcile loop: each `KVCacheCluster`
-  CR emits the full eight-resource tree — kvstore-node `StatefulSet`
-  + headless `Service` + `ServiceAccount` + `ConfigMap`; a 3-replica
-  in-cluster etcd `StatefulSet` + headless `Service` (skipped when
-  `byoEtcd: true`); and a 3-replica control-plane `StatefulSet` +
-  headless `Service` wired against the same etcd. `kubectl apply -f
-  cluster.yaml` brings up the entire data + control plane. Drift,
-  idempotency, and OwnerReference cascade verified by 17 unit tests
-  against the controller-runtime fake client.
+- **K8s operator** with two reconcilers: `KVCacheCluster` emits the
+  full nine-resource tree per cluster — kvstore-node `StatefulSet` +
+  headless `Service` + `ServiceAccount` + `ConfigMap` + self-signed
+  mTLS `Secret`; a 3-replica in-cluster etcd `StatefulSet` + headless
+  `Service` (skipped when `byoEtcd: true`); and a 3-replica
+  control-plane `StatefulSet` + headless `Service` wired against the
+  same etcd. `kubectl apply -f cluster.yaml` brings up the entire
+  data + control plane with mTLS material in place. `KVCacheTenant`
+  CRs are validated by a second reconciler (hex tenant ID, parseable
+  quota quantities, parent cluster exists) and surface their state
+  via a `Validated` condition. Membership status is read from the
+  in-cluster etcd's `/nodes/` prefix when reachable, with a
+  StatefulSet-ReadyReplicas fallback when it isn't. Drift,
+  idempotency, OwnerReference cascade, etcd-status override, and
+  tenant validation paths are covered by 29 unit tests against the
+  controller-runtime fake client.
 - 7-job CI on every push.
 
 **Honestly not done yet** (called out so nobody is misled):
@@ -269,11 +276,13 @@ LLD section it implements.
   three adapters are ~50 LOC shells on top of a shared
   `kvcache_core` package that holds the `cffi` substrate. TRT-LLM
   is still a stub (C++ engine; needs a different binding path).
-- **K8s operator** — cert-manager-driven mTLS Secret material, the
-  KVCacheTenant CRD controller (3D quota propagation), and the
-  etcd-backed `joining / draining / unreachable` status breakdown
-  are still on the punch-list. Today's reconciler emits the full
-  cluster tree (kvstore-node + etcd + control-plane).
+- **K8s operator** — `cert-manager` integration (`useCertManager:
+  true` switch), mTLS cert rotation, the CP-side wiring that pushes
+  validated tenant quotas to etcd, and the `joining / draining /
+  unreachable` membership breakdown (needs a `state` field in the
+  FSM) are still on the punch-list. Today's reconcilers emit the
+  full cluster tree, the mTLS Secret, and the Tenant `Validated`
+  status surface.
 
 This is an **honest MVP**: the architecture is complete and verified
 end-to-end; production hardening is the next phase.
