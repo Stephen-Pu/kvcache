@@ -147,3 +147,50 @@ TEST_F(GrpcEtcdIntegrationTest, LeaseLifecycle) {
     }
     EXPECT_FALSE(client_->Get(k, &err).has_value());
 }
+
+// Phase F-3 — verifies the bidi-stream watcher.
+//
+// Subscribe a prefix watcher, fire a Put + Delete through KV, assert
+// both events land on the callback in order. The whole exchange goes
+// through one bidi Watch stream — no polling fallback.
+TEST_F(GrpcEtcdIntegrationTest, WatchPrefixDeliversPutThenDelete) {
+    std::mutex                 mu;
+    std::condition_variable    cv;
+    std::vector<WatchEvent>    events;
+
+    auto h = client_->WatchPrefix(prefix_, [&](const WatchEvent& ev) {
+        std::lock_guard<std::mutex> lk(mu);
+        events.push_back(ev);
+        cv.notify_one();
+    });
+    ASSERT_NE(h, 0u) << "WatchPrefix returned no handle — create stream "
+                        "or Create-ack flow failed";
+
+    // Drive the stream from a separate thread so we can race the
+    // events against a deadline.
+    std::string err;
+    ASSERT_TRUE(client_->Put(prefix_ + "w1", "hello", kNoLease, nullptr,
+                                &err))
+        << err;
+    {
+        std::unique_lock<std::mutex> lk(mu);
+        cv.wait_for(lk, std::chrono::seconds(3),
+                     [&] { return events.size() >= 1; });
+    }
+    ASSERT_GE(events.size(), 1u);
+    EXPECT_EQ(events.front().type, WatchEventType::kPut);
+    EXPECT_EQ(events.front().kv.key,   prefix_ + "w1");
+    EXPECT_EQ(events.front().kv.value, "hello");
+
+    ASSERT_TRUE(client_->Delete(prefix_ + "w1", &err)) << err;
+    {
+        std::unique_lock<std::mutex> lk(mu);
+        cv.wait_for(lk, std::chrono::seconds(3),
+                     [&] { return events.size() >= 2; });
+    }
+    ASSERT_GE(events.size(), 2u);
+    EXPECT_EQ(events[1].type,    WatchEventType::kDelete);
+    EXPECT_EQ(events[1].kv.key,  prefix_ + "w1");
+
+    client_->Unwatch(h);
+}

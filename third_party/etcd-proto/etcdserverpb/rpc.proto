@@ -161,3 +161,51 @@ service Lease {
     rpc LeaseRevoke      (LeaseRevokeRequest)      returns (LeaseRevokeResponse);
     rpc LeaseTimeToLive  (LeaseTimeToLiveRequest)  returns (LeaseTimeToLiveResponse);
 }
+
+// ---- Watch service (Phase F-3 — bidi stream) ----------------------------
+//
+// The canonical etcd v3 Watch is a single bidirectional stream that
+// multiplexes many subscriptions ("watch_ids"). Clients send
+// WatchCreateRequest / WatchCancelRequest envelopes via WatchRequest;
+// the server returns one WatchResponse per logical event batch.
+
+message WatchCreateRequest {
+    bytes key                   = 1;
+    bytes range_end             = 2;
+    int64 start_revision        = 3;
+    bool  progress_notify       = 4;
+    enum FilterType { NOPUT = 0; NODELETE = 1; }
+    repeated FilterType filters = 5;
+    bool  prev_kv               = 6;
+    int64 watch_id              = 7;
+    bool  fragment              = 8;
+}
+
+message WatchCancelRequest {
+    int64 watch_id = 1;
+}
+
+message WatchProgressRequest { }
+
+message WatchRequest {
+    oneof request_union {
+        WatchCreateRequest   create_request   = 1;
+        WatchCancelRequest   cancel_request   = 2;
+        WatchProgressRequest progress_request = 3;
+    }
+}
+
+message WatchResponse {
+    ResponseHeader  header           = 1;
+    int64           watch_id         = 2;
+    bool            created          = 3;
+    bool            canceled         = 4;
+    int64           compact_revision = 5;
+    string          cancel_reason    = 6;
+    bool            fragment         = 7;
+    repeated mvccpb.Event events     = 11;
+}
+
+service Watch {
+    rpc Watch (stream WatchRequest) returns (stream WatchResponse);
+}

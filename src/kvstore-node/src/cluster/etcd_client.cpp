@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <deque>
 #include <fstream>
 #include <memory>
 #include <mutex>
@@ -233,18 +235,43 @@ struct GrpcEtcdClient::Impl {
     std::shared_ptr<grpc::Channel>            channel;
     std::unique_ptr<etcdserverpb::KV::Stub>   kv_stub;
     std::unique_ptr<etcdserverpb::Lease::Stub> lease_stub;
+    std::unique_ptr<etcdserverpb::Watch::Stub> watch_stub;
 
-    // Polling watcher (mirrors HttpEtcdClient).
-    struct PollWatcher {
-        std::string                                  prefix;
-        WatchCallback                                cb;
-        std::unordered_map<std::string, KeyValue>    last_state;
+    // Phase F-3 — one bidirectional Watch stream per client, multiplexing
+    // every Watcher's events via the etcd-assigned `watch_id`.
+    //
+    // Lifecycle: the first WatchPrefix() call lazily opens the stream
+    // and spawns a reader thread. Each subsequent WatchPrefix sends a
+    // WatchCreateRequest (under writer_mu_) and blocks on `create_cv`
+    // until the reader sees a `created=true` response carrying the
+    // server-assigned watch_id. The reader dispatches subsequent
+    // Put/Delete events to the matching callback. Unwatch sends a
+    // WatchCancelRequest and removes the (watch_id → callback) entry.
+    struct Watcher {
+        WatchHandle   handle;
+        std::string   prefix;
+        WatchCallback cb;
+        // After Create acks, the server assigns a watch_id; this maps
+        // the client-side handle to it. Cleared on cancel/error.
+        int64_t       watch_id = -1;
     };
-    std::mutex                                   w_mu;
-    std::unordered_map<WatchHandle, PollWatcher> watchers;
-    std::atomic<WatchHandle>                     next_watch{1};
-    std::atomic<bool>                            stop{false};
-    std::thread                                  poller;
+
+    grpc::ClientContext                       watch_ctx;
+    std::unique_ptr<
+        grpc::ClientReaderWriter<etcdserverpb::WatchRequest,
+                                   etcdserverpb::WatchResponse>>
+                                              watch_stream;
+    std::mutex                                writer_mu;   // serialises Write()
+    std::mutex                                w_mu;        // protects maps below
+    std::condition_variable                   create_cv;
+    // Pending creates: matched FIFO against the next `created=true`
+    // response. Etcd preserves request order on the stream.
+    std::deque<WatchHandle>                   pending_creates;
+    std::unordered_map<WatchHandle, Watcher>  watchers;
+    std::unordered_map<int64_t,  WatchHandle> id_to_handle;
+    std::atomic<WatchHandle>                  next_watch{1};
+    std::atomic<bool>                         stop{false};
+    std::thread                               reader_thread;
 #endif
 };
 
@@ -328,6 +355,7 @@ GrpcEtcdClient::Create(const Options& opts, std::string* err) {
     self->impl_->channel = grpc::CreateChannel(target, creds);
     self->impl_->kv_stub    = etcdserverpb::KV::NewStub(self->impl_->channel);
     self->impl_->lease_stub = etcdserverpb::Lease::NewStub(self->impl_->channel);
+    self->impl_->watch_stub = etcdserverpb::Watch::NewStub(self->impl_->channel);
 
     // Smoke-test: a benign Range(empty key). Fails fast when etcd is
     // unreachable so callers see the error at Create-time.
@@ -346,9 +374,21 @@ GrpcEtcdClient::Create(const Options& opts, std::string* err) {
 }
 
 GrpcEtcdClient::~GrpcEtcdClient() {
-    if (impl_) {
-        impl_->stop.store(true, std::memory_order_release);
-        if (impl_->poller.joinable()) impl_->poller.join();
+    if (!impl_) return;
+    impl_->stop.store(true, std::memory_order_release);
+    // Cancel the bidi stream so the reader thread's Read() unblocks.
+    if (impl_->watch_stream) {
+        impl_->watch_ctx.TryCancel();
+        {
+            std::lock_guard<std::mutex> lk(impl_->writer_mu);
+            impl_->watch_stream->WritesDone();
+        }
+    }
+    if (impl_->reader_thread.joinable()) impl_->reader_thread.join();
+    if (impl_->watch_stream) {
+        // Drain the Finish() so we don't trip the grpc++ assert about
+        // calling Finish only after the reader returned false.
+        (void)impl_->watch_stream->Finish();
     }
 }
 
@@ -517,73 +557,143 @@ uint32_t GrpcEtcdClient::LeaseTTLRemaining(LeaseId id) const {
     return static_cast<uint32_t>(resp.ttl());
 }
 
+// Phase F-3 — bidi-stream watcher.
+//
+// First WatchPrefix() lazily opens the stream and spawns a reader
+// thread. Each call sends a WatchCreateRequest and blocks until the
+// reader observes the matching `created=true` ack and binds the
+// server-assigned `watch_id` to the client-side handle. Subsequent
+// events arrive on the same stream multiplexed by watch_id.
 WatchHandle GrpcEtcdClient::WatchPrefix(const std::string& prefix,
                                           WatchCallback cb) {
-    std::lock_guard<std::mutex> lk(impl_->w_mu);
-    const WatchHandle h = impl_->next_watch.fetch_add(1, std::memory_order_relaxed);
-
-    Impl::PollWatcher pw;
-    pw.prefix = prefix;
-    pw.cb     = std::move(cb);
-    // Seed with current state so the first poll only fires diffs.
-    std::string err;
-    for (const auto& kv : GetPrefix(prefix, &err)) {
-        pw.last_state[kv.key] = kv;
+    // Lazily open the stream + spawn reader on the first watcher.
+    {
+        std::lock_guard<std::mutex> lk(impl_->writer_mu);
+        if (!impl_->watch_stream) {
+            impl_->watch_stream = impl_->watch_stub->Watch(&impl_->watch_ctx);
+            impl_->reader_thread = std::thread([this] {
+                etcdserverpb::WatchResponse resp;
+                while (impl_->watch_stream->Read(&resp)) {
+                    // Match a `created=true` ack to the next pending
+                    // WatchPrefix() call (etcd preserves request order
+                    // on the stream, so FIFO works).
+                    if (resp.created()) {
+                        std::lock_guard<std::mutex> lk(impl_->w_mu);
+                        if (impl_->pending_creates.empty()) continue;
+                        const WatchHandle h = impl_->pending_creates.front();
+                        impl_->pending_creates.pop_front();
+                        auto it = impl_->watchers.find(h);
+                        if (it != impl_->watchers.end()) {
+                            it->second.watch_id = resp.watch_id();
+                            impl_->id_to_handle[resp.watch_id()] = h;
+                        }
+                        impl_->create_cv.notify_all();
+                        continue;
+                    }
+                    if (resp.canceled()) {
+                        std::lock_guard<std::mutex> lk(impl_->w_mu);
+                        auto it = impl_->id_to_handle.find(resp.watch_id());
+                        if (it != impl_->id_to_handle.end()) {
+                            impl_->id_to_handle.erase(it);
+                        }
+                        continue;
+                    }
+                    // Event batch — find the callback by watch_id and
+                    // dispatch each event without holding the lock (the
+                    // user callback might re-enter the client).
+                    WatchCallback cb_copy;
+                    {
+                        std::lock_guard<std::mutex> lk(impl_->w_mu);
+                        auto it = impl_->id_to_handle.find(resp.watch_id());
+                        if (it == impl_->id_to_handle.end()) continue;
+                        auto wit = impl_->watchers.find(it->second);
+                        if (wit == impl_->watchers.end()) continue;
+                        cb_copy = wit->second.cb;
+                    }
+                    for (const auto& ev_pb : resp.events()) {
+                        WatchEvent ev;
+                        ev.type = ev_pb.type() == mvccpb::Event::DELETE
+                                      ? WatchEventType::kDelete
+                                      : WatchEventType::kPut;
+                        if (ev_pb.has_kv())      ev.kv      = FromPbKv(ev_pb.kv());
+                        if (ev_pb.has_prev_kv()) ev.prev_kv = FromPbKv(ev_pb.prev_kv());
+                        cb_copy(ev);
+                    }
+                }
+                // Stream closed — wake any waiters so they don't hang.
+                std::lock_guard<std::mutex> lk(impl_->w_mu);
+                impl_->create_cv.notify_all();
+            });
+        }
     }
-    impl_->watchers[h] = std::move(pw);
 
-    if (!impl_->poller.joinable()) {
-        impl_->poller = std::thread([this] {
-            while (!impl_->stop.load(std::memory_order_acquire)) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(500));
-                if (impl_->stop.load(std::memory_order_acquire)) break;
+    const WatchHandle h = impl_->next_watch.fetch_add(1, std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lk(impl_->w_mu);
+        Impl::Watcher w;
+        w.handle = h;
+        w.prefix = prefix;
+        w.cb     = std::move(cb);
+        impl_->watchers[h] = std::move(w);
+        impl_->pending_creates.push_back(h);
+    }
 
-                std::vector<std::pair<WatchHandle, std::string>> snapshot;
-                {
-                    std::lock_guard<std::mutex> lk2(impl_->w_mu);
-                    snapshot.reserve(impl_->watchers.size());
-                    for (const auto& [id, w] : impl_->watchers) {
-                        snapshot.emplace_back(id, w.prefix);
-                    }
-                }
-                for (const auto& [id, prefix] : snapshot) {
-                    std::string e;
-                    auto cur = GetPrefix(prefix, &e);
-                    if (!e.empty() && cur.empty()) continue;
-                    std::lock_guard<std::mutex> lk2(impl_->w_mu);
-                    auto it = impl_->watchers.find(id);
-                    if (it == impl_->watchers.end()) continue;
-                    auto& w = it->second;
-                    std::unordered_map<std::string, KeyValue> new_state;
-                    new_state.reserve(cur.size());
-                    for (const auto& kv : cur) new_state[kv.key] = kv;
-                    for (const auto& [k, kv] : new_state) {
-                        auto pit = w.last_state.find(k);
-                        if (pit == w.last_state.end() ||
-                            pit->second.mod_revision != kv.mod_revision) {
-                            WatchEvent ev{WatchEventType::kPut, kv,
-                                           pit == w.last_state.end()
-                                               ? KeyValue{} : pit->second};
-                            w.cb(ev);
-                        }
-                    }
-                    for (const auto& [k, kv] : w.last_state) {
-                        if (new_state.find(k) == new_state.end()) {
-                            WatchEvent ev{WatchEventType::kDelete, kv, kv};
-                            w.cb(ev);
-                        }
-                    }
-                    w.last_state = std::move(new_state);
-                }
+    // Send the WatchCreateRequest. The writer mutex serialises stream
+    // writes (gRPC's bidi stream is single-Write at a time).
+    etcdserverpb::WatchRequest req;
+    auto* cr = req.mutable_create_request();
+    cr->set_key(prefix);
+    cr->set_range_end(PrefixRangeEnd(prefix));
+    {
+        std::lock_guard<std::mutex> lk(impl_->writer_mu);
+        if (!impl_->watch_stream->Write(req)) {
+            // Write failed — drop the watcher and surface a "dead handle".
+            std::lock_guard<std::mutex> lk2(impl_->w_mu);
+            impl_->watchers.erase(h);
+            // Best-effort: remove from pending_creates if still there.
+            for (auto it = impl_->pending_creates.begin();
+                 it != impl_->pending_creates.end(); ++it) {
+                if (*it == h) { impl_->pending_creates.erase(it); break; }
             }
-        });
+            return 0;
+        }
+    }
+
+    // Wait until the reader maps a watch_id to this handle (or stop).
+    std::unique_lock<std::mutex> lk(impl_->w_mu);
+    impl_->create_cv.wait_for(lk, std::chrono::seconds(5), [&] {
+        auto it = impl_->watchers.find(h);
+        return impl_->stop.load(std::memory_order_acquire) ||
+               (it != impl_->watchers.end() && it->second.watch_id >= 0);
+    });
+    auto it = impl_->watchers.find(h);
+    if (it == impl_->watchers.end() || it->second.watch_id < 0) {
+        // Timeout / error: don't leak the entry.
+        if (it != impl_->watchers.end()) impl_->watchers.erase(it);
+        for (auto pit = impl_->pending_creates.begin();
+             pit != impl_->pending_creates.end(); ++pit) {
+            if (*pit == h) { impl_->pending_creates.erase(pit); break; }
+        }
+        return 0;
     }
     return h;
 }
 
 void GrpcEtcdClient::Unwatch(WatchHandle h) {
-    std::lock_guard<std::mutex> lk(impl_->w_mu);
-    impl_->watchers.erase(h);
+    int64_t watch_id = -1;
+    {
+        std::lock_guard<std::mutex> lk(impl_->w_mu);
+        auto it = impl_->watchers.find(h);
+        if (it == impl_->watchers.end()) return;
+        watch_id = it->second.watch_id;
+        if (watch_id >= 0) impl_->id_to_handle.erase(watch_id);
+        impl_->watchers.erase(it);
+    }
+    if (watch_id < 0 || !impl_->watch_stream) return;
+    etcdserverpb::WatchRequest req;
+    req.mutable_cancel_request()->set_watch_id(watch_id);
+    std::lock_guard<std::mutex> lk(impl_->writer_mu);
+    (void)impl_->watch_stream->Write(req);
 }
 
 #else  // !KVCACHE_HAVE_GRPC — facade returns errors so the tree compiles.

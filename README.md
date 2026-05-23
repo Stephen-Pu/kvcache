@@ -211,14 +211,14 @@ cd kvcache
 python3 -m venv .venv && source .venv/bin/activate
 pip install cffi pytest
 
-make all      # zero warnings · 210/210 tests pass · ~4 min cold start
+make all      # zero warnings · 211/211 tests pass · ~4 min cold start
 ```
 
 Expected end of `make all`:
 
 ```
 # C++ ctest
-100% tests passed, 0 tests failed out of 210
+100% tests passed, 0 tests failed out of 211
 
 # Go (control-plane + operator)
 ok  control-plane/internal/membership   …
@@ -252,7 +252,7 @@ Run `make all` to verify. **207 unit tests across 38 gtest binaries**, plus Go a
 
 ### L2 — Coordination
 - **HRW + Bloom routing** with peer sketch broadcast
-- **Real etcd, two C++ clients** — `HttpEtcdClient` (libcurl, runs on dev laptop) and `GrpcEtcdClient` (canonical etcd v3 protos, vendored at `third_party/etcd-proto/`). Auto-enabled when `find_package(gRPC)` succeeds.
+- **Real etcd, two C++ clients** — `HttpEtcdClient` (libcurl, runs on dev laptop, polling Watch) and `GrpcEtcdClient` (canonical etcd v3 protos vendored at `third_party/etcd-proto/`, **real bidi Watch stream** with watch_id multiplexing). Auto-enabled when `find_package(gRPC)` succeeds.
 - **Go side** uses embedded etcd v3.5 in tests.
 
 ### L3 — Service
@@ -275,7 +275,11 @@ Run `make all` to verify. **207 unit tests across 38 gtest binaries**, plus Go a
 Called out so nobody is misled:
 
 - **Real RDMA backends** (UCX / GDR / GDS / NVLink) — await Mellanox CX-6/7 + IB / RoCE fabric. `INixlBackend` interface ready.
-- **Streaming Watch** on `GrpcEtcdClient` — both etcd clients poll today; bidi stream lands in F-3.
+- **HttpEtcdClient Watch** is still poll-based (it talks to the JSON
+  gateway, which doesn't expose the streaming Watch RPC cleanly).
+  `GrpcEtcdClient` carries the real bidi Watch stream — Phase F-3 —
+  so production deployments that need event-driven config push run
+  the gRPC client.
 - **gRPC `NodeData` is in-process only** — `ReserveResponse.slot_iova` is a server-side host pointer. Cross-process / cross-node path will replace iova fields with NIXL `RemoteMrDescriptor` exchange (Phase M-3).
 - **Per-(tenant, model) `kv_ctx_t` cache** — today's binary uses one default ctx; multi-tenant wire routing kicks in at Phase M-3.
 - **Cert-manager opt-in** — operator emits self-signed certs today; `Certificate` CR pathway pending.
