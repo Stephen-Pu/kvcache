@@ -320,6 +320,93 @@ TEST_F(NodeDataFixture, FetchAcceptsRemoteMrDescriptor) {
 //   * kv_export_mr / kv_import_remote_mr — round-trip a registered
 //     buffer's MR descriptor through the NIXL backend so cross-process
 //     callers can hand it over the wire.
+// Phase M-5 — HeadlessNode::Fetch honours a pre-registered dst.mr_key.
+//
+// Drives a full Reserve → Publish → Seal → Lookup → Fetch through the
+// gRPC service with the destination buffer registered up-front via the
+// new kv_register_local_mr C ABI. Asserts:
+//   * Fetch succeeds with dst_mr_key != 0.
+//   * The same key is still valid after the Fetch completes (the
+//     handler did NOT unregister it — the second Fetch in a row would
+//     fail under the old "register & unregister per call" semantics
+//     for an imported-remote key).
+TEST_F(NodeDataFixture, FetchHonoursPreRegisteredDstMrKey) {
+    const auto tokens             = RangeTokens(15000, 2 * kChunkTokens);
+    const std::size_t bytes_total = tokens.size() * 64;
+
+    // Reserve + write known pattern.
+    ::grpc::ClientContext rctx;
+    kvcache::proto::ReserveRequest rreq;
+    *rreq.mutable_locator() = BuildLocator(tenant_id_, model_id_, tokens,
+                                             bytes_total);
+    rreq.set_bytes(bytes_total);
+    kvcache::proto::ReserveResponse rresp;
+    ASSERT_TRUE(stub_->Reserve(&rctx, rreq, &rresp).ok());
+    auto* slot = reinterpret_cast<uint8_t*>(rresp.slot_iova());
+    for (std::size_t i = 0; i < bytes_total; ++i) {
+        slot[i] = static_cast<uint8_t>((i * 17 + 3) & 0xff);
+    }
+
+    // Publish + Seal.
+    ::grpc::ClientContext pctx;
+    kvcache::proto::PublishRequest preq;
+    preq.set_server_handle(rresp.server_handle());
+    preq.set_watermark(bytes_total);
+    kvcache::proto::PublishResponse presp;
+    ASSERT_TRUE(stub_->Publish(&pctx, preq, &presp).ok());
+
+    ::grpc::ClientContext sctx;
+    kvcache::proto::SealRequest sreq;
+    sreq.set_server_handle(rresp.server_handle());
+    for (uint32_t t : tokens) sreq.add_tokens(t);
+    kvcache::proto::SealResponse sresp;
+    ASSERT_TRUE(stub_->Seal(&sctx, sreq, &sresp).ok());
+
+    // Look up to mint a read handle.
+    ::grpc::ClientContext lctx;
+    kvcache::proto::LookupRequest lreq;
+    lreq.set_tenant_id(tenant_id_);
+    for (uint32_t t : tokens) lreq.add_tokens(t);
+    kvcache::proto::LookupResponse lresp;
+    ASSERT_TRUE(stub_->Lookup(&lctx, lreq, &lresp).ok());
+    ASSERT_TRUE(lresp.hit());
+
+    // Pre-register the dst buffer via the C ABI exposed for engines.
+    // This is the hot-path knob M-5 unlocks: engines register once,
+    // pass the key on every Fetch, no per-call NIXL churn.
+    std::vector<uint8_t> dst(bytes_total, 0);
+    uint32_t dst_key = 0;
+    ASSERT_EQ(kv_register_local_mr(ctx_, dst.data(), dst.size(), &dst_key),
+              KV_OK);
+    ASSERT_NE(dst_key, 0u);
+
+    auto issue_fetch = [&]() {
+        ::grpc::ClientContext fctx;
+        kvcache::proto::FetchRequest freq;
+        freq.set_server_handle(lresp.server_handle());
+        freq.set_dst_iova(reinterpret_cast<uint64_t>(dst.data()));
+        freq.set_dst_bytes(dst.size());
+        freq.set_dst_mr_key(dst_key);  // <-- pre-registered
+        kvcache::proto::FetchResponse fresp;
+        return stub_->Fetch(&fctx, freq, &fresp);
+    };
+
+    // Two Fetches back-to-back with the same pre-registered dst key
+    // — the second proves the handler did not silently unregister it.
+    auto s1 = issue_fetch();
+    EXPECT_TRUE(s1.ok()) << s1.error_message();
+    EXPECT_EQ(std::memcmp(dst.data(), slot, bytes_total), 0);
+
+    std::fill(dst.begin(), dst.end(), 0);
+    auto s2 = issue_fetch();
+    EXPECT_TRUE(s2.ok()) << s2.error_message();
+    EXPECT_EQ(std::memcmp(dst.data(), slot, bytes_total), 0)
+        << "second fetch with the same dst key produced wrong bytes — "
+           "handler probably unregistered the key after the first call";
+
+    EXPECT_EQ(kv_unregister_local_mr(ctx_, dst_key), KV_OK);
+}
+
 TEST(KvAbiM3, OpenFromHashesAndMrRoundTrip) {
     kv_ctx_t* ctx = nullptr;
     ASSERT_EQ(kv_ctx_open_from_hashes(KVCACHE_ABI_VERSION,

@@ -184,6 +184,22 @@ int kv_import_remote_mr(kv_ctx_t*      ctx,
                         size_t         len,
                         uint32_t*      out_mr_key);
 
+/* Register a local memory region with the ctx's NIXL backend.
+ * Engines typically register a long-lived fetch destination buffer
+ * once at startup and pass the resulting key in
+ * `kv_buffer_desc_t::mr_key` for every kv_fetch — so the hot path
+ * never registers / unregisters per call (Phase M-5). The key is
+ * stable until kv_unregister_local_mr is called (or kv_ctx_close on
+ * the owning ctx). */
+int kv_register_local_mr(kv_ctx_t* ctx,
+                          void*     addr,
+                          size_t    bytes,
+                          uint32_t* out_mr_key);
+
+/* Drop a key previously returned by kv_register_local_mr or
+ * kv_import_remote_mr. Idempotent on unknown keys. */
+int kv_unregister_local_mr(kv_ctx_t* ctx, uint32_t mr_key);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

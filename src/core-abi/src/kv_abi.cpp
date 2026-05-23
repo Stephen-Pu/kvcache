@@ -231,4 +231,26 @@ KV_API int kv_import_remote_mr(kv_ctx_t* ctx, const uint8_t* buf,
     return KV_OK;
 }
 
+KV_API int kv_register_local_mr(kv_ctx_t* ctx, void* addr, size_t bytes,
+                                 uint32_t* out_mr_key) {
+    if (!ctx || !ctx->node || !addr || bytes == 0 || !out_mr_key) {
+        return KV_E_INVAL;
+    }
+    auto* be = ctx->node->backend();
+    if (!be) return KV_E_INTERNAL;
+    std::string err;
+    auto k = be->RegisterRegion(addr, bytes, &err);
+    if (k == kvcache::node::transport::kInvalidMrKey) return KV_E_TRANSPORT;
+    *out_mr_key = k;
+    return KV_OK;
+}
+
+KV_API int kv_unregister_local_mr(kv_ctx_t* ctx, uint32_t mr_key) {
+    if (!ctx || !ctx->node) return KV_E_INVAL;
+    auto* be = ctx->node->backend();
+    if (!be) return KV_E_INTERNAL;
+    be->UnregisterRegion(mr_key);
+    return KV_OK;
+}
+
 }  // extern "C"

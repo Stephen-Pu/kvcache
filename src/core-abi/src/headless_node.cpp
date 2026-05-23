@@ -268,9 +268,24 @@ int HeadlessNode::Fetch(kv_handle_t handle, uint64_t tenant_hash,
     // Loopback NIXL transfer into the caller's dst buffer.
     if (!dst.addr || dst.len < f.data.size()) return KV_E_NOMEM;
     auto src_mr = nixl_->Register(f.data.data(), f.data.size(), &err);
-    auto dst_mr = nixl_->Register(dst.addr, dst.len, &err);
-    if (src_mr == node::transport::kInvalidMrKey ||
-        dst_mr == node::transport::kInvalidMrKey) return KV_E_TRANSPORT;
+    if (src_mr == node::transport::kInvalidMrKey) return KV_E_TRANSPORT;
+
+    // Phase M-5 — honour a pre-registered destination key. When
+    // engines register their fetch buffer once at startup (via
+    // kv_register_local_mr) — or when the gRPC handler has imported
+    // a remote MR descriptor — `dst.mr_key` is already a key the
+    // backend recognises. Re-registering would either fail outright
+    // (imported-remote case) or churn keys for no reason
+    // (long-lived-local case). We use the supplied key directly and
+    // do not unregister it: ownership stays with the caller.
+    const bool reuse_dst_mr = (dst.mr_key != 0);
+    node::transport::MrKey dst_mr = reuse_dst_mr
+        ? static_cast<node::transport::MrKey>(dst.mr_key)
+        : nixl_->Register(dst.addr, dst.len, &err);
+    if (dst_mr == node::transport::kInvalidMrKey) {
+        nixl_->Unregister(src_mr);
+        return KV_E_TRANSPORT;
+    }
 
     node::transport::PullRequest req{dst_mr, 0, src_mr, 0, f.data.size()};
     // P1 is the default class for ordinary Fetch. The tenant hash routes
@@ -280,11 +295,11 @@ int HeadlessNode::Fetch(kv_handle_t handle, uint64_t tenant_hash,
     if (!nixl_->ScheduledPull(req, node::transport::Priority::P1,
                                 tenant_hash, 5000, &err)) {
         nixl_->Unregister(src_mr);
-        nixl_->Unregister(dst_mr);
+        if (!reuse_dst_mr) nixl_->Unregister(dst_mr);
         return KV_E_TRANSPORT;
     }
     nixl_->Unregister(src_mr);
-    nixl_->Unregister(dst_mr);
+    if (!reuse_dst_mr) nixl_->Unregister(dst_mr);
 
     *out_completion = handle;  // synchronous in loopback; reuse handle as id
     return KV_OK;
