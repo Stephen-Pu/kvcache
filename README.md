@@ -280,8 +280,8 @@ Called out so nobody is misled:
   `GrpcEtcdClient` carries the real bidi Watch stream — Phase F-3 —
   so production deployments that need event-driven config push run
   the gRPC client.
-- **gRPC `NodeData` is in-process only** — `ReserveResponse.slot_iova` is a server-side host pointer. Cross-process / cross-node path will replace iova fields with NIXL `RemoteMrDescriptor` exchange (Phase M-3).
-- **Per-(tenant, model) `kv_ctx_t` cache** — today's binary uses one default ctx; multi-tenant wire routing kicks in at Phase M-3.
+- **gRPC `NodeData` cross-process Pull** — Phase M-3 B added `ReserveResponse.remote_mr_descriptor` + `FetchRequest.dst_remote_mr_descriptor` (opaque NIXL `RemoteMrDescriptor` bytes, Export/Import surfaced through the C ABI as `kv_export_mr` / `kv_import_remote_mr`). The legacy in-process `slot_iova` / `dst_iova` path coexists for callers that share an address space.
+- **Per-(tenant, model) `kv_ctx_t` cache — Phase M-3 A**. `NodeDataServiceImpl` lazily opens a distinct ctx for each `(tenant_hash, model_hash)` seen on the wire via a new `kv_ctx_open_from_hashes` ABI helper, with a reverse handle→ctx map so Publish/Fetch/Seal/Release land on the same ctx that minted the handle. Verified by `LookupOpensPerTenantModelCtx`.
 - **Cert-manager opt-in** — operator emits self-signed certs today; `Certificate` CR pathway pending.
 
 This is an **honest MVP**: architecture complete, end-to-end verified on a laptop, production hardening is the next phase.

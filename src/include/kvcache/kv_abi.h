@@ -40,6 +40,24 @@ typedef struct {
 int kv_ctx_open (const kv_ctx_config_t* cfg, kv_ctx_t** out_ctx);
 int kv_ctx_close(kv_ctx_t* ctx);
 
+/*
+ * kv_ctx_open_from_hashes — variant of kv_ctx_open used by the gRPC
+ * NodeData service (Phase M-3 A). The wire only carries
+ * `model_id_hash` (fixed64), never the canonical `model_id` string, so
+ * the service can't reconstruct the same hash via FNV-1a on its end.
+ * This entry point lets the caller supply both hashes directly and
+ * leaves the string fields empty.
+ *
+ * `tenant_id_hash` plumbs through to the PriorityScheduler so distinct
+ * tenants land in distinct round-robin buckets. Pass the same value
+ * the engine-side ABI would compute via FNV-1a over the tenant string.
+ */
+int kv_ctx_open_from_hashes(int32_t  abi_version,
+                            uint64_t tenant_id_hash,
+                            uint64_t model_id_hash,
+                            uint32_t flags,
+                            kv_ctx_t** out_ctx);
+
 /* ------------------------------------------------------------------------- */
 /* Hot-path data-plane operations (LLD §6.1.2)                               */
 /* ------------------------------------------------------------------------- */
@@ -139,6 +157,32 @@ int kv_subscribe_events(kv_ctx_t* ctx,
  * call even when no subscription exists. Blocks until the poller
  * thread observes the cancel and exits.                              */
 int kv_unsubscribe_events(kv_ctx_t* ctx);
+
+/* ------------------------------------------------------------------------- */
+/* NIXL RemoteMrDescriptor exchange (Phase M-3 B)                            */
+/* ------------------------------------------------------------------------- */
+
+/* Export `local_mr_key` (a key previously returned by Reserve.slot.mr_key
+ * or by an internal RegisterRegion) as an opaque descriptor that a peer
+ * backend can import via kv_import_remote_mr. On success returns KV_OK
+ * and writes the descriptor bytes into `out_buf` up to `buf_cap`, with
+ * the true length written to `*out_len`. If `out_buf` is null or
+ * `buf_cap < *out_len`, returns KV_E_NOMEM with `*out_len` set so the
+ * caller can size a second call. */
+int kv_export_mr(kv_ctx_t* ctx,
+                 uint32_t  local_mr_key,
+                 uint8_t*  out_buf,
+                 size_t    buf_cap,
+                 size_t*   out_len);
+
+/* Import a peer's descriptor (typically received from kv_export_mr on
+ * another node) into this ctx's NIXL backend, yielding a local mr_key
+ * usable as `dst.mr_key` in subsequent kv_fetch calls. Returns KV_OK
+ * and writes the key to *out_mr_key on success. */
+int kv_import_remote_mr(kv_ctx_t*      ctx,
+                        const uint8_t* buf,
+                        size_t         len,
+                        uint32_t*      out_mr_key);
 
 #ifdef __cplusplus
 } /* extern "C" */

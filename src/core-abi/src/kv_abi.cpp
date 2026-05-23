@@ -11,6 +11,7 @@
 
 #include "headless_node.h"
 #include "kvcache/kv_errors.h"
+#include "transport/nixl_wrapper.h"
 
 extern "C" {
 
@@ -75,6 +76,39 @@ KV_API int kv_ctx_open(const kv_ctx_config_t* cfg, kv_ctx_t** out_ctx) {
     c->model_id_hash  = Fnv1a64(c->model_id);
     c->tenant_id_hash = c->tenant_id.empty() ? 0 : Fnv1a64(c->tenant_id);
     c->node = node;
+    *out_ctx = c;
+    return KV_OK;
+}
+
+KV_API int kv_ctx_open_from_hashes(int32_t abi_version,
+                                    uint64_t tenant_id_hash,
+                                    uint64_t model_id_hash,
+                                    uint32_t /*flags*/,
+                                    kv_ctx_t** out_ctx) {
+    if (!out_ctx) return KV_E_INVAL;
+    if (abi_version != KVCACHE_ABI_VERSION) return KV_E_VERSION_MISMATCH;
+
+    // Same headless-node singleton as kv_ctx_open; identity is carried
+    // entirely through ctx->tenant_id_hash + ctx->model_id_hash so the
+    // string fields stay empty.
+    kvcache::abi::HeadlessNode::Options opts{};
+    opts.tier.pinned.pool_bytes = 32ull << 20;
+    opts.tier.pinned.slot_bytes =  4ull << 20;
+    opts.tier.pinned.use_mlock  = false;
+    opts.tier.dram.capacity_bytes    = 64ull << 20;
+    opts.tier.dram.a1out_max_entries = 1024;
+    opts.tier.enable_nvme = false;
+    opts.tier.enable_cold = false;
+    opts.nixl_backend = "loopback";
+
+    std::string err;
+    auto* node = kvcache::abi::HeadlessNode::GetOrCreate(opts, &err);
+    if (!node) return KV_E_INTERNAL;
+
+    auto c = new kv_ctx_s();
+    c->model_id_hash  = model_id_hash;
+    c->tenant_id_hash = tenant_id_hash;
+    c->node           = node;
     *out_ctx = c;
     return KV_OK;
 }
@@ -147,6 +181,34 @@ KV_API int kv_unsubscribe_events(kv_ctx_t* ctx) {
     if (ctx->sub_id == 0) return KV_OK;  // idempotent
     ctx->node->UnsubscribeEvents(ctx->sub_id);
     ctx->sub_id = 0;
+    return KV_OK;
+}
+
+KV_API int kv_export_mr(kv_ctx_t* ctx, uint32_t local_mr_key,
+                         uint8_t* out_buf, size_t buf_cap, size_t* out_len) {
+    if (!ctx || !ctx->node || !out_len) return KV_E_INVAL;
+    auto* be = ctx->node->backend();
+    if (!be) return KV_E_INTERNAL;
+    kvcache::node::transport::RemoteMrDescriptor desc;
+    std::string err;
+    if (!be->ExportMr(local_mr_key, &desc, &err)) return KV_E_INVAL;
+    *out_len = desc.opaque.size();
+    if (!out_buf || buf_cap < desc.opaque.size()) return KV_E_NOMEM;
+    std::memcpy(out_buf, desc.opaque.data(), desc.opaque.size());
+    return KV_OK;
+}
+
+KV_API int kv_import_remote_mr(kv_ctx_t* ctx, const uint8_t* buf,
+                                size_t len, uint32_t* out_mr_key) {
+    if (!ctx || !ctx->node || !buf || !out_mr_key) return KV_E_INVAL;
+    auto* be = ctx->node->backend();
+    if (!be) return KV_E_INTERNAL;
+    kvcache::node::transport::RemoteMrDescriptor desc;
+    desc.opaque.assign(buf, buf + len);
+    std::string err;
+    auto k = be->ImportRemoteMr(desc, &err);
+    if (k == kvcache::node::transport::kInvalidMrKey) return KV_E_INVAL;
+    *out_mr_key = k;
     return KV_OK;
 }
 

@@ -99,6 +99,14 @@ class HeadlessNode {
     SubscriptionId SubscribeEvents(EventCallback cb, void* user);
     void           UnsubscribeEvents(SubscriptionId id);
 
+    // Phase M-3 B — expose the NIXL backend so the gRPC layer can
+    // Export / Import RemoteMrDescriptors on the same backend that
+    // owns the registered pinned-tier MR. Returns nullptr if Init
+    // failed (no backend was created).
+    node::transport::INixlBackend* backend() {
+        return nixl_ ? nixl_->backend() : nullptr;
+    }
+
    private:
     HeadlessNode() = default;
 

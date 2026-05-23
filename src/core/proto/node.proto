@@ -74,9 +74,16 @@ message ReserveRequest {
 message ReserveResponse {
   fixed64 server_handle = 1;
   // The NIXL-registered slot the caller writes into.
-  uint64  slot_iova     = 2;  // server-mapped address
+  uint64  slot_iova     = 2;  // server-mapped address (in-process only)
   uint64  slot_bytes    = 3;
-  uint32  mr_key        = 4;  // NIXL memory key
+  uint32  mr_key        = 4;  // server-local NIXL memory key
+  // Phase M-3 B — opaque NIXL RemoteMrDescriptor describing the slot,
+  // produced by INixlBackend::ExportMr. Cross-process / cross-node
+  // callers feed this to their own backend's ImportRemoteMr so the
+  // server-initiated Pull can target the slot without sharing an
+  // address space. Empty when the backend doesn't support export
+  // (e.g. the in-process loopback path with an unregistered slot).
+  bytes   remote_mr_descriptor = 5;
 }
 
 message PublishRequest {
@@ -96,6 +103,12 @@ message FetchRequest {
   uint64   dst_bytes      = 4;
   uint32   dst_mr_key     = 5;
   uint32   priority       = 6;
+  // Phase M-3 B — opaque NIXL RemoteMrDescriptor for the destination
+  // buffer. When non-empty the server calls ImportRemoteMr on it to
+  // resolve a backend-local key and uses that as the Pull destination,
+  // ignoring `dst_iova` / `dst_mr_key`. Empty falls back to the
+  // legacy in-process path.
+  bytes    dst_remote_mr_descriptor = 7;
 }
 
 message FetchResponse {
