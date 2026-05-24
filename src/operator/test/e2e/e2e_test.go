@@ -417,6 +417,41 @@ func TestRealWorkloadPodReady(t *testing.T) {
 					}
 				}
 			}
+			// Phase Q-4 — dump the container logs (current + previous)
+			// AND the LastTerminationState (exit code + reason),
+			// AND `kubectl describe pod` — so diagnostics survive
+			// cluster teardown even when stdout is empty (crashes
+			// before logging anything).
+			for _, p := range pods.Items {
+				if !strings.HasPrefix(p.Name, "e2e-cp-") {
+					continue
+				}
+				for _, cs := range p.Status.ContainerStatuses {
+					if cs.LastTerminationState.Terminated != nil {
+						lt := cs.LastTerminationState.Terminated
+						t.Logf("  %s last-terminated: exit=%d signal=%d "+
+							"reason=%s message=%q",
+							cs.Name, lt.ExitCode, lt.Signal,
+							lt.Reason, lt.Message)
+					}
+					if cs.State.Terminated != nil {
+						lt := cs.State.Terminated
+						t.Logf("  %s state-terminated: exit=%d signal=%d "+
+							"reason=%s message=%q",
+							cs.Name, lt.ExitCode, lt.Signal,
+							lt.Reason, lt.Message)
+					}
+				}
+				t.Logf("---- kubectl logs %s/%s (current) ----",
+					ns, p.Name)
+				t.Log(kubectlLogs(ns, p.Name, false))
+				t.Logf("---- kubectl logs %s/%s --previous ----",
+					ns, p.Name)
+				t.Log(kubectlLogs(ns, p.Name, true))
+				t.Logf("---- kubectl describe pod %s/%s ----",
+					ns, p.Name)
+				t.Log(kubectlDescribe(ns, p.Name))
+			}
 			if requireCp {
 				t.Fatalf("control-plane pod never reached Ready: %v", cpErr)
 			}
@@ -425,6 +460,51 @@ func TestRealWorkloadPodReady(t *testing.T) {
 				cpErr)
 		}
 	}
+}
+
+// kubectlDescribe wraps `kubectl describe pod` for Q-4 diagnostics —
+// surfaces events (failed mounts, image pull errors, OOMKilled) that
+// don't appear in stdout logs.
+func kubectlDescribe(ns, podName string) string {
+	kubeconfig := os.Getenv("KUBECONFIG")
+	if kubeconfig == "" {
+		home, _ := os.UserHomeDir()
+		kubeconfig = filepath.Join(home, ".kube", "config")
+	}
+	out, err := exec.Command("kubectl",
+		"--kubeconfig", kubeconfig,
+		"-n", ns,
+		"describe", "pod", podName).CombinedOutput()
+	if err != nil {
+		return fmt.Sprintf("[kubectl describe failed: %v]\n%s", err, out)
+	}
+	return string(out)
+}
+
+// kubectlLogs runs `kubectl logs` against the named pod and returns
+// the stdout/stderr stitched together. Used by the Q-4 diagnostics
+// path to surface CrashLoopBackOff container output without making
+// the caller read the kind cluster manually. `previous=true` adds
+// --previous to retrieve logs from the prior crashed container.
+func kubectlLogs(ns, podName string, previous bool) string {
+	kubeconfig := os.Getenv("KUBECONFIG")
+	if kubeconfig == "" {
+		home, _ := os.UserHomeDir()
+		kubeconfig = filepath.Join(home, ".kube", "config")
+	}
+	args := []string{
+		"--kubeconfig", kubeconfig,
+		"-n", ns,
+		"logs", podName, "--tail=80",
+	}
+	if previous {
+		args = append(args, "--previous")
+	}
+	out, err := exec.Command("kubectl", args...).CombinedOutput()
+	if err != nil {
+		return fmt.Sprintf("[kubectl logs failed: %v]\n%s", err, out)
+	}
+	return string(out)
 }
 
 // TestCascadeDeleteRemovesChildren: real apiserver-driven test that the

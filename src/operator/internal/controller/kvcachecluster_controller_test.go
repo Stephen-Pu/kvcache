@@ -471,6 +471,15 @@ func TestReconcileEmitsControlPlane(t *testing.T) {
 	if !strings.Contains(args, "--etcd-endpoints=") {
 		t.Errorf("CP args missing etcd endpoints flag: %s", args)
 	}
+	// Phase Q-4 — pin the binary path so a Dockerfile rename or an
+	// operator typo can't silently send the pod into CrashLoopBackOff
+	// with "no such file or directory" again. The CP Dockerfile
+	// ships /usr/local/bin/cp (see src/deploy/docker/Dockerfile.cp).
+	cmd := sts.Spec.Template.Spec.Containers[0].Command
+	if len(cmd) == 0 || cmd[0] != "/usr/local/bin/cp" {
+		t.Errorf("CP Command = %v, want [/usr/local/bin/cp] "+
+			"(matches Dockerfile.cp ENTRYPOINT)", cmd)
+	}
 }
 
 func TestControlPlaneRespectsOverrides(t *testing.T) {

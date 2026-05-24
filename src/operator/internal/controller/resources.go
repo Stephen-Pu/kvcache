@@ -502,7 +502,14 @@ func DesiredControlPlaneStatefulSet(cluster *kvcachev1alpha1.KVCacheCluster) *ap
 		Name:            cpContainerName,
 		Image:           image,
 		ImagePullPolicy: corev1.PullIfNotPresent,
-		Command:         []string{"/usr/local/bin/control-plane"},
+		// Phase Q-4 — the Dockerfile ships the binary at /usr/local/bin/cp
+		// (see src/deploy/docker/Dockerfile.cp's `COPY --from=build
+		// /out/cp /usr/local/bin/cp` + ENTRYPOINT). The previous path
+		// `/usr/local/bin/control-plane` doesn't exist in the image, so
+		// containerd's runc init failed with "no such file or directory"
+		// and the pod went into CrashLoopBackOff before producing any
+		// stdout — making the bug hard to spot without `kubectl describe`.
+		Command:         []string{"/usr/local/bin/cp"},
 		Args: []string{
 			"--etcd-endpoints=" + endpoints,
 			"--listen=:" + portStr(cpGrpcPort),
