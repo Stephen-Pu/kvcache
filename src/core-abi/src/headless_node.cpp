@@ -303,12 +303,13 @@ int HeadlessNode::Fetch(kv_handle_t handle, uint64_t tenant_hash,
     const bool dst_is_remote = be && be->IsRemote(dst_mr);
     bool xfer_ok = false;
     if (dst_is_remote) {
-        // TODO(stephen): route this through PriorityScheduler too —
-        // for M-6 we do the Push synchronously so the test path is
-        // simple. The scheduler integration mirrors ScheduledPull.
+        // Phase M-7 — Push goes through the same scheduler as Pull so
+        // per-tenant QoS reservations and round-robin admission apply
+        // uniformly across the data plane.
         node::transport::PushRequest preq{src_mr, 0, dst_mr, 0,
                                             f.data.size()};
-        xfer_ok = (be->Push(preq, &err) != node::transport::kInvalidCompletionId);
+        xfer_ok = nixl_->ScheduledPush(preq, node::transport::Priority::P1,
+                                        tenant_hash, 5000, &err);
     } else {
         node::transport::PullRequest req{dst_mr, 0, src_mr, 0, f.data.size()};
         // P1 is the default class for ordinary Fetch. The tenant hash

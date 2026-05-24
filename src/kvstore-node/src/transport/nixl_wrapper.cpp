@@ -202,16 +202,51 @@ bool NixlWrapper::ScheduledPull(const PullRequest& req, Priority prio,
         return false;
     }
 
-    PendingPull pp;
-    pp.req        = req;
+    PendingXfer pp;
+    pp.kind       = PendingXfer::Kind::kPull;
+    pp.pull       = req;
     pp.timeout_ms = timeout_ms;
     // The scheduler stores `&pp` as the WorkItem user pointer; the
-    // dispatcher casts back to drive the Pull. PendingPull is owned by this
-    // stack frame and outlives the dispatcher call because we wait on
-    // pp.cv before returning.
+    // dispatcher casts back to drive the Pull / Push. PendingXfer is
+    // owned by this stack frame and outlives the dispatcher call
+    // because we wait on pp.cv before returning.
     sched_.Submit(prio, tenant_hash, req.bytes, &pp);
 
     // Wake the dispatcher.
+    {
+        std::lock_guard lk(disp_mu_);
+        disp_cv_.notify_one();
+    }
+
+    std::unique_lock lk(pp.mu);
+    pp.cv.wait(lk, [&] { return pp.done; });
+
+    if (err) *err = pp.err;
+    if (!pp.ok) span.SetError(pp.err);
+    return pp.ok;
+}
+
+bool NixlWrapper::ScheduledPush(const PushRequest& req, Priority prio,
+                                  uint64_t tenant_hash, uint32_t timeout_ms,
+                                  std::string* err) {
+    auto span = kvcache::trace::Tracer::Get().StartSpan("nixl.scheduled_push");
+    span.SetAttribute("nixl.bytes",        static_cast<int64_t>(req.bytes));
+    span.SetAttribute("nixl.tenant_hash",  static_cast<int64_t>(tenant_hash));
+    span.SetAttribute("nixl.priority",     static_cast<int64_t>(prio));
+    span.SetAttribute("nixl.backend",      name_);
+
+    if (!backend_) {
+        span.SetError("no backend");
+        if (err) *err = "nixl: no backend";
+        return false;
+    }
+
+    PendingXfer pp;
+    pp.kind       = PendingXfer::Kind::kPush;
+    pp.push       = req;
+    pp.timeout_ms = timeout_ms;
+    sched_.Submit(prio, tenant_hash, req.bytes, &pp);
+
     {
         std::lock_guard lk(disp_mu_);
         disp_cv_.notify_one();
@@ -241,9 +276,14 @@ void NixlWrapper::DispatcherLoop() {
 
         // Drain whatever the scheduler currently admits.
         while (auto w = sched_.TryNext()) {
-            auto* pp = static_cast<PendingPull*>(w->user);
+            auto* pp = static_cast<PendingXfer*>(w->user);
             std::string local_err;
-            const auto cid = backend_->Pull(pp->req, &local_err);
+            CompletionId cid = kInvalidCompletionId;
+            if (pp->kind == PendingXfer::Kind::kPull) {
+                cid = backend_->Pull(pp->pull, &local_err);
+            } else {
+                cid = backend_->Push(pp->push, &local_err);
+            }
             bool ok = false;
             if (cid != kInvalidCompletionId) {
                 ok = backend_->Wait(cid, pp->timeout_ms, &local_err);

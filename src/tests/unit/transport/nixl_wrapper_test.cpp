@@ -148,6 +148,84 @@ TEST(NixlWrapperTest, ScheduledPullConcurrentCallersAllSucceed) {
               static_cast<uint64_t>(kN));
 }
 
+// ---- Phase M-7: ScheduledPush --------------------------------------------
+
+TEST(NixlWrapperTest, ScheduledPushRoutesThroughScheduler) {
+    NixlWrapper w(Loopback());
+    std::vector<uint8_t> src(256, 0xAA), dst(256, 0x00);
+    std::string err;
+    auto sk = w.Register(src.data(), src.size(), &err);
+    auto dk = w.Register(dst.data(), dst.size(), &err);
+
+    const auto admits_before =
+        w.scheduler().NormalAdmissions() + w.scheduler().ForcedAdmissions();
+
+    // Loopback's Push is a memcpy in the same direction as Pull, so the
+    // observable side effect is the same: dst gets the src bytes. What
+    // we're verifying here is that ScheduledPush walked through the
+    // PriorityScheduler dispatcher, not a backend back-door.
+    PushRequest r{sk, 0, dk, 0, 256};
+    EXPECT_TRUE(w.ScheduledPush(r, Priority::P1, kSystemTenantHash, 1000, &err))
+        << err;
+    EXPECT_EQ(std::memcmp(src.data(), dst.data(), 256), 0);
+
+    const auto admits_after =
+        w.scheduler().NormalAdmissions() + w.scheduler().ForcedAdmissions();
+    EXPECT_EQ(admits_after - admits_before, 1u)
+        << "ScheduledPush did not submit through the scheduler";
+
+    // Scheduler ends quiescent.
+    EXPECT_EQ(w.scheduler().QueueDepth(Priority::P1), 0u);
+    EXPECT_EQ(w.scheduler().InFlightBytes(Priority::P1), 0u);
+}
+
+TEST(NixlWrapperTest, ScheduledPushMixedWithPullDrainsAll) {
+    NixlWrapper w(Loopback());
+    constexpr int kN = 24;  // half Pulls, half Pushes
+    std::vector<std::vector<uint8_t>> srcs(kN, std::vector<uint8_t>(64, 0));
+    std::vector<std::vector<uint8_t>> dsts(kN, std::vector<uint8_t>(64, 0));
+    for (int i = 0; i < kN; ++i) {
+        for (auto& b : srcs[i]) b = static_cast<uint8_t>((i * 7) & 0xff);
+    }
+    std::vector<MrKey> sk(kN), dk(kN);
+    {
+        std::string err;
+        for (int i = 0; i < kN; ++i) {
+            sk[i] = w.Register(srcs[i].data(), srcs[i].size(), &err);
+            dk[i] = w.Register(dsts[i].data(), dsts[i].size(), &err);
+        }
+    }
+
+    std::atomic<int> ok{0};
+    std::vector<std::thread> ts;
+    for (int i = 0; i < kN; ++i) {
+        ts.emplace_back([&, i] {
+            std::string err;
+            const auto prio = static_cast<Priority>(i % 3);
+            const uint64_t tenant = (i & 1) ? 0xAAull : 0xBBull;
+            if (i & 1) {  // odd: Pull
+                PullRequest r{dk[i], 0, sk[i], 0, 64};
+                if (w.ScheduledPull(r, prio, tenant, 5000, &err)) ++ok;
+            } else {       // even: Push
+                PushRequest r{sk[i], 0, dk[i], 0, 64};
+                if (w.ScheduledPush(r, prio, tenant, 5000, &err)) ++ok;
+            }
+        });
+    }
+    for (auto& t : ts) t.join();
+
+    EXPECT_EQ(ok.load(), kN);
+    for (int i = 0; i < kN; ++i) {
+        EXPECT_EQ(std::memcmp(srcs[i].data(), dsts[i].data(), 64), 0)
+            << "thread " << i;
+    }
+    EXPECT_EQ(w.scheduler().QueueDepth(Priority::P0), 0u);
+    EXPECT_EQ(w.scheduler().QueueDepth(Priority::P1), 0u);
+    EXPECT_EQ(w.scheduler().QueueDepth(Priority::P2), 0u);
+    EXPECT_EQ(w.scheduler().NormalAdmissions() + w.scheduler().ForcedAdmissions(),
+              static_cast<uint64_t>(kN));
+}
+
 TEST(NixlWrapperTest, ScheduledPullCustomSchedulerOpts) {
     // Construct with a non-default scheduler config; verify the wrapper
     // honours it (a small Pull still goes through, and the scheduler is

@@ -203,11 +203,24 @@ class NixlWrapper {
                        uint64_t tenant_hash, uint32_t timeout_ms,
                        std::string* err);
 
+    // Phase M-7 — server-push counterpart of ScheduledPull. Same
+    // admission semantics: per-(class, tenant) round-robin, idle-credit
+    // lending, starvation overrides — but the dispatcher drives
+    // backend->Push instead of Pull when this work item pops.
+    bool ScheduledPush(const PushRequest& req, Priority prio,
+                       uint64_t tenant_hash, uint32_t timeout_ms,
+                       std::string* err);
+
    private:
-    // Per-call state for ScheduledPull. The dispatcher thread fills in
-    // `ok` / `err` and notifies the caller via `cv`.
-    struct PendingPull {
-        PullRequest          req;
+    // Per-call state for the scheduled transfer paths. The dispatcher
+    // thread fills in `ok` / `err` and notifies the caller via `cv`.
+    // A single struct covers both Pull and Push so the dispatcher's
+    // WorkItem pointer keeps one type.
+    struct PendingXfer {
+        enum class Kind : uint8_t { kPull, kPush };
+        Kind                 kind       = Kind::kPull;
+        PullRequest          pull{};
+        PushRequest          push{};
         uint32_t             timeout_ms = 0;
         bool                 done       = false;
         bool                 ok         = false;
