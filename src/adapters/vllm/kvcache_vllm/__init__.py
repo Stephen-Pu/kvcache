@@ -1,9 +1,9 @@
 """vLLM adapter package. See README.md and LLD §6.1.4.
 
-The classes here are re-exports from :mod:`kvcache_core` — every adapter
-shares the same thin Python wrapper around the C ABI. vLLM-flavoured
-extensions (e.g. a future ``VllmKVConnector`` that matches vLLM's
-``KVConnectorBase`` shape) will land in this package as siblings.
+The Core ABI re-exports (``KVCacheConnector`` etc.) stay for callers
+that want the engine-agnostic surface. The vLLM-flavoured wrapper
+``VllmKVConnector`` lives in :mod:`kvcache_vllm.connector` and matches
+the method names + lifecycle of vLLM v1's ``KVConnectorBase``.
 """
 
 from kvcache_core import (
@@ -12,5 +12,13 @@ from kvcache_core import (
     LookupResult,
     ReserveResult,
 )
+from .connector import VllmConnectorMetadata, VllmKVConnector
 
-__all__ = ["KVCacheConnector", "KVCacheError", "LookupResult", "ReserveResult"]
+__all__ = [
+    "KVCacheConnector",
+    "KVCacheError",
+    "LookupResult",
+    "ReserveResult",
+    "VllmConnectorMetadata",
+    "VllmKVConnector",
+]
