@@ -68,6 +68,19 @@ class Refcount {
 
     bool IsZero() const noexcept { return Load() == 0; }
 
+    // Phase G-2 — eviction claim. Atomically CAS 1 -> 0, succeeding
+    // only when the only outstanding reference is the ART-owned baseline
+    // installed at Seal. If a Lookup races and bumps the count to 2+
+    // between an external check and the CAS, this primitive fails and
+    // the evictor defers — the leaf stays reachable until the holders
+    // Release. Mirror of TryAcquireIfNonZero on the producer side.
+    bool TryEvict() noexcept {
+        uint32_t expected = 1;
+        return v_.compare_exchange_strong(expected, 0,
+                                          std::memory_order_acq_rel,
+                                          std::memory_order_acquire);
+    }
+
    private:
     std::atomic<uint32_t> v_{0};
 };

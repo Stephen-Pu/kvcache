@@ -130,6 +130,16 @@ class ArtIndex {
     LookupResult Lookup(std::span<const ChunkHash> path,
                         const ReaderGuard& guard) const;
 
+    // Phase G-2 — exact-path leaf peek. Walks the tree until a leaf
+    // sits at exactly `path` and returns it (nullptr if the path is
+    // empty, the walk fails, or what sits at the terminal slot is an
+    // inner node, not a leaf). Unlike Lookup() this does NOT do
+    // longest-prefix-match — partial matches return nullptr. Used by
+    // the deferred-eviction sweeper to (re)check whether a previously
+    // observed leaf is still the one the path points at.
+    LeafData* LookupByPath(std::span<const ChunkHash> path,
+                            const ReaderGuard& guard) const;
+
     // ---- stats ----
     std::size_t LeafCount() const noexcept {
         return leaf_count_.load(std::memory_order_acquire);

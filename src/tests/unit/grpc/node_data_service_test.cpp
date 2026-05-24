@@ -14,6 +14,7 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <chrono>
 #include <thread>
 #include <vector>
 
@@ -476,35 +477,65 @@ TEST_F(NodeDataFixture, DramEvictionPrunesArtLeaf) {
         return {};
     };
 
-    auto lookup_hits = [&](uint32_t lo) -> bool {
+    // Lookup helper that returns the server_handle on a hit (for
+    // explicit Release later — leaking the handle would keep the
+    // leaf's refcount above baseline and G-2 would correctly refuse
+    // to evict it).
+    auto lookup_handle = [&](uint32_t lo) -> uint64_t {
         ::grpc::ClientContext lctx;
         kvcache::proto::LookupRequest lreq;
         lreq.set_tenant_id(tenant_id_);
         for (uint32_t t : RangeTokens(lo, 2 * kChunkTokens)) lreq.add_tokens(t);
         kvcache::proto::LookupResponse lresp;
-        if (!stub_->Lookup(&lctx, lreq, &lresp).ok()) return false;
-        return lresp.hit();
+        if (!stub_->Lookup(&lctx, lreq, &lresp).ok()) return 0;
+        if (!lresp.hit()) return 0;
+        return lresp.server_handle();
+    };
+    auto release_handle = [&](uint64_t h) {
+        ::grpc::ClientContext rctx;
+        kvcache::proto::ReleaseRequest req;
+        req.set_server_handle(h);
+        kvcache::proto::ReleaseResponse resp;
+        (void)stub_->Release(&rctx, req, &resp);
     };
 
     // Seal the canary first; it's the LRU victim and should be the
     // one that gets pruned when DRAM overflows.
     const uint32_t canary_lo = 60000;
     ASSERT_EQ(seal_prefix(canary_lo), "");
-    ASSERT_TRUE(lookup_hits(canary_lo)) << "canary should be present after seal";
+    const uint64_t canary_h = lookup_handle(canary_lo);
+    ASSERT_NE(canary_h, 0u) << "canary should be present after seal";
 
-    // Now seal 16 more distinct prefixes — each adds 4 MiB to DRAM.
-    // The canary's bytes (and possibly its ART leaf) get evicted once
-    // DRAM crosses capacity.
+    // Now seal more distinct prefixes — each adds 4 MiB to DRAM.
     for (int i = 1; i <= kSeals; ++i) {
         const uint32_t lo = 60000 + static_cast<uint32_t>(i) * 1000;
         ASSERT_EQ(seal_prefix(lo), "") << "seal #" << i << " failed";
     }
 
-    // The canary's leaf should have been removed from ART by the
-    // DRAM-eviction → ART-prune bridge — Lookup misses.
-    EXPECT_FALSE(lookup_hits(canary_lo))
-        << "canary still in ART after enough seals to overflow DRAM — "
-           "G-1 prune callback did not fire";
+    // Phase G-2: with the canary still pinned by `canary_h` the
+    // sweeper must NOT evict it — Lookup keeps hitting. We probe
+    // with lookup+immediate-release so the probe itself doesn't bump
+    // the long-term refcount.
+    auto probe_hit = [&]() -> bool {
+        uint64_t h = lookup_handle(canary_lo);
+        if (h) { release_handle(h); return true; }
+        return false;
+    };
+    EXPECT_TRUE(probe_hit())
+        << "G-2: canary with live holder must not be evicted yet";
+
+    // Drop the only long-term hold. The sweeper wakes on Release and
+    // the next tick claims the leaf.
+    release_handle(canary_h);
+
+    // Wait up to 1s for the sweeper to claim the deferred leaf.
+    bool evicted = false;
+    for (int i = 0; i < 40; ++i) {
+        if (!probe_hit()) { evicted = true; break; }
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+    EXPECT_TRUE(evicted)
+        << "G-2: canary should have been swept after all holders Released";
 }
 
 TEST(KvAbiM3, OpenFromHashesAndMrRoundTrip) {

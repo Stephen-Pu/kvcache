@@ -48,6 +48,14 @@ void HeadlessNode::Shutdown() {
     g_singleton = nullptr;
 }
 
+HeadlessNode::~HeadlessNode() {
+    // Stop the sweeper first; everything below may otherwise be torn
+    // down while SweeperLoop is mid-iteration.
+    sweeper_stop_.store(true, std::memory_order_release);
+    defer_cv_.notify_all();
+    if (sweeper_.joinable()) sweeper_.join();
+}
+
 bool HeadlessNode::Init(const Options& opts, std::string* err) {
     // Phase M-4 — build the NIXL backend FIRST so we can hand its
     // RegisterRegion to the pinned tier as its register_region
@@ -139,6 +147,8 @@ bool HeadlessNode::Init(const Options& opts, std::string* err) {
     }
     if (!art_ && !art_wal_) art_ = std::make_unique<node::prefix::ArtIndex>();
     events_  = std::make_unique<node::prefix::EventStream>();
+    // Phase G-2 — start the refcount-deferred eviction sweeper.
+    sweeper_ = std::thread([this] { SweeperLoop(); });
     // The PriorityScheduler lives inside NixlWrapper (Phase E-2); the
     // backend was constructed above so the pinned tier could register
     // its pool with it.
@@ -442,6 +452,9 @@ int HeadlessNode::Release(kv_handle_t handle) {
         buffers_->Release(st.ingest_handle);
     } else if (st.kind == HandleKind::kRead && st.leaf) {
         st.leaf->refcount.Release();
+        // Phase G-2 — releasing a reader may unblock a deferred
+        // eviction; nudge the sweeper out of its wait_for tick.
+        defer_cv_.notify_one();
     }
     return KV_OK;
 }
@@ -517,46 +530,135 @@ void HeadlessNode::UnsubscribeEvents(SubscriptionId id) {
 }
 
 // ---------------------------------------------------------------------------
-// DRAM-eviction bridge (Phase G-1)
+// DRAM-eviction bridge (Phase G-1 → G-2)
 // ---------------------------------------------------------------------------
 //
-// Fires synchronously inside DramTier::EvictToFit (DramTier's mutex is
-// held when we run). Constraints: NEVER touch tm_ again from here —
-// that would deadlock. ART writes are independent and safe.
+// G-1 wired DramTier evictions to ART pruning. G-2 makes the pruning
+// refcount-aware: if a leaf has live Lookup-acquired holders
+// (refcount > 1), we cannot Remove from ART without leaving dangling
+// kv_handle_ts behind — so the path is queued and a background
+// sweeper retries until TryEvict succeeds (or the leaf is replaced).
+//
+// Fires synchronously inside DramTier::EvictToFit (DramTier's mutex
+// is held). Constraint: never touch tm_ from here.
 void HeadlessNode::OnDramEvict(const node::tier::DramKey& key) {
-    // 1) Resolve DramKey -> chunk_path under the local map mutex,
-    //    then drop the lock before touching ART / events.
     std::vector<node::prefix::ChunkHash> path;
-    kv_locator_t loc{};
     {
         std::lock_guard lk(mu_evict_);
         auto it = evict_index_.find(key);
-        if (it == evict_index_.end()) return;  // unknown — nothing to prune
+        if (it == evict_index_.end()) return;
         path = std::move(it->second);
         evict_index_.erase(it);
     }
     if (path.empty()) return;
 
-    // 2) Remove the leaf from ART. If readers are mid-Lookup they
-    //    stay valid via the epoch guard; the leaf is reclaimed when
-    //    the last reader exits. We don't peek the leaf for its
-    //    locator first because the only public ART read API is
-    //    LongestPrefixMatch (over token-derived chunks), and adding
-    //    an exact-path-peek to ArtIndex just for the EVICT event is
-    //    scope creep — subscribers can correlate via the chunk path.
-    bool removed = art_wal_
-        ? art_wal_->Remove({path.data(), path.size()})
-        : art_->Remove({path.data(), path.size()});
-    if (!removed) return;
+    if (TryEvictNow({path.data(), path.size()})) return;
 
-    // 3) Publish an Evict event so subscribers (gRPC Subscribe
-    //    stream, in-process callbacks) see the cache miss happen.
+    // Couldn't claim — there are outstanding holders. Queue for the
+    // sweeper; record the current leaf pointer + locator so the
+    // sweeper can recognise "leaf replaced" vs "still the same leaf,
+    // still has holders".
+    node::prefix::ArtIndex& art_ref = art_wal_ ? art_wal_->art() : *art_;
+    auto g = art_ref.EnterRead();
+    auto* leaf = art_ref.LookupByPath({path.data(), path.size()}, g);
+    if (!leaf) return;  // already gone by some other path
+
+    DeferredEvict entry;
+    entry.path    = std::move(path);
+    entry.leaf    = leaf;
+    entry.locator = leaf->locator;
+    {
+        std::lock_guard lk(mu_defer_);
+        deferred_evicts_.push_back(std::move(entry));
+    }
+    defer_cv_.notify_one();
+}
+
+// Atomic claim + Remove + EVICT publish for a single path. Returns
+// true on success (leaf was at refcount 1 and we evicted it), false
+// if the path no longer maps to a leaf or the leaf has live holders.
+bool HeadlessNode::TryEvictNow(
+    std::span<const node::prefix::ChunkHash> path) {
+    node::prefix::ArtIndex& art_ref = art_wal_ ? art_wal_->art() : *art_;
+    node::prefix::LeafData* leaf = nullptr;
+    kv_locator_t loc{};
+    {
+        auto g = art_ref.EnterRead();
+        leaf = art_ref.LookupByPath(path, g);
+        if (!leaf) return false;
+        loc = leaf->locator;
+    }
+    // Atomic claim: only proceed if no Lookup-acquired holders.
+    if (!leaf->refcount.TryEvict()) return false;
+
+    // We now own the right to remove. From this point on a racing
+    // Lookup that wants this leaf will see refcount == 0 and bail
+    // via TryAcquireIfNonZero.
+    bool removed = art_wal_
+        ? art_wal_->Remove(path)
+        : art_->Remove(path);
+    if (!removed) return false;
+
     if (events_) {
         node::prefix::Event ev{};
         ev.type    = node::prefix::EventType::Evict;
         ev.tier    = node::prefix::Tier::Dram;
         ev.locator = loc;
         events_->Publish(ev);
+    }
+    return true;
+}
+
+// Sweeper: every ~50ms (or sooner on a Release-driven notify), walk
+// the deferred queue and retry each entry's TryEvictNow. Drop entries
+// whose leaf was already replaced.
+void HeadlessNode::SweeperLoop() {
+    constexpr auto kTick = std::chrono::milliseconds(50);
+    while (!sweeper_stop_.load(std::memory_order_acquire)) {
+        {
+            std::unique_lock<std::mutex> lk(mu_defer_);
+            defer_cv_.wait_for(lk, kTick, [&] {
+                return sweeper_stop_.load(std::memory_order_acquire) ||
+                       !deferred_evicts_.empty();
+            });
+        }
+        if (sweeper_stop_.load(std::memory_order_acquire)) break;
+
+        // Move the current queue out so we don't hold mu_defer_ across
+        // ART ops. Anything we can't evict this pass gets re-queued.
+        std::vector<DeferredEvict> work;
+        {
+            std::lock_guard lk(mu_defer_);
+            work.swap(deferred_evicts_);
+        }
+        if (work.empty()) continue;
+
+        std::vector<DeferredEvict> still_pending;
+        still_pending.reserve(work.size());
+        node::prefix::ArtIndex& art_ref =
+            art_wal_ ? art_wal_->art() : *art_;
+        for (auto& e : work) {
+            // Check identity: if the leaf at path is no longer the one
+            // we deferred, a fresh Seal replaced it — drop entry.
+            bool drop_replaced = false;
+            {
+                auto g = art_ref.EnterRead();
+                auto* cur = art_ref.LookupByPath(
+                    {e.path.data(), e.path.size()}, g);
+                if (cur != e.leaf) drop_replaced = true;
+            }
+            if (drop_replaced) continue;
+
+            if (!TryEvictNow({e.path.data(), e.path.size()})) {
+                still_pending.push_back(std::move(e));
+            }
+        }
+        if (!still_pending.empty()) {
+            std::lock_guard lk(mu_defer_);
+            for (auto& e : still_pending) {
+                deferred_evicts_.push_back(std::move(e));
+            }
+        }
     }
 }
 

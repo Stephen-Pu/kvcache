@@ -175,4 +175,28 @@ ArtIndex::LookupResult ArtIndex::Lookup(std::span<const ChunkHash> path,
     return best;
 }
 
+LeafData* ArtIndex::LookupByPath(std::span<const ChunkHash> path,
+                                  const ReaderGuard& /*guard*/) const {
+    if (path.empty()) return nullptr;
+
+    const ArtInner256* cur = root_.get();
+    for (std::size_t i = 0; i + 1 < path.size(); ++i) {
+        const ChunkHash& h = path[i];
+        const uint8_t slot = h[0];
+        ArtNode* child = cur->children[slot].load(std::memory_order_acquire);
+        if (!child || !EdgeMatches(*child, h) ||
+            child->tag != ArtNodeTag::Inner256) {
+            return nullptr;
+        }
+        cur = static_cast<const ArtInner256*>(child);
+    }
+    const ChunkHash& last = path.back();
+    const uint8_t slot = last[0];
+    ArtNode* tail = cur->children[slot].load(std::memory_order_acquire);
+    if (!tail || !EdgeMatches(*tail, last) || tail->tag != ArtNodeTag::Leaf) {
+        return nullptr;
+    }
+    return static_cast<const ArtLeaf*>(tail)->data.get();
+}
+
 }  // namespace kvcache::node::prefix

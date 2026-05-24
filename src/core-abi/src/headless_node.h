@@ -8,6 +8,7 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -112,6 +113,10 @@ class HeadlessNode {
         return nixl_ ? nixl_->backend() : nullptr;
     }
 
+    // Phase G-2 — explicit destructor so the sweeper joins before
+    // the ART / events fields it touches are destroyed.
+    ~HeadlessNode();
+
    private:
     HeadlessNode() = default;
 
@@ -188,6 +193,37 @@ class HeadlessNode {
                        DramKeyHasher>                                 evict_index_;
 
     void OnDramEvict(const node::tier::DramKey& key);
+
+    // ----- Refcount-deferred eviction sweep (Phase G-2) -----
+    //
+    // When OnDramEvict fires but the leaf still has outstanding readers
+    // (refcount > 1), we cannot safely Remove from ART without leaving
+    // dangling handles. The path is queued here and a background
+    // sweeper retries each entry: as soon as TryEvict succeeds, the
+    // leaf is removed and a KV_EVENT_EVICT is published. Entries are
+    // dropped from the queue when either (a) the eviction succeeds or
+    // (b) the path no longer points at the same leaf (a fresh Seal
+    // replaced it).
+    struct DeferredEvict {
+        std::vector<node::prefix::ChunkHash> path;
+        // Identity of the leaf we deferred. If a later Seal replaces
+        // the leaf at this path, the new leaf has a different
+        // address; the sweeper drops the entry without acting.
+        node::prefix::LeafData* leaf = nullptr;
+        // Locator captured at defer time so the EVICT event we
+        // eventually publish carries something useful for subscribers.
+        kv_locator_t locator{};
+    };
+    mutable std::mutex                       mu_defer_;
+    std::vector<DeferredEvict>               deferred_evicts_;
+    std::condition_variable                  defer_cv_;
+    std::atomic<bool>                        sweeper_stop_{false};
+    std::thread                              sweeper_;
+
+    // True if the leaf was claimed and removed; false if it was
+    // deferred or already gone. Publishes the EVICT event on success.
+    bool TryEvictNow(std::span<const node::prefix::ChunkHash> path);
+    void SweeperLoop();
 };
 
 }  // namespace kvcache::abi
