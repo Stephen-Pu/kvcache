@@ -182,6 +182,67 @@ TEST(TcpBackendTest, PullRejectsOutOfBoundsOffset) {
     EXPECT_FALSE(err.empty());
 }
 
+// Phase M-6 — Push: server has the bytes (src local), peer's dst is
+// imported-remote. Server connects to peer's listener via the PUT op
+// and deposits the bytes into peer's local MR.
+TEST(TcpBackendTest, PushDepositsBytesIntoPeerMr) {
+    TcpBackend server(OnLocalhost());
+    TcpBackend peer(OnLocalhost());
+    ASSERT_TRUE(server.Ok());
+    ASSERT_TRUE(peer.Ok());
+
+    constexpr std::size_t kBytes = 4096;
+    std::vector<uint8_t> src(kBytes);
+    for (std::size_t i = 0; i < kBytes; ++i) {
+        src[i] = static_cast<uint8_t>((i * 37 + 5) & 0xff);
+    }
+    std::vector<uint8_t> dst(kBytes, 0);
+
+    std::string err;
+    // Peer registers its dst buffer and exports a descriptor pointing
+    // at *its* listener.
+    auto peer_local_dst = peer.RegisterRegion(dst.data(), dst.size(), &err);
+    ASSERT_NE(peer_local_dst, kInvalidMrKey);
+    RemoteMrDescriptor peer_dst_desc;
+    ASSERT_TRUE(peer.ExportMr(peer_local_dst, &peer_dst_desc, &err)) << err;
+
+    // Server imports the peer's descriptor → server-side remote-MR
+    // key referring to peer's listener.
+    auto server_remote_dst = server.ImportRemoteMr(peer_dst_desc, &err);
+    ASSERT_NE(server_remote_dst, kInvalidMrKey) << err;
+    EXPECT_TRUE(server.IsRemote(server_remote_dst));
+
+    // Server registers its src bytes locally.
+    auto server_local_src = server.RegisterRegion(src.data(), src.size(), &err);
+    ASSERT_NE(server_local_src, kInvalidMrKey);
+    EXPECT_FALSE(server.IsRemote(server_local_src));
+
+    PushRequest r{server_local_src, 0, server_remote_dst, 0, kBytes};
+    auto cid = server.Push(r, &err);
+    ASSERT_NE(cid, kInvalidCompletionId) << err;
+    EXPECT_TRUE(server.Wait(cid, 1000, &err));
+
+    // Bytes landed in peer's dst buffer.
+    EXPECT_EQ(std::memcmp(src.data(), dst.data(), kBytes), 0);
+}
+
+TEST(TcpBackendTest, PushRejectsRemoteSrc) {
+    TcpBackend a(OnLocalhost());
+    TcpBackend b(OnLocalhost());
+    std::vector<uint8_t> buf(64);
+    std::string err;
+    auto a_key = a.RegisterRegion(buf.data(), buf.size(), &err);
+    RemoteMrDescriptor desc;
+    a.ExportMr(a_key, &desc, &err);
+    auto b_remote_of_a = b.ImportRemoteMr(desc, &err);
+
+    // Push requires src_mr to be local — feeding it a remote key
+    // must fail with a clear error, not crash.
+    PushRequest r{b_remote_of_a, 0, b_remote_of_a, 0, 64};
+    EXPECT_EQ(b.Push(r, &err), kInvalidCompletionId);
+    EXPECT_NE(err.find("src_mr is not local"), std::string::npos);
+}
+
 TEST(TcpBackendTest, FactoryCreatesTcpBackend) {
     BackendOptions o = OnLocalhost();
     std::string err;

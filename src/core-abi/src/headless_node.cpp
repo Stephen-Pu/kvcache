@@ -293,13 +293,32 @@ int HeadlessNode::Fetch(kv_handle_t handle, uint64_t tenant_hash,
         return KV_E_TRANSPORT;
     }
 
-    node::transport::PullRequest req{dst_mr, 0, src_mr, 0, f.data.size()};
-    // P1 is the default class for ordinary Fetch. The tenant hash routes
-    // each caller into its own per-tenant FIFO inside the class — so two
-    // tenants' Fetches interleave under round-robin instead of one
-    // tenant's burst monopolising the link.
-    if (!nixl_->ScheduledPull(req, node::transport::Priority::P1,
-                                tenant_hash, 5000, &err)) {
+    // Phase M-6 — dispatch Pull vs Push based on whether the dst MR
+    // is local (engine in this process, share-everything case) or
+    // imported-remote (the gRPC handler just minted it from an
+    // incoming dst_remote_mr_descriptor). The remote path goes over
+    // the wire via TcpBackend::Push and lands the bytes in the
+    // peer's pre-registered MR.
+    auto* be = nixl_->backend();
+    const bool dst_is_remote = be && be->IsRemote(dst_mr);
+    bool xfer_ok = false;
+    if (dst_is_remote) {
+        // TODO(stephen): route this through PriorityScheduler too —
+        // for M-6 we do the Push synchronously so the test path is
+        // simple. The scheduler integration mirrors ScheduledPull.
+        node::transport::PushRequest preq{src_mr, 0, dst_mr, 0,
+                                            f.data.size()};
+        xfer_ok = (be->Push(preq, &err) != node::transport::kInvalidCompletionId);
+    } else {
+        node::transport::PullRequest req{dst_mr, 0, src_mr, 0, f.data.size()};
+        // P1 is the default class for ordinary Fetch. The tenant hash
+        // routes each caller into its own per-tenant FIFO inside the
+        // class — so two tenants' Fetches interleave under round-robin
+        // instead of one tenant's burst monopolising the link.
+        xfer_ok = nixl_->ScheduledPull(req, node::transport::Priority::P1,
+                                        tenant_hash, 5000, &err);
+    }
+    if (!xfer_ok) {
         nixl_->Unregister(src_mr);
         if (!reuse_dst_mr) nixl_->Unregister(dst_mr);
         return KV_E_TRANSPORT;

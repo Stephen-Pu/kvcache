@@ -18,10 +18,13 @@ namespace kvcache::node::transport {
 namespace {
 
 constexpr uint8_t kOpGet = 1;
+constexpr uint8_t kOpPut = 2;  // Phase M-6 — server-push.
 
 // Request: op(1) + peer_mr_id(4) + offset(8) + length(8) = 21 bytes.
+// For PUT, `length` bytes of payload follow the 21-byte header.
 constexpr std::size_t kRequestSize = 1 + 4 + 8 + 8;
-// Response header: status(1) + length(8) = 9 bytes; bytes follow.
+// Response header: status(1) + length(8) = 9 bytes; bytes follow (GET only).
+// PUT response = status(1) only.
 constexpr std::size_t kResponseHeaderSize = 1 + 8;
 
 inline int CloseFd(int fd) {
@@ -141,8 +144,8 @@ void TcpBackend::HandleConnection(int conn_fd) {
     if (!ReadAll(conn_fd, req, sizeof(req))) return;
 
     const uint8_t op = req[0];
-    if (op != kOpGet) {
-        // Unknown op — send error and bail.
+    if (op != kOpGet && op != kOpPut) {
+        // Unknown op — send GET-shaped error and bail.
         const uint8_t status = 1;
         const uint64_t len = 0;
         WriteAll(conn_fd, &status, 1);
@@ -163,23 +166,50 @@ void TcpBackend::HandleConnection(int conn_fd) {
         std::lock_guard lk(mu_);
         auto it = local_mrs_.find(peer_mr_id);
         if (it == local_mrs_.end()) {
-            const uint8_t status = 2;
-            const uint64_t len = 0;
-            WriteAll(conn_fd, &status, 1);
-            WriteAll(conn_fd, &len, 8);
+            if (op == kOpPut) {
+                const uint8_t status = 2;
+                WriteAll(conn_fd, &status, 1);
+            } else {
+                const uint8_t status = 2;
+                const uint64_t len = 0;
+                WriteAll(conn_fd, &status, 1);
+                WriteAll(conn_fd, &len, 8);
+            }
             return;
         }
         addr  = it->second.addr;
         bytes = it->second.bytes;
     }
     if (offset + length > bytes) {
-        const uint8_t status = 3;
-        const uint64_t len = 0;
-        WriteAll(conn_fd, &status, 1);
-        WriteAll(conn_fd, &len, 8);
+        if (op == kOpPut) {
+            const uint8_t status = 3;
+            WriteAll(conn_fd, &status, 1);
+        } else {
+            const uint8_t status = 3;
+            const uint64_t len = 0;
+            WriteAll(conn_fd, &status, 1);
+            WriteAll(conn_fd, &len, 8);
+        }
         return;
     }
 
+    if (op == kOpPut) {
+        // Phase M-6 — peer is depositing bytes into our MR. Read
+        // `length` bytes directly into the target offset, then ack.
+        if (length > 0) {
+            if (!ReadAll(conn_fd,
+                          static_cast<uint8_t*>(addr) + offset, length)) {
+                const uint8_t status = 4;
+                WriteAll(conn_fd, &status, 1);
+                return;
+            }
+        }
+        const uint8_t status = 0;
+        WriteAll(conn_fd, &status, 1);
+        return;
+    }
+
+    // GET path.
     const uint8_t status = 0;
     if (!WriteAll(conn_fd, &status, 1))  return;
     if (!WriteAll(conn_fd, &length, 8))  return;
@@ -425,6 +455,109 @@ CompletionId TcpBackend::Pull(const PullRequest& req, std::string* err) {
     }
     ::close(fd);
     return next_completion_.fetch_add(1, std::memory_order_relaxed);
+}
+
+// ---------------------------------------------------------------------------
+// Push (Phase M-6) — server-push counterpart of Pull.
+// ---------------------------------------------------------------------------
+//
+// src_mr MUST be local; dst_mr MAY be local (intra-process — memcpy)
+// or imported-remote (we connect to the peer's listener and write the
+// bytes via the PUT op).
+CompletionId TcpBackend::Push(const PushRequest& req, std::string* err) {
+    // Resolve src (must be local).
+    void* src_addr = nullptr;
+    std::size_t src_bytes = 0;
+    {
+        std::lock_guard lk(mu_);
+        auto it = local_mrs_.find(req.src_mr);
+        if (it == local_mrs_.end()) {
+            if (err) *err = "tcp: src_mr is not local (Push requires local src)";
+            return kInvalidCompletionId;
+        }
+        src_addr  = it->second.addr;
+        src_bytes = it->second.bytes;
+    }
+    if (req.src_off + req.bytes > src_bytes) {
+        if (err) *err = "tcp: src out-of-bounds";
+        return kInvalidCompletionId;
+    }
+
+    // Resolve dst: local (memcpy) or remote (PUT over wire).
+    void* dst_local_addr = nullptr;
+    std::size_t dst_local_bytes = 0;
+    RemoteMr remote_copy;
+    bool is_remote = false;
+    {
+        std::lock_guard lk(mu_);
+        auto lit = local_mrs_.find(req.dst_mr);
+        if (lit != local_mrs_.end()) {
+            dst_local_addr  = lit->second.addr;
+            dst_local_bytes = lit->second.bytes;
+        } else {
+            auto rit = remote_mrs_.find(req.dst_mr);
+            if (rit == remote_mrs_.end()) {
+                if (err) *err = "tcp: unknown dst_mr";
+                return kInvalidCompletionId;
+            }
+            remote_copy = rit->second;
+            is_remote = true;
+        }
+    }
+
+    if (!is_remote) {
+        if (req.dst_off + req.bytes > dst_local_bytes) {
+            if (err) *err = "tcp: dst out-of-bounds";
+            return kInvalidCompletionId;
+        }
+        std::memcpy(static_cast<uint8_t*>(dst_local_addr) + req.dst_off,
+                    static_cast<uint8_t*>(src_addr) + req.src_off,
+                    req.bytes);
+        return next_completion_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    if (req.dst_off + req.bytes > remote_copy.bytes) {
+        if (err) *err = "tcp: dst out-of-bounds (remote)";
+        return kInvalidCompletionId;
+    }
+    int fd = ConnectPeer(remote_copy, err);
+    if (fd < 0) return kInvalidCompletionId;
+
+    uint8_t hdr[kRequestSize];
+    hdr[0] = kOpPut;
+    std::memcpy(hdr + 1,  &remote_copy.peer_mr_id, 4);
+    std::memcpy(hdr + 5,  &req.dst_off,            8);
+    std::memcpy(hdr + 13, &req.bytes,              8);
+    if (!WriteAll(fd, hdr, sizeof(hdr))) {
+        if (err) *err = "tcp: short write of PUT header";
+        ::close(fd);
+        return kInvalidCompletionId;
+    }
+    if (req.bytes > 0 &&
+        !WriteAll(fd, static_cast<uint8_t*>(src_addr) + req.src_off,
+                   req.bytes)) {
+        if (err) *err = "tcp: short write of PUT payload";
+        ::close(fd);
+        return kInvalidCompletionId;
+    }
+    uint8_t status = 255;
+    if (!ReadAll(fd, &status, 1)) {
+        if (err) *err = "tcp: short read of PUT ack";
+        ::close(fd);
+        return kInvalidCompletionId;
+    }
+    ::close(fd);
+    if (status != 0) {
+        if (err) *err = "tcp: peer returned PUT error status " +
+                          std::to_string(status);
+        return kInvalidCompletionId;
+    }
+    return next_completion_.fetch_add(1, std::memory_order_relaxed);
+}
+
+bool TcpBackend::IsRemote(MrKey key) const {
+    std::lock_guard lk(mu_);
+    return remote_mrs_.find(key) != remote_mrs_.end();
 }
 
 bool TcpBackend::Wait(CompletionId cid, uint32_t /*timeout_ms*/,

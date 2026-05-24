@@ -183,3 +183,126 @@ TEST(CrossProcessPull, ReserveExportsDescriptorPeerPullsBytes) {
     svc.reset();
     kv_ctx_close(ctx);
 }
+
+// Phase M-6 — full server-push round-trip through the gRPC Fetch
+// handler. Engine registers its dst buffer with its own TcpBackend,
+// exports the descriptor, and sends it via FetchRequest.
+// dst_remote_mr_descriptor. The server-side gRPC handler imports the
+// descriptor into the singleton's NIXL backend; HeadlessNode::Fetch
+// detects the imported-remote dst (IsRemote == true) and dispatches
+// via TcpBackend::Push — the server connects to the engine's
+// listener and writes the bytes via PUT. We verify the engine's
+// receive buffer matches the bytes the server staged via
+// Reserve+Publish+Seal.
+TEST(CrossProcessPull, FetchPushesBytesToEngine) {
+    // Same TCP-mode singleton boot as the earlier test in this binary.
+    // Setenv is idempotent across tests; the singleton is sticky.
+    ASSERT_EQ(::setenv("KVCACHE_NIXL_BACKEND",   "tcp",       1), 0);
+    ASSERT_EQ(::setenv("KVCACHE_NIXL_BIND_HOST", "127.0.0.1", 1), 0);
+    ASSERT_EQ(::setenv("KVCACHE_NIXL_BIND_PORT", "0",         1), 0);
+
+    kv_ctx_t* ctx = nullptr;
+    {
+        kv_ctx_config_t cfg{};
+        cfg.abi_version = KVCACHE_ABI_VERSION;
+        cfg.tenant_id   = "m6-tenant";
+        cfg.model_id    = "m6-model";
+        ASSERT_EQ(kv_ctx_open(&cfg, &ctx), KV_OK);
+    }
+    auto svc = std::make_unique<NodeDataServiceImpl>(ctx);
+    GrpcServer::Options grpc_opts;
+    grpc_opts.bind_host = "127.0.0.1";
+    grpc_opts.port      = 0;
+    auto server = std::make_unique<GrpcServer>(grpc_opts, svc.get());
+    ASSERT_TRUE(server->Ok()) << server->error();
+    auto channel = ::grpc::CreateChannel(
+        "127.0.0.1:" + std::to_string(server->BoundPort()),
+        ::grpc::InsecureChannelCredentials());
+    auto stub = NodeData::NewStub(channel);
+
+    // Use small payloads — DRAM staging copies these in full, no need
+    // to stress capacity for this test.
+    const auto tokens             = RangeTokens(50000, 2 * kChunkTokens);
+    const std::size_t bytes_total = 4096;
+
+    // Reserve + write known pattern + Publish + Seal so the server
+    // has actual bytes in DRAM that Fetch will resolve.
+    ::grpc::ClientContext rctx;
+    kvcache::proto::ReserveRequest rreq;
+    *rreq.mutable_locator() = BuildLocator("m6-tenant", 0xb0bACAFE, tokens);
+    rreq.set_bytes(bytes_total);
+    kvcache::proto::ReserveResponse rresp;
+    ASSERT_TRUE(stub->Reserve(&rctx, rreq, &rresp).ok());
+    auto* slot = reinterpret_cast<uint8_t*>(rresp.slot_iova());
+    for (std::size_t i = 0; i < bytes_total; ++i) {
+        slot[i] = static_cast<uint8_t>((i * 53 + 11) & 0xff);
+    }
+
+    ::grpc::ClientContext pctx;
+    kvcache::proto::PublishRequest preq;
+    preq.set_server_handle(rresp.server_handle());
+    preq.set_watermark(bytes_total);
+    kvcache::proto::PublishResponse presp;
+    ASSERT_TRUE(stub->Publish(&pctx, preq, &presp).ok());
+
+    ::grpc::ClientContext sctx;
+    kvcache::proto::SealRequest sreq;
+    sreq.set_server_handle(rresp.server_handle());
+    for (uint32_t t : tokens) sreq.add_tokens(t);
+    kvcache::proto::SealResponse sresp;
+    ASSERT_TRUE(stub->Seal(&sctx, sreq, &sresp).ok());
+
+    // Lookup to mint a read handle.
+    ::grpc::ClientContext lctx;
+    kvcache::proto::LookupRequest lreq;
+    lreq.set_tenant_id("m6-tenant");
+    for (uint32_t t : tokens) lreq.add_tokens(t);
+    kvcache::proto::LookupResponse lresp;
+    ASSERT_TRUE(stub->Lookup(&lctx, lreq, &lresp).ok());
+    ASSERT_TRUE(lresp.hit());
+
+    // ---- Engine side: separate TcpBackend, registers dst, exports.
+    BackendOptions ebo;
+    ebo.name      = "tcp";
+    ebo.bind_host = "127.0.0.1";
+    ebo.bind_port = 0;
+    std::string err;
+    auto engine = CreateBackend(ebo, &err);
+    ASSERT_NE(engine, nullptr) << err;
+
+    std::vector<uint8_t> engine_dst(bytes_total, 0);
+    auto engine_local = engine->RegisterRegion(engine_dst.data(),
+                                                engine_dst.size(), &err);
+    ASSERT_NE(engine_local, kInvalidMrKey) << err;
+    RemoteMrDescriptor engine_dst_desc;
+    ASSERT_TRUE(engine->ExportMr(engine_local, &engine_dst_desc, &err)) << err;
+
+    // ---- Issue Fetch with dst_remote_mr_descriptor = engine's
+    //      exported dst. Server imports, sees IsRemote == true,
+    //      drives a Push over TCP into engine_dst.
+    ::grpc::ClientContext fctx;
+    kvcache::proto::FetchRequest freq;
+    freq.set_server_handle(lresp.server_handle());
+    // dst_iova / dst_bytes are still needed by HeadlessNode for the
+    // size/bound check (it uses dst.len). Pass the engine buffer's
+    // address+size; they're consulted but the actual write is via
+    // Push to the imported remote MR.
+    freq.set_dst_iova(reinterpret_cast<uint64_t>(engine_dst.data()));
+    freq.set_dst_bytes(engine_dst.size());
+    freq.set_dst_remote_mr_descriptor(
+        std::string(engine_dst_desc.opaque.begin(),
+                     engine_dst_desc.opaque.end()));
+    kvcache::proto::FetchResponse fresp;
+    auto fs = stub->Fetch(&fctx, freq, &fresp);
+    ASSERT_TRUE(fs.ok()) << fs.error_message();
+
+    // Engine's dst should now hold the bytes the server wrote into
+    // its slot before Sealing.
+    EXPECT_EQ(std::memcmp(engine_dst.data(), slot, bytes_total), 0);
+
+    stub.reset();
+    server->Stop();
+    server.reset();
+    svc.reset();
+    kv_ctx_close(ctx);
+}

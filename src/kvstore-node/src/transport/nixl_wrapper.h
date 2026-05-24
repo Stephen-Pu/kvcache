@@ -65,6 +65,19 @@ struct PullRequest {
     uint64_t bytes;
 };
 
+// Phase M-6 — server-push transfer. Mirror of PullRequest, semantically
+// "the server has the bytes (src_mr is local) and wants to deposit them
+// into a peer's pre-registered destination MR (dst_mr is imported-
+// remote)". For loopback both ends are local and Push degenerates into
+// the same memcpy as Pull.
+struct PushRequest {
+    MrKey    src_mr;
+    uint64_t src_off;
+    MrKey    dst_mr;
+    uint64_t dst_off;
+    uint64_t bytes;
+};
+
 class INixlBackend {
    public:
     virtual ~INixlBackend() = default;
@@ -109,6 +122,27 @@ class INixlBackend {
     // Returns a completion id; caller calls Wait() to block. Some backends
     // (loopback, TCP synchronous mode) complete inline.
     virtual CompletionId Pull(const PullRequest& req, std::string* err) = 0;
+
+    // Phase M-6 — server-push counterpart of Pull. `src_mr` MUST be
+    // local; `dst_mr` MAY be local (intra-process — degenerates to
+    // memcpy) or imported-remote (the backend connects to the peer's
+    // listener and writes the bytes into the peer's MR). The default
+    // implementation falls back to Pull semantics so non-network
+    // backends keep working unchanged.
+    virtual CompletionId Push(const PushRequest& req, std::string* err) {
+        // Default: reuse the Pull path. For loopback this is exactly
+        // the right behaviour (both ends are local). For network
+        // backends Push is overridden to drive a PUT over the wire.
+        PullRequest pr{req.dst_mr, req.dst_off, req.src_mr, req.src_off,
+                        req.bytes};
+        return Pull(pr, err);
+    }
+
+    // Phase M-6 — does this MrKey refer to an imported-remote MR
+    // (versus a locally-registered region)? HeadlessNode::Fetch uses
+    // this to dispatch Pull vs Push when the gRPC layer hands in a
+    // dst_mr that was just minted from an incoming descriptor.
+    virtual bool IsRemote(MrKey /*key*/) const { return false; }
 
     // Wait for a completion. Returns true if completed within `timeout_ms`,
     // false on timeout or unknown id.

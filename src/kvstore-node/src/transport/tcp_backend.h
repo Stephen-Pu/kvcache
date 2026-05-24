@@ -74,6 +74,8 @@ class TcpBackend final : public INixlBackend {
                           std::string* err) override;
 
     CompletionId Pull(const PullRequest& req, std::string* err) override;
+    CompletionId Push(const PushRequest& req, std::string* err) override;
+    bool         IsRemote(MrKey key) const override;
     bool         Wait(CompletionId cid, uint32_t timeout_ms,
                       std::string* err) override;
 
