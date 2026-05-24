@@ -21,6 +21,7 @@
 #include <gtest/gtest.h>
 
 #include <grpcpp/grpcpp.h>
+#include <openssl/sha.h>
 
 #include <chrono>
 #include <cstring>
@@ -166,10 +167,14 @@ TEST(LookupForwarding, NonPrimaryForwardsToPrimary) {
     // so the test is self-contained.
     auto build_locator = [&]() {
         kvcache::proto::Locator loc;
-        std::string tid(16, '\0');
-        for (std::size_t i = 0; i < tenant_id.size(); ++i) {
-            tid[i % 16] ^= tenant_id[i];
-        }
+        // Phase Q-5: SHA-1(tenant)[:16] matches both the Python
+        // connector and the server's HashTenantString -> namespace
+        // derivation. Required for ART lookups to find what Reserve
+        // sealed.
+        uint8_t sha[20];
+        SHA1(reinterpret_cast<const uint8_t*>(tenant_id.data()),
+              tenant_id.size(), sha);
+        std::string tid(reinterpret_cast<const char*>(sha), 16);
         loc.set_tenant_id(tid);
         loc.set_model_id_hash(model_hash);
         std::string ph(16, '\0');
@@ -293,10 +298,14 @@ TEST(LookupForwarding, ReserveSealForwardsViaHandleMap) {
     // Build the locator the same way Reserve handler computes the HRW key.
     auto build_locator = [&]() {
         kvcache::proto::Locator loc;
-        std::string tid(16, '\0');
-        for (std::size_t i = 0; i < tenant_id.size(); ++i) {
-            tid[i % 16] ^= tenant_id[i];
-        }
+        // Phase Q-5: SHA-1(tenant)[:16] matches both the Python
+        // connector and the server's HashTenantString -> namespace
+        // derivation. Required for ART lookups to find what Reserve
+        // sealed.
+        uint8_t sha[20];
+        SHA1(reinterpret_cast<const uint8_t*>(tenant_id.data()),
+              tenant_id.size(), sha);
+        std::string tid(reinterpret_cast<const char*>(sha), 16);
         loc.set_tenant_id(tid);
         loc.set_model_id_hash(model_hash);
         std::string ph(16, '\0');

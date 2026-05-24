@@ -67,13 +67,24 @@ class HeadlessNode {
 
     // Hot-path ABI operations. Status codes match include/kvcache/kv_errors.h.
 
-    int Lookup(const char* tenant_id, uint64_t model_id_hash,
+    // Phase Q-5 — tenant_hash is now USED. It feeds the namespace
+    // fingerprint that scopes the ART path to this (tenant, model),
+    // so two distinct (tenant, model) pairs with the same tokens
+    // miss each other's data. tenant_id (string) stays in the
+    // signature for diagnostics + future audit hooks but no longer
+    // drives routing.
+    int Lookup(const char* tenant_id, uint64_t tenant_hash,
+               uint64_t model_id_hash,
                const uint32_t* tokens, std::size_t n,
                kv_locator_t* out_meta,
                kv_handle_t*  out_handle,
                uint32_t*     out_matched_tokens);
 
+    // Phase Q-5 — Reserve records tenant_hash + model_hash on the
+    // HandleState so the matching Seal computes the SAME namespace
+    // fingerprint and lands on the right ART subtree.
     int Reserve(const kv_locator_t* locator, std::size_t bytes,
+                uint64_t tenant_hash, uint64_t model_hash,
                 kv_handle_t* out_handle, kv_buffer_desc_t* out_slot);
 
     int Publish(kv_handle_t handle, kv_buffer_desc_t src, uint64_t watermark);
@@ -135,6 +146,11 @@ class HeadlessNode {
         uint64_t ingest_handle = 0;
         // For read:
         node::prefix::LeafData* leaf = nullptr;
+        // Phase Q-5 — captured at Reserve / Lookup time so the
+        // matching Seal/Fetch reproduces the same namespace
+        // fingerprint and lands on the right ART subtree.
+        uint64_t tenant_hash   = 0;
+        uint64_t model_hash    = 0;
     };
 
     mutable std::mutex mu_;

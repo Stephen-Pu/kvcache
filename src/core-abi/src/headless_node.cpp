@@ -159,7 +159,9 @@ bool HeadlessNode::Init(const Options& opts, std::string* err) {
 // Lookup
 // ---------------------------------------------------------------------------
 
-int HeadlessNode::Lookup(const char* /*tenant_id*/, uint64_t /*model_id_hash*/,
+int HeadlessNode::Lookup(const char* /*tenant_id*/,
+                         uint64_t tenant_hash,
+                         uint64_t model_id_hash,
                          const uint32_t* tokens, std::size_t n,
                          kv_locator_t* out_meta,
                          kv_handle_t*  out_handle,
@@ -175,7 +177,11 @@ int HeadlessNode::Lookup(const char* /*tenant_id*/, uint64_t /*model_id_hash*/,
     // (Phase D-1 / no persistence). Pick whichever is live.
     node::prefix::ArtIndex& art_ref = art_wal_ ? art_wal_->art() : *art_;
     auto g = art_ref.EnterRead();
-    auto r = node::prefix::LongestPrefixMatch(art_ref, {tokens, n}, g);
+    // Phase Q-5 — namespace-scoped LPM. Tokens alone are no longer the
+    // chunk_path key; the (tenant_hash, model_hash) namespace is the
+    // ART subtree this caller is allowed to see.
+    auto r = node::prefix::LongestPrefixMatchNS(
+        art_ref, {tokens, n}, tenant_hash, model_id_hash, g);
     if (r.matched_tokens == 0 || !r.leaf) {
         span.SetAttribute("kv.hit", false);
         return KV_E_NOT_FOUND;
@@ -192,7 +198,11 @@ int HeadlessNode::Lookup(const char* /*tenant_id*/, uint64_t /*model_id_hash*/,
     kv_handle_t h = next_handle_.fetch_add(1, std::memory_order_relaxed);
     {
         std::lock_guard lk(mu_);
-        handles_[h] = HandleState{HandleKind::kRead, r.leaf->locator, 0, r.leaf};
+        // Phase Q-5 — record the namespace so subsequent Fetch
+        // / Release on this handle stay scoped (and a future audit
+        // hook can read it without re-deriving).
+        handles_[h] = HandleState{HandleKind::kRead, r.leaf->locator,
+                                   0, r.leaf, tenant_hash, model_id_hash};
     }
     *out_handle = h;
     return KV_OK;
@@ -203,6 +213,7 @@ int HeadlessNode::Lookup(const char* /*tenant_id*/, uint64_t /*model_id_hash*/,
 // ---------------------------------------------------------------------------
 
 int HeadlessNode::Reserve(const kv_locator_t* locator, std::size_t bytes,
+                          uint64_t tenant_hash, uint64_t model_hash,
                           kv_handle_t* out_handle, kv_buffer_desc_t* out_slot) {
     if (!locator || bytes == 0 || !out_handle || !out_slot) return KV_E_INVAL;
     auto ih = buffers_->Reserve();
@@ -223,7 +234,10 @@ int HeadlessNode::Reserve(const kv_locator_t* locator, std::size_t bytes,
     kv_handle_t h = next_handle_.fetch_add(1, std::memory_order_relaxed);
     {
         std::lock_guard lk(mu_);
-        handles_[h] = HandleState{HandleKind::kIngest, *locator, ih, nullptr};
+        // Phase Q-5 — record (tenant_hash, model_hash) so the matching
+        // Seal reproduces the namespace fingerprint we used to insert.
+        handles_[h] = HandleState{HandleKind::kIngest, *locator, ih,
+                                   nullptr, tenant_hash, model_hash};
     }
     *out_handle = h;
     return KV_OK;
@@ -368,7 +382,10 @@ int HeadlessNode::Seal(kv_handle_t handle,
         return KV_E_INVAL;
     }
 
-    auto chunk_path = node::prefix::Chunkify({tokens, n_tokens});
+    // Phase Q-5 — same namespace prefix the matching Lookup will use.
+    const auto ns = node::prefix::NamespaceFingerprint(
+        st.tenant_hash, st.model_hash);
+    auto chunk_path = node::prefix::ChunkifyNS({tokens, n_tokens}, ns);
 
     // Stage the slot bytes into DRAM so the next Lookup→Fetch can serve from
     // T2. We don't have a structured KV layout in MVP — the bytes are just

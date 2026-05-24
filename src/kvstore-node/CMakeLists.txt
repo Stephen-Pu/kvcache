@@ -97,6 +97,9 @@ if(KVCACHE_HAVE_GRPC)
             # NodeDirectory for cross-node Lookup fan-out; both live
             # inside kvstore_node_core.
             kvstore_node_core
+            # Phase Q-5: SHA-1 to derive the 16-byte tenant fingerprint
+            # consistent with the Python connector's Locator.
+            OpenSSL::Crypto
     )
 endif()
 

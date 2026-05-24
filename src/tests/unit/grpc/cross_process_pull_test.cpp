@@ -30,6 +30,7 @@
 #include <gtest/gtest.h>
 
 #include <grpcpp/grpcpp.h>
+#include <openssl/sha.h>
 
 #include <cstdlib>
 #include <cstring>
@@ -62,8 +63,11 @@ kvcache::proto::Locator BuildLocator(const std::string& tenant,
                                        uint64_t model_hash,
                                        const std::vector<uint32_t>& tokens) {
     kvcache::proto::Locator loc;
-    std::string tid(16, '\0');
-    for (std::size_t i = 0; i < tenant.size(); ++i) tid[i % 16] ^= tenant[i];
+    // Phase Q-5: SHA-1(tenant)[:16] matches the Python connector's
+    // make_locator and the server's tenant-namespace derivation.
+    uint8_t sha[20];
+    SHA1(reinterpret_cast<const uint8_t*>(tenant.data()), tenant.size(), sha);
+    std::string tid(reinterpret_cast<const char*>(sha), 16);
     loc.set_tenant_id(tid);
     loc.set_model_id_hash(model_hash);
     std::string ph(16, '\0');
@@ -256,6 +260,10 @@ TEST(CrossProcessPull, FetchPushesBytesToEngine) {
     ::grpc::ClientContext lctx;
     kvcache::proto::LookupRequest lreq;
     lreq.set_tenant_id("m6-tenant");
+    // Phase Q-5 — must match the model_id_hash used in BuildLocator
+    // above; otherwise the ART namespace fingerprint differs and the
+    // lookup walks an empty subtree.
+    lreq.set_model_id_hash(0xb0bACAFE);
     for (uint32_t t : tokens) lreq.add_tokens(t);
     kvcache::proto::LookupResponse lresp;
     ASSERT_TRUE(stub->Lookup(&lctx, lreq, &lresp).ok());

@@ -9,6 +9,7 @@
 #include <gtest/gtest.h>
 
 #include <grpcpp/grpcpp.h>
+#include <openssl/sha.h>
 
 #include <atomic>
 #include <cstring>
@@ -85,6 +86,20 @@ std::vector<uint32_t> RangeTokens(uint32_t lo, std::size_t n) {
     return out;
 }
 
+// Phase Q-5 — FNV-1a 64 of the model_id string. Same hash the Python
+// connector uses for `Locator.model_id_hash`, and the same one the
+// server feeds into the per-(tenant, model) ART namespace
+// fingerprint. Lookup requests MUST set this field (defaulting to 0
+// would walk a different ART subtree than Reserve sealed into).
+inline uint64_t ModelIdHash(const std::string& model) {
+    uint64_t mh = 0xcbf29ce484222325ull;
+    for (char c : model) {
+        mh ^= static_cast<uint8_t>(c);
+        mh *= 0x100000001b3ull;
+    }
+    return mh;
+}
+
 // Build a Locator the agent would normally construct via make_locator.
 // We mirror the FNV-style derivation that kv_abi.cpp uses internally so
 // the server-side seal path lands on the same chunk path.
@@ -94,10 +109,14 @@ kvcache::proto::Locator BuildLocator(const std::string& tenant,
                                        uint64_t bytes_total) {
     kvcache::proto::Locator loc;
     // tenant_id: 16 bytes. Use SHA1-ish: just take a stable hash.
-    std::string tid(16, '\0');
-    for (std::size_t i = 0; i < tenant.size(); ++i) {
-        tid[i % 16] ^= tenant[i];
-    }
+    // Phase Q-5 — must match the Python connector's tenant_id
+    // derivation (SHA-1 of the tenant string, first 16 bytes), which
+    // is also what the server's HashTenantString uses to compute the
+    // ART namespace fingerprint. Otherwise the LPM walks a different
+    // subtree and Lookup misses what Reserve sealed.
+    uint8_t sha[20];
+    SHA1(reinterpret_cast<const uint8_t*>(tenant.data()), tenant.size(), sha);
+    std::string tid(reinterpret_cast<const char*>(sha), 16);
     loc.set_tenant_id(tid);
     // model_id_hash: FNV-1a 64.
     uint64_t mh = 0xcbf29ce484222325ull;
@@ -186,6 +205,7 @@ TEST_F(NodeDataFixture, ReservePublishSealLookupRoundTrip) {
     ::grpc::ClientContext lctx;
     kvcache::proto::LookupRequest lreq;
     lreq.set_tenant_id(tenant_id_);
+    lreq.set_model_id_hash(ModelIdHash(model_id_));
     for (uint32_t t : tokens) lreq.add_tokens(t);
     kvcache::proto::LookupResponse lresp;
     s = stub_->Lookup(&lctx, lreq, &lresp);
@@ -287,6 +307,7 @@ TEST_F(NodeDataFixture, FetchAcceptsRemoteMrDescriptor) {
     ::grpc::ClientContext lctx;
     kvcache::proto::LookupRequest lreq;
     lreq.set_tenant_id(tenant_id_);
+    lreq.set_model_id_hash(ModelIdHash(model_id_));
     for (uint32_t t : tokens) lreq.add_tokens(t);
     kvcache::proto::LookupResponse lresp;
     ASSERT_TRUE(stub_->Lookup(&lctx, lreq, &lresp).ok());
@@ -367,6 +388,7 @@ TEST_F(NodeDataFixture, FetchHonoursPreRegisteredDstMrKey) {
     ::grpc::ClientContext lctx;
     kvcache::proto::LookupRequest lreq;
     lreq.set_tenant_id(tenant_id_);
+    lreq.set_model_id_hash(ModelIdHash(model_id_));
     for (uint32_t t : tokens) lreq.add_tokens(t);
     kvcache::proto::LookupResponse lresp;
     ASSERT_TRUE(stub_->Lookup(&lctx, lreq, &lresp).ok());
@@ -485,6 +507,7 @@ TEST_F(NodeDataFixture, DramEvictionPrunesArtLeaf) {
         ::grpc::ClientContext lctx;
         kvcache::proto::LookupRequest lreq;
         lreq.set_tenant_id(tenant_id_);
+    lreq.set_model_id_hash(ModelIdHash(model_id_));
         for (uint32_t t : RangeTokens(lo, 2 * kChunkTokens)) lreq.add_tokens(t);
         kvcache::proto::LookupResponse lresp;
         if (!stub_->Lookup(&lctx, lreq, &lresp).ok()) return 0;
@@ -631,4 +654,109 @@ TEST_F(NodeDataFixture, SubscribeDeliversAddEventOnSeal) {
     // Wait for the worker to drain (it cancels itself on first event).
     sub_thread.join();
     EXPECT_GE(events_seen.load(), 1);
+}
+
+// Phase Q-5 — verifies the per-(tenant, model) ART namespace.
+//
+// Seal a chunk under (tenantA, modelA). Look it up under
+// (tenantA, modelA) — must hit. Look it up under (tenantB, modelA) and
+// (tenantA, modelB) — both must MISS. Pre-Q-5 the chunk_path was
+// derived from tokens alone, so the two cross-namespace probes would
+// have hit and leaked data; with the namespace fingerprint prepended
+// each (tenant, model) pair occupies a disjoint subtree of the same
+// ART.
+TEST(NodeDataIsolation, CrossTenantOrModelLookupMisses) {
+    // We spin up a fresh ctx per (tenant, model) and one service per
+    // ctx — but they ALL talk to the same singleton HeadlessNode. The
+    // singleton's ART is the shared store; the namespace fingerprint
+    // is what isolates them.
+    struct CtxPair {
+        kv_ctx_t* ctx = nullptr;
+        std::unique_ptr<NodeDataServiceImpl> svc;
+        std::unique_ptr<GrpcServer>          server;
+        std::unique_ptr<NodeData::Stub>      stub;
+    };
+
+    auto open = [](const std::string& tenant,
+                    const std::string& model) -> CtxPair {
+        CtxPair cp;
+        kv_ctx_config_t cfg{};
+        cfg.abi_version = KVCACHE_ABI_VERSION;
+        cfg.tenant_id   = tenant.c_str();
+        cfg.model_id    = model.c_str();
+        EXPECT_EQ(kv_ctx_open(&cfg, &cp.ctx), KV_OK);
+        cp.svc = std::make_unique<NodeDataServiceImpl>(cp.ctx);
+        GrpcServer::Options o;
+        o.bind_host = "127.0.0.1";
+        o.port      = 0;
+        cp.server = std::make_unique<GrpcServer>(o, cp.svc.get());
+        EXPECT_TRUE(cp.server->Ok());
+        auto ch = ::grpc::CreateChannel(
+            "127.0.0.1:" + std::to_string(cp.server->BoundPort()),
+            ::grpc::InsecureChannelCredentials());
+        cp.stub = NodeData::NewStub(ch);
+        return cp;
+    };
+
+    auto a_a = open("q5-tenA", "q5-modA");
+    auto b_a = open("q5-tenB", "q5-modA");  // different tenant, same model
+    auto a_b = open("q5-tenA", "q5-modB");  // same tenant, different model
+
+    const auto tokens = RangeTokens(90000, 2 * kChunkTokens);
+    const std::size_t bytes_total = tokens.size() * 64;
+
+    // Seal under (tenA, modA).
+    ::grpc::ClientContext rctx;
+    kvcache::proto::ReserveRequest rreq;
+    *rreq.mutable_locator() = BuildLocator("q5-tenA", "q5-modA", tokens,
+                                             bytes_total);
+    rreq.set_bytes(bytes_total);
+    kvcache::proto::ReserveResponse rresp;
+    ASSERT_TRUE(a_a.stub->Reserve(&rctx, rreq, &rresp).ok());
+    auto* slot = reinterpret_cast<uint8_t*>(rresp.slot_iova());
+    std::memset(slot, 0xA5, bytes_total);
+
+    ::grpc::ClientContext pctx;
+    kvcache::proto::PublishRequest preq;
+    preq.set_server_handle(rresp.server_handle());
+    preq.set_watermark(bytes_total);
+    kvcache::proto::PublishResponse presp;
+    ASSERT_TRUE(a_a.stub->Publish(&pctx, preq, &presp).ok());
+
+    ::grpc::ClientContext sctx;
+    kvcache::proto::SealRequest sreq;
+    sreq.set_server_handle(rresp.server_handle());
+    for (uint32_t t : tokens) sreq.add_tokens(t);
+    kvcache::proto::SealResponse sresp;
+    ASSERT_TRUE(a_a.stub->Seal(&sctx, sreq, &sresp).ok());
+
+    auto probe = [&](CtxPair& cp, const char* tenant, const char* model) {
+        ::grpc::ClientContext lctx;
+        kvcache::proto::LookupRequest lreq;
+        lreq.set_tenant_id(tenant);
+        lreq.set_model_id_hash(ModelIdHash(model));
+        for (uint32_t t : tokens) lreq.add_tokens(t);
+        kvcache::proto::LookupResponse lresp;
+        EXPECT_TRUE(cp.stub->Lookup(&lctx, lreq, &lresp).ok());
+        return lresp.hit();
+    };
+
+    // Same (tenant, model) hits.
+    EXPECT_TRUE(probe(a_a, "q5-tenA", "q5-modA"))
+        << "same (tenant, model) must hit";
+    // Different tenant misses.
+    EXPECT_FALSE(probe(b_a, "q5-tenB", "q5-modA"))
+        << "different tenant must NOT see another tenant's chunk";
+    // Different model misses.
+    EXPECT_FALSE(probe(a_b, "q5-tenA", "q5-modB"))
+        << "same tenant different model must NOT see another model's chunk";
+
+    // Cleanup in reverse order.
+    for (auto* cp : {&a_b, &b_a, &a_a}) {
+        cp->stub.reset();
+        cp->server->Stop();
+        cp->server.reset();
+        cp->svc.reset();
+        kv_ctx_close(cp->ctx);
+    }
 }

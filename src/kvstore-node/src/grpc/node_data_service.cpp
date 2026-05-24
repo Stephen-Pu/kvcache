@@ -22,6 +22,8 @@
 #include <string>
 #include <vector>
 
+#include <openssl/sha.h>
+
 #include "cluster/node_directory.h"
 #include "kvcache/kv_errors.h"
 #include "kvcache/kv_types.h"
@@ -47,8 +49,21 @@ uint64_t Fnv1a64Bytes(const void* data, std::size_t n) {
     return h;
 }
 
+// Phase Q-5 — derive the same 16-byte tenant fingerprint the Python
+// connector puts in `Locator.tenant_id`: first 16 bytes of SHA-1
+// over the tenant string. Then FNV-1a those 16 bytes. This matches
+// `HashTenantBytes16(locator.tenant_id)` so a Lookup request carrying
+// the tenant STRING and a Reserve request carrying the same tenant's
+// locator BYTES resolve to the same per-(tenant, model) ctx + ART
+// namespace.
 uint64_t HashTenantString(const std::string& s) {
-    return s.empty() ? 0 : Fnv1a64Bytes(s.data(), s.size());
+    if (s.empty()) return 0;
+    uint8_t digest[SHA_DIGEST_LENGTH];  // 20 bytes
+    SHA1(reinterpret_cast<const uint8_t*>(s.data()), s.size(), digest);
+    // First 16 bytes mirror what the Python connector stores in the
+    // Locator's 16-byte tenant_id field — see
+    // src/adapters/core/kvcache_core/connector.py make_locator().
+    return Fnv1a64Bytes(digest, 16);
 }
 
 uint64_t HashTenantBytes16(const std::string& s) {

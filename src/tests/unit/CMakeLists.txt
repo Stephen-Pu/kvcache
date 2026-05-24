@@ -160,6 +160,9 @@ if(KVCACHE_HAVE_GRPC)
     target_link_libraries(test_node_data_service PRIVATE
         kvstore_node_grpc
         kvcache
+        # Phase Q-5: BuildLocator now uses SHA-1 to mirror the
+        # Python connector's tenant_id derivation.
+        OpenSSL::Crypto
     )
 
     # Phase N-1: mTLS end-to-end. Skips at runtime if openssl(1) isn't
@@ -182,6 +185,7 @@ if(KVCACHE_HAVE_GRPC)
         kvcache
         CURL::libcurl
         nlohmann_json::nlohmann_json
+        OpenSSL::Crypto
     )
 
     # Phase M-4: cross-process Pull e2e. Lives in its own binary so the
@@ -196,6 +200,7 @@ if(KVCACHE_HAVE_GRPC)
     target_link_libraries(test_cross_process_pull PRIVATE
         kvstore_node_grpc
         kvcache
+        OpenSSL::Crypto
     )
 endif()
 kvcache_add_test(test_trace             obs/trace_test.cpp)

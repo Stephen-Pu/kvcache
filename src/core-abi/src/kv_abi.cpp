@@ -145,14 +145,17 @@ KV_API int kv_lookup(kv_ctx_t* ctx, const uint32_t* tokens, size_t n,
                     kv_locator_t* meta, kv_handle_t* handle,
                     uint32_t* matched_tokens) {
     if (!ctx || !ctx->node) return KV_E_INVAL;
-    return ctx->node->Lookup(ctx->tenant_id.c_str(), ctx->model_id_hash,
+    return ctx->node->Lookup(ctx->tenant_id.c_str(),
+                              ctx->tenant_id_hash, ctx->model_id_hash,
                               tokens, n, meta, handle, matched_tokens);
 }
 
 KV_API int kv_reserve(kv_ctx_t* ctx, const kv_locator_t* locator, size_t bytes,
                      kv_handle_t* handle, kv_buffer_desc_t* slot) {
     if (!ctx || !ctx->node) return KV_E_INVAL;
-    return ctx->node->Reserve(locator, bytes, handle, slot);
+    return ctx->node->Reserve(locator, bytes,
+                               ctx->tenant_id_hash, ctx->model_id_hash,
+                               handle, slot);
 }
 
 KV_API int kv_publish(kv_ctx_t* ctx, kv_handle_t handle, kv_buffer_desc_t src,

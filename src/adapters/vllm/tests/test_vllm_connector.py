@@ -47,12 +47,12 @@ def test_full_vllm_lifecycle():
                          model_id="vllm-lifecycle",
                          bytes_per_token=BYTES_PER_TOKEN) as conn:
         # --- Request A: cold, save 32 tokens ----------------------------
-        # P-1 isolation: pick token ranges that don't collide with the
-        # other adapter tests (e2e_demo uses range(32), sglang uses
-        # range(0,32), etc.). The HeadlessNode singleton's ART is
-        # currently shared across (tenant, model) — a separate bug to
-        # fix, but for now distinct tokens keep these tests
-        # order-independent.
+        # Phase Q-5 fixed cross-(tenant, model) ART collisions, so
+        # we no longer NEED distinct token ranges to keep tests
+        # order-independent — but the high token range remains
+        # because it makes the assertion more legible (and would
+        # catch any future regression that re-introduces a shared
+        # namespace).
         tokens_a = list(range(80000, 80000 + 2 * CHUNK))
         rid_a = "req-a"
         # Cold lookup returns 0; entry created.
