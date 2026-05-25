@@ -66,6 +66,16 @@ class BloomPublisher {
     // Thread-safe; piggy-backs on LocalBloom's internal mutex.
     void Add(std::span<const uint8_t> key);
 
+    // Phase K-6 — convenience for the Seal hook: build the canonical
+    // sketch key from (tenant_hash, model_hash, tokens) and Add it.
+    // Mirrors the consumer-side derivation that NodeDataService uses
+    // on a Lookup local-miss when consulting PeerMaybeHas, so a
+    // chunk added here is discoverable via that path.
+    void AddTokens(uint64_t        tenant_hash,
+                    uint64_t        model_hash,
+                    const uint32_t* tokens,
+                    std::size_t     n);
+
     // First publish runs synchronously inside Start() so peers see a
     // sketch from the very first revision. Subsequent publishes fire
     // on the background loop.
@@ -108,5 +118,19 @@ class BloomPublisher {
 bool DecodeBloomSnapshot(const std::string&    encoded,
                           routing::BloomParams* out_params,
                           std::vector<uint8_t>* out_bytes);
+
+// Phase K-6 — canonical sketch key shape for "is this token-prefix
+// chunk hosted by peer X?" queries. Both the publisher's AddTokens
+// hook (at Seal time) and the router's PeerMaybeHas hint (at Lookup
+// local-miss time) feed identical bytes into the Bloom math:
+//
+//   [tenant_hash:u64 LE][model_hash:u64 LE][token_0:u32 LE]...[token_{n-1}:u32 LE]
+//
+// Token-set match is exact — partial-prefix matches need a separate
+// chunked variant (Phase K-8) that pre-hashes every 16-token boundary.
+std::vector<uint8_t> SketchKeyForTokens(uint64_t        tenant_hash,
+                                         uint64_t        model_hash,
+                                         const uint32_t* tokens,
+                                         std::size_t     n);
 
 }  // namespace kvcache::node::cluster

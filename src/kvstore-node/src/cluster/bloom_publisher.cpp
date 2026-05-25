@@ -22,6 +22,36 @@ BloomPublisher::~BloomPublisher() { Stop(); }
 
 void BloomPublisher::Add(std::span<const uint8_t> key) { bloom_.Add(key); }
 
+void BloomPublisher::AddTokens(uint64_t        tenant_hash,
+                                uint64_t        model_hash,
+                                const uint32_t* tokens,
+                                std::size_t     n) {
+    const auto k = SketchKeyForTokens(tenant_hash, model_hash, tokens, n);
+    bloom_.Add(k);
+}
+
+std::vector<uint8_t> SketchKeyForTokens(uint64_t        tenant_hash,
+                                         uint64_t        model_hash,
+                                         const uint32_t* tokens,
+                                         std::size_t     n) {
+    std::vector<uint8_t> out;
+    out.reserve(16 + n * 4);
+    auto append_u64 = [&](uint64_t v) {
+        for (int i = 0; i < 8; ++i) {
+            out.push_back(static_cast<uint8_t>((v >> (i * 8)) & 0xff));
+        }
+    };
+    auto append_u32 = [&](uint32_t v) {
+        for (int i = 0; i < 4; ++i) {
+            out.push_back(static_cast<uint8_t>((v >> (i * 8)) & 0xff));
+        }
+    };
+    append_u64(tenant_hash);
+    append_u64(model_hash);
+    for (std::size_t i = 0; i < n; ++i) append_u32(tokens[i]);
+    return out;
+}
+
 bool BloomPublisher::Start(std::string* err) {
     if (running_.exchange(true)) return true;
     if (!etcd_ || opts_.node_id.empty()) {

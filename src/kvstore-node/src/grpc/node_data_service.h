@@ -35,6 +35,7 @@
 #pragma once
 
 #include <cstdint>
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -102,6 +103,14 @@ class NodeDataServiceImpl final : public kvcache::proto::NodeData::Service {
     // lazily opened. Exposed for tests; cheap O(1) lookup under a lock.
     std::size_t CachedCtxCount() const;
 
+    // Phase K-6 — RPC arrival counters for tests. Each handler bumps
+    // these BEFORE any forwarding decision, so the count reflects
+    // "this service was actually called", whether or not it served
+    // the request locally.
+    uint64_t LookupCalls() const noexcept {
+        return lookup_calls_.load(std::memory_order_relaxed);
+    }
+
    private:
     // 128-bit cache key reduced to a single u64 by mixing the two hashes
     // — collisions are astronomically unlikely (two FNV-1a 64s xored).
@@ -150,6 +159,9 @@ class NodeDataServiceImpl final : public kvcache::proto::NodeData::Service {
     // will try to serve handle-based RPCs locally and fail.
     mutable std::mutex                                  fwd_handle_mu_;
     std::unordered_map<uint64_t, std::string>           forwarded_handles_;
+
+    // Phase K-6 — per-RPC arrival counter for tests.
+    std::atomic<uint64_t>                               lookup_calls_{0};
 
     void RememberForwardedHandle(uint64_t handle, std::string owner);
     void ForgetForwardedHandle(uint64_t handle);

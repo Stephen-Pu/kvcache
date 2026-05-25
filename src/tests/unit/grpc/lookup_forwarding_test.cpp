@@ -30,6 +30,7 @@
 #include <thread>
 #include <vector>
 
+#include "cluster/bloom_publisher.h"
 #include "cluster/etcd_client.h"
 #include "cluster/node_directory.h"
 #include "cluster/node_registrar.h"
@@ -517,6 +518,145 @@ TEST(LookupForwarding, ReserveSealForwardsViaHandleMap) {
 
     // Cleanup.
     stub.reset();
+    ra.Stop();
+    rb.Stop();
+    server_a->Stop();
+    server_b->Stop();
+    server_a.reset();
+    server_b.reset();
+    svc_a.reset();
+    svc_b.reset();
+    dir.Stop();
+    kv_ctx_close(ctx);
+}
+
+// ---------------------------------------------------------------------------
+// Phase K-6 — sketch-hint fallback. When the HRW primary IS the
+// caller (`primary == self_node_id`) AND local Lookup misses, the
+// service consults peer bloom sketches and forwards the request to
+// the first peer whose sketch says "MaybeHas". Even though the
+// forwarded peer will (in this shared-singleton test) also miss and
+// return hit=false, we can verify the SKETCH-HINT WIRING fired by
+// observing the peer's LookupCalls counter — it only increments
+// when a remote Lookup actually reaches the peer, which proves K-6
+// fanned out via the sketch path rather than silently bailing.
+// ---------------------------------------------------------------------------
+TEST(LookupForwarding, SketchHintForwardsOnLocalMiss) {
+    kv_ctx_config_t cfg{};
+    cfg.abi_version = KVCACHE_ABI_VERSION;
+    cfg.tenant_id   = "k6-tenant";
+    cfg.model_id    = "k6-model";
+    kv_ctx_t* ctx = nullptr;
+    ASSERT_EQ(kv_ctx_open(&cfg, &ctx), KV_OK);
+
+    InMemoryEtcdClient etcd;
+    HrwRing            ring;
+    NodeDirectory      dir(&etcd, &ring);
+    std::string err;
+    ASSERT_TRUE(dir.Start(&err)) << err;
+
+    auto svc_a = std::make_unique<NodeDataServiceImpl>(ctx);
+    auto svc_b = std::make_unique<NodeDataServiceImpl>(ctx);
+
+    GrpcServer::Options gso;
+    gso.bind_host = "127.0.0.1";
+    gso.port      = 0;
+    auto server_a = std::make_unique<GrpcServer>(gso, svc_a.get());
+    ASSERT_TRUE(server_a->Ok()) << server_a->error();
+    auto server_b = std::make_unique<GrpcServer>(gso, svc_b.get());
+    ASSERT_TRUE(server_b->Ok()) << server_b->error();
+
+    NodeRegistrar::Options oa{};
+    oa.node_id        = "node-a";
+    oa.advertise_host = "127.0.0.1";
+    oa.grpc_port      = server_a->BoundPort();
+    NodeRegistrar ra(&etcd, oa);
+    ASSERT_TRUE(ra.Start(&err)) << err;
+
+    NodeRegistrar::Options ob{};
+    ob.node_id        = "node-b";
+    ob.advertise_host = "127.0.0.1";
+    ob.grpc_port      = server_b->BoundPort();
+    NodeRegistrar rb(&etcd, ob);
+    ASSERT_TRUE(rb.Start(&err)) << err;
+
+    ASSERT_TRUE(WaitFor([&] { return dir.NodeCount() == 2; }));
+
+    svc_a->EnableForwarding("node-a", &ring, &dir);
+    svc_b->EnableForwarding("node-b", &ring, &dir);
+
+    // Probe many disjoint token vectors until we find one whose HRW
+    // primary happens to be node-a — that's the seed the test needs
+    // (HRW primary == self for the caller).
+    const std::string tenant_id  = "k6-tenant";
+    const uint64_t    model_hash = 0x1357'9ABC'DEF0'1234ULL;
+    const uint64_t    tenant_hash_for_sketch = 42;  // arbitrary; we
+        // use the same value when populating the bloom + when
+        // sending the LookupRequest (via tenant_id_hash field).
+    std::vector<uint32_t> tokens;
+    for (uint32_t seed = 1000; seed < 5000; seed += 13) {
+        const auto candidate = RangeTokens(seed, 2 * kChunkTokens);
+        // HRW key shape: same bytes the Lookup handler hashes against
+        // ring_->Primary — tokens packed LE.
+        std::vector<uint8_t> kb(candidate.size() * 4);
+        for (std::size_t i = 0; i < candidate.size(); ++i) {
+            for (int j = 0; j < 4; ++j) {
+                kb[i * 4 + j] =
+                    static_cast<uint8_t>((candidate[i] >> (j * 8)) & 0xff);
+            }
+        }
+        if (ring.Primary(std::span<const uint8_t>(kb.data(), kb.size()))
+              == "node-a") {
+            tokens = candidate;
+            break;
+        }
+    }
+    ASSERT_FALSE(tokens.empty())
+        << "couldn't find a token vector with HRW primary=node-a";
+
+    // Populate node-b's bloom sketch with our token vector under the
+    // SAME (tenant_hash, model_hash) the Lookup will use. We don't
+    // bother sealing on node-b — we only need the directory to
+    // see "node-b might have this key".
+    using kvcache::node::cluster::BloomPublisher;
+    BloomPublisher::Options pub_opts{};
+    pub_opts.node_id        = "node-b";
+    pub_opts.expected_chunks = 1024;
+    pub_opts.publish_period = std::chrono::seconds(60);  // no-op timer
+    BloomPublisher pub(&etcd, pub_opts);
+    pub.AddTokens(tenant_hash_for_sketch, model_hash,
+                  tokens.data(), tokens.size());
+    ASSERT_TRUE(pub.Start(&err)) << err;
+    ASSERT_TRUE(WaitFor([&] { return dir.SketchCount() == 1; }));
+
+    auto chan_a = ::grpc::CreateChannel(
+        "127.0.0.1:" + std::to_string(server_a->BoundPort()),
+        ::grpc::InsecureChannelCredentials());
+    auto stub_a = NodeData::NewStub(chan_a);
+
+    const uint64_t b_calls_before = svc_b->LookupCalls();
+
+    ::grpc::ClientContext lctx;
+    kvcache::proto::LookupRequest lreq;
+    lreq.set_tenant_id(tenant_id);
+    lreq.set_tenant_id_hash(tenant_hash_for_sketch);
+    lreq.set_model_id_hash(model_hash);
+    for (uint32_t t : tokens) lreq.add_tokens(t);
+    kvcache::proto::LookupResponse lresp;
+    auto s = stub_a->Lookup(&lctx, lreq, &lresp);
+    ASSERT_TRUE(s.ok()) << s.error_message();
+    // node-b's bloom has it but the (shared) HeadlessNode never had
+    // it sealed — the forwarded Lookup MUST observe hit=false.
+    EXPECT_FALSE(lresp.hit());
+
+    // The actual K-6 assertion: node-b's Lookup handler was invoked.
+    const uint64_t b_calls_after = svc_b->LookupCalls();
+    EXPECT_GT(b_calls_after, b_calls_before)
+        << "K-6 sketch-hint path did NOT forward to node-b. "
+           "Before=" << b_calls_before << " After=" << b_calls_after;
+
+    pub.Stop();
+    stub_a.reset();
     ra.Stop();
     rb.Stop();
     server_a->Stop();

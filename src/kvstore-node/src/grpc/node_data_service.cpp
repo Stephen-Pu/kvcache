@@ -24,6 +24,7 @@
 
 #include <openssl/sha.h>
 
+#include "cluster/bloom_publisher.h"  // SketchKeyForTokens
 #include "cluster/node_directory.h"
 #include "kvcache/kv_errors.h"
 #include "kvcache/kv_types.h"
@@ -278,6 +279,7 @@ kv_ctx_t* NodeDataServiceImpl::CtxForHandle(uint64_t h) {
     ::grpc::ServerContext* context,
     const kvcache::proto::LookupRequest* request,
     kvcache::proto::LookupResponse*      response) {
+    lookup_calls_.fetch_add(1, std::memory_order_relaxed);
     // Phase Q-1 — cross-node Lookup fan-out.
     //
     // If fan-out is enabled and we are NOT the HRW primary for this
@@ -346,6 +348,54 @@ kv_ctx_t* NodeDataServiceImpl::CtxForHandle(uint64_t h) {
     int rc = kv_lookup(ctx, tokens.data(), tokens.size(),
                          &meta, &handle, &matched);
     if (rc == KV_E_NOT_FOUND) {
+        // Phase K-6 — sketch-hint fallback. We are HRW primary AND
+        // we have nothing locally. A peer with a positive bloom may
+        // still have the chunk (chunk migrated, or HRW changed and
+        // the old owner still has the bytes). Probe every directory-
+        // visible peer in HRW-rank order; forward to the first
+        // bloom-positive that we haven't already forwarded from.
+        if (!already_forwarded && ring_ && directory_ &&
+            !self_node_id_.empty()) {
+            const auto skey = cluster::SketchKeyForTokens(
+                th, mh, tokens.data(), tokens.size());
+            // Stable iteration order: HRW.TopK against the same key
+            // bytes the primary computation used. This keeps the
+            // probe order deterministic AND biased toward whatever
+            // node was the previous owner before a membership shift.
+            std::string tokens_bytes;
+            tokens_bytes.resize(tokens.size() * 4);
+            for (std::size_t i = 0; i < tokens.size(); ++i) {
+                const uint32_t t = tokens[i];
+                std::memcpy(tokens_bytes.data() + i * 4, &t, 4);
+            }
+            const auto ranked = ring_->TopK(
+                std::span<const uint8_t>(
+                    reinterpret_cast<const uint8_t*>(tokens_bytes.data()),
+                    tokens_bytes.size()),
+                /*k=*/ ring_->NodeCount());
+            for (const auto& peer_id : ranked) {
+                if (peer_id == self_node_id_) continue;
+                if (!directory_->PeerMaybeHas(peer_id, skey)) continue;
+                auto peer = GetPeerStub(peer_id);
+                if (!peer) continue;  // try next peer
+                ::grpc::ClientContext fctx;
+                fctx.AddMetadata(kForwardedHeader, "1");
+                auto status =
+                    peer->stub->Lookup(&fctx, *request, response);
+                // A successful forward (hit OR clean miss) ends the
+                // probe — even a peer that bloom-says-maybe and
+                // actually-says-miss is authoritative for itself.
+                // Errors fall through to the next ranked peer.
+                if (status.ok()) {
+                    if (response->hit() &&
+                        response->server_handle() != 0) {
+                        RememberForwardedHandle(
+                            response->server_handle(), peer_id);
+                    }
+                    return status;
+                }
+            }
+        }
         response->set_hit(false);
         return ::grpc::Status::OK;
     }
