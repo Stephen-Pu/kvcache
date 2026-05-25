@@ -222,6 +222,73 @@ TEST(NodeDirectoryTest, AdoptsClusterViewSnapshot) {
     dir.Stop();
 }
 
+// Phase R-4 — chaos: N parallel registrars race the watch dispatcher.
+//
+// Each thread runs an independent NodeRegistrar against a shared
+// etcd. The test asserts that NodeDirectory converges to ALL N
+// nodes, then to 0 after every registrar Stops. Catches:
+//
+//   * Lost-update races between WatchPrefix callback delivery and
+//     NodeDirectory's table mutations.
+//   * Lock-ordering inversions between Registry-side keepalive
+//     threads and Directory-side OnWatch.
+//   * Off-by-one bugs in the rebuild-ring path when many concurrent
+//     mutations land in a short window.
+//
+// N=10 is enough to surface races on macOS/Linux without making the
+// test long. Each registrar lives in its own thread with its own
+// keepalive loop.
+TEST(NodeDirectoryTest, ConcurrentRegistrarsConverge) {
+    constexpr int kN = 10;
+    InMemoryEtcdClient etcd;
+    HrwRing ring;
+    NodeDirectory dir(&etcd, &ring);
+    std::string err;
+    ASSERT_TRUE(dir.Start(&err)) << err;
+
+    std::vector<std::unique_ptr<NodeRegistrar>> regs;
+    regs.reserve(kN);
+    std::vector<std::thread>     starters;
+    starters.reserve(kN);
+    for (int i = 0; i < kN; ++i) {
+        NodeRegistrar::Options o{};
+        o.node_id        = "n" + std::to_string(i);
+        o.advertise_host = "10.0.0." + std::to_string(i + 1);
+        o.grpc_port      = static_cast<uint16_t>(8000 + i);
+        regs.emplace_back(std::make_unique<NodeRegistrar>(&etcd, o));
+    }
+    // Race the Starts.
+    for (auto& r : regs) {
+        starters.emplace_back([&r] {
+            std::string e;
+            (void)r->Start(&e);
+        });
+    }
+    for (auto& t : starters) t.join();
+
+    ASSERT_TRUE(WaitFor([&] { return dir.NodeCount() == kN; },
+                          std::chrono::seconds(3)));
+    EXPECT_EQ(ring.NodeCount(), kN);
+    // Every id should be resolvable.
+    for (int i = 0; i < kN; ++i) {
+        EXPECT_TRUE(dir.Resolve("n" + std::to_string(i)).has_value())
+            << "n" << i << " missing after concurrent register";
+    }
+
+    // Race the Stops (graceful unregister → LeaseRevoke).
+    std::vector<std::thread> stoppers;
+    stoppers.reserve(kN);
+    for (auto& r : regs) {
+        stoppers.emplace_back([&r] { r->Stop(); });
+    }
+    for (auto& t : stoppers) t.join();
+
+    ASSERT_TRUE(WaitFor([&] { return dir.NodeCount() == 0; },
+                          std::chrono::seconds(3)));
+    EXPECT_EQ(ring.NodeCount(), 0u);
+    dir.Stop();
+}
+
 // Phase R-3 — chaos: full leader handover under in-flight membership.
 //
 // Scenario the test pins down:
