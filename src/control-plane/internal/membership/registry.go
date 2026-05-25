@@ -80,6 +80,12 @@ func NewRegistry(c *myetcd.Client) *Registry {
 	return &Registry{etcd: c}
 }
 
+// EtcdClient exposes the underlying client for collaborators that
+// need their own Put/Watch path (e.g. the K-7 SketchAggregator).
+// Returns nil for an uninitialised Registry — callers should
+// nil-check before use.
+func (r *Registry) EtcdClient() *myetcd.Client { return r.etcd }
+
 // RegisterNode publishes the node under /nodes/<node_id> bound to a fresh lease
 // and returns the lease id. The caller must call KeepAlive on that lease for
 // the duration of the node's lifetime.

@@ -27,6 +27,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -218,12 +219,30 @@ func runElection(ctx context.Context, cli *clientv3.Client, electionPath string,
 // key auto-expires on leader loss and the new leader rewrites it.
 func runLeaderDuties(ctx context.Context, registry *membership.Registry,
 	leaderID string, lease clientv3.LeaseID) {
+	// Phase K-2 — coherent cluster view.
 	pub := &membership.ViewPublisher{
 		Registry: registry,
 		Lease:    lease,
 		LeaderID: leaderID,
 	}
+	// Phase K-7 — cluster-wide bloom-sketch aggregation. Runs in a
+	// sibling goroutine so view + sketch publish independently.
+	agg := &membership.SketchAggregator{
+		Etcd:     registry.EtcdClient(),
+		Lease:    lease,
+		LeaderID: leaderID,
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := agg.Run(ctx); err != nil {
+			log.Printf("control-plane: sketch aggregator: %v", err)
+		}
+	}()
 	if err := pub.Run(ctx); err != nil {
 		log.Printf("control-plane: cluster-view publisher: %v", err)
 	}
+	wg.Wait()
 }
