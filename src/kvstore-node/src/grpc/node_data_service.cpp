@@ -156,6 +156,11 @@ NodeDataServiceImpl::~NodeDataServiceImpl() {
     handle_to_ctx_.clear();
 }
 
+void NodeDataServiceImpl::EnableSketchPublishing(
+    cluster::BloomPublisher* publisher) {
+    publisher_ = publisher;
+}
+
 void NodeDataServiceImpl::EnableForwarding(std::string self_node_id,
                                             routing::HrwRing* ring,
                                             cluster::NodeDirectory* directory) {
@@ -266,6 +271,7 @@ void NodeDataServiceImpl::RememberHandle(uint64_t h, kv_ctx_t* ctx) {
 void NodeDataServiceImpl::ForgetHandle(uint64_t h) {
     std::lock_guard<std::mutex> lk(mu_);
     handle_to_ctx_.erase(h);
+    handle_to_hashes_.erase(h);
 }
 
 kv_ctx_t* NodeDataServiceImpl::CtxForHandle(uint64_t h) {
@@ -472,6 +478,13 @@ kv_ctx_t* NodeDataServiceImpl::CtxForHandle(uint64_t h) {
     if (rc != KV_OK) return ToGrpcStatus(rc, "kv_reserve");
 
     RememberHandle(h, ctx);
+    // Phase K-8 — remember (th, mh) alongside the ctx so Seal can
+    // publish to the bloom sketch under the same hashes Lookup will
+    // probe for. ForgetHandle clears both maps in tandem.
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        handle_to_hashes_[h] = HandleHashes{th, mh};
+    }
     response->set_server_handle(h);
     response->set_slot_iova(reinterpret_cast<uint64_t>(slot.addr));
     response->set_slot_bytes(slot.len);
@@ -615,6 +628,28 @@ kv_ctx_t* NodeDataServiceImpl::CtxForHandle(uint64_t h) {
                        tokens.empty() ? nullptr : tokens.data(),
                        tokens.size());
     if (rc != KV_OK) return ToGrpcStatus(rc, "kv_seal");
+
+    // Phase K-8 — publish the just-sealed chunk into our bloom sketch
+    // under the same (tenant_hash, model_hash) Reserve resolved, so
+    // peers consulting K-6 see a positive Maybehas for this prefix.
+    // Best-effort: the publisher is optional; the sketch entry never
+    // gates correctness.
+    if (publisher_ && !tokens.empty()) {
+        HandleHashes hh{0, 0};
+        bool found = false;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            auto it = handle_to_hashes_.find(request->server_handle());
+            if (it != handle_to_hashes_.end()) {
+                hh = it->second;
+                found = true;
+            }
+        }
+        if (found) {
+            publisher_->AddTokens(hh.tenant_hash, hh.model_hash,
+                                    tokens.data(), tokens.size());
+        }
+    }
     response->mutable_locator();  // empty Locator; Phase H-3 fills in if needed
     return ::grpc::Status::OK;
 }

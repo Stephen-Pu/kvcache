@@ -45,6 +45,7 @@
 #include "node.grpc.pb.h"
 
 namespace kvcache::node::cluster { class NodeDirectory; }
+namespace kvcache::node::cluster { class BloomPublisher; }
 namespace kvcache::node::routing { class HrwRing; }
 
 namespace kvcache::node::grpc_server {
@@ -69,6 +70,12 @@ class NodeDataServiceImpl final : public kvcache::proto::NodeData::Service {
     void EnableForwarding(std::string             self_node_id,
                           routing::HrwRing*       ring,
                           cluster::NodeDirectory* directory);
+
+    // Phase K-8 — install a BloomPublisher to receive AddTokens on
+    // every successful Seal. Optional; when null the service skips
+    // the publisher call and the node's sketch stays empty. The
+    // pointer is non-owning and must outlive the service.
+    void EnableSketchPublishing(cluster::BloomPublisher* publisher);
 
     ::grpc::Status Lookup(::grpc::ServerContext*               context,
                             const kvcache::proto::LookupRequest* request,
@@ -137,12 +144,19 @@ class NodeDataServiceImpl final : public kvcache::proto::NodeData::Service {
     mutable std::mutex                       mu_;
     std::unordered_map<uint64_t, kv_ctx_t*>  cache_;        // owned ctxs
     std::unordered_map<uint64_t, kv_ctx_t*>  handle_to_ctx_;
+    // Phase K-8 — handle→(tenant_hash, model_hash) shadow so Seal
+    // can publish to the bloom sketch under the same hashes Reserve
+    // resolved (the kv_ctx_t* doesn't expose them externally).
+    struct HandleHashes { uint64_t tenant_hash; uint64_t model_hash; };
+    std::unordered_map<uint64_t, HandleHashes> handle_to_hashes_;
 
     // Forwarding state — populated by EnableForwarding. All three are
     // either all set (fan-out enabled) or all empty/null (local-only).
     std::string                              self_node_id_;
     routing::HrwRing*                        ring_      = nullptr;
     cluster::NodeDirectory*                  directory_ = nullptr;
+    // Phase K-8 — set by EnableSketchPublishing.
+    cluster::BloomPublisher*                 publisher_ = nullptr;
 
     // Per-peer NodeData stub cache. The Channel keeps itself reusable
     // across RPCs; the stub is light-weight on top.

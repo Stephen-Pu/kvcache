@@ -668,3 +668,139 @@ TEST(LookupForwarding, SketchHintForwardsOnLocalMiss) {
     dir.Stop();
     kv_ctx_close(ctx);
 }
+
+// ---------------------------------------------------------------------------
+// Phase K-8 — Seal hook populates the publisher's bloom.
+//
+// Wires svc_a to a BloomPublisher; drives a Reserve→Publish→Seal
+// against svc_a's stub; then decodes the publisher's snapshot and
+// asserts the chunk-key derived from the sealed token vector lands
+// in the resulting bloom. Closes the loop K-6 opened: by the time a
+// peer's directory observes svc_a's published sketch, that sketch
+// actually reflects what svc_a has sealed.
+// ---------------------------------------------------------------------------
+TEST(SketchPublishing, SealAddsTokensToPublisher) {
+    kv_ctx_config_t cfg{};
+    cfg.abi_version = KVCACHE_ABI_VERSION;
+    cfg.tenant_id   = "k8-tenant";
+    cfg.model_id    = "k8-model";
+    kv_ctx_t* ctx = nullptr;
+    ASSERT_EQ(kv_ctx_open(&cfg, &ctx), KV_OK);
+
+    InMemoryEtcdClient etcd;
+    auto svc = std::make_unique<NodeDataServiceImpl>(ctx);
+    GrpcServer::Options gso;
+    gso.bind_host = "127.0.0.1";
+    gso.port      = 0;
+    auto server = std::make_unique<GrpcServer>(gso, svc.get());
+    ASSERT_TRUE(server->Ok()) << server->error();
+
+    // Publisher does NOT need an etcd publish — we read its bloom
+    // in-process directly through EncodeSnapshot.
+    using kvcache::node::cluster::BloomPublisher;
+    using kvcache::node::cluster::DecodeBloomSnapshot;
+    using kvcache::node::cluster::SketchKeyForTokens;
+    BloomPublisher::Options pub_opts{};
+    pub_opts.node_id        = "k8-self";
+    pub_opts.expected_chunks = 1024;
+    pub_opts.publish_period = std::chrono::seconds(60);  // no-op timer
+    BloomPublisher pub(&etcd, pub_opts);
+    std::string err;
+    ASSERT_TRUE(pub.Start(&err)) << err;
+
+    svc->EnableSketchPublishing(&pub);
+
+    auto chan = ::grpc::CreateChannel(
+        "127.0.0.1:" + std::to_string(server->BoundPort()),
+        ::grpc::InsecureChannelCredentials());
+    auto stub = NodeData::NewStub(chan);
+
+    const std::string tenant_id  = "k8-tenant";
+    const uint64_t    model_hash = 0xFEEDFACECAFEBABEULL;
+    const auto        tokens     = RangeTokens(60000, 2 * kChunkTokens);
+    const std::size_t bytes_total = tokens.size() * 64;
+
+    // Build the same Locator shape Reserve expects (see Q-5 SHA-1 path).
+    auto build_locator = [&]() {
+        kvcache::proto::Locator loc;
+        uint8_t sha[20];
+        SHA1(reinterpret_cast<const uint8_t*>(tenant_id.data()),
+              tenant_id.size(), sha);
+        loc.set_tenant_id(std::string(reinterpret_cast<const char*>(sha), 16));
+        loc.set_model_id_hash(model_hash);
+        std::string ph(16, '\0');
+        for (std::size_t i = 0; i < tokens.size(); ++i) {
+            ph[(i * 7) % 16] ^= static_cast<char>(tokens[i] & 0xff);
+            ph[(i * 3) % 16] ^= static_cast<char>((tokens[i] >> 8) & 0xff);
+        }
+        loc.set_prefix_hash(ph);
+        auto* r = loc.mutable_range();
+        r->set_token_start(0);
+        r->set_token_count(static_cast<uint32_t>(tokens.size()));
+        loc.set_version(1);
+        return loc;
+    };
+
+    ::grpc::ClientContext rctx;
+    kvcache::proto::ReserveRequest rreq;
+    *rreq.mutable_locator() = build_locator();
+    rreq.set_bytes(bytes_total);
+    kvcache::proto::ReserveResponse rresp;
+    ASSERT_TRUE(stub->Reserve(&rctx, rreq, &rresp).ok());
+    auto* slot = reinterpret_cast<uint8_t*>(rresp.slot_iova());
+    std::memset(slot, 0x77, bytes_total);
+
+    ::grpc::ClientContext pctx;
+    kvcache::proto::PublishRequest preq;
+    preq.set_server_handle(rresp.server_handle());
+    preq.set_watermark(bytes_total);
+    kvcache::proto::PublishResponse presp;
+    ASSERT_TRUE(stub->Publish(&pctx, preq, &presp).ok());
+
+    ::grpc::ClientContext sctx;
+    kvcache::proto::SealRequest sreq;
+    sreq.set_server_handle(rresp.server_handle());
+    for (uint32_t t : tokens) sreq.add_tokens(t);
+    kvcache::proto::SealResponse sresp;
+    ASSERT_TRUE(stub->Seal(&sctx, sreq, &sresp).ok());
+
+    // Decode the publisher's bloom and probe it directly. Reserve
+    // resolved (th, mh) via HashTenantBytes16(locator.tenant_id) for
+    // tenant_hash; here the locator's tenant_id IS the SHA-1 prefix
+    // bytes, so we replicate exactly.
+    auto hash_tenant_bytes16 = [](const std::string& sixteen) {
+        uint64_t h = 0xcbf29ce484222325ULL;
+        for (char c : sixteen) {
+            h ^= static_cast<uint8_t>(c);
+            h *= 0x100000001b3ULL;
+        }
+        return h;
+    };
+    uint8_t sha[20];
+    SHA1(reinterpret_cast<const uint8_t*>(tenant_id.data()),
+          tenant_id.size(), sha);
+    const std::string tenant16(reinterpret_cast<const char*>(sha), 16);
+    const uint64_t expected_th = hash_tenant_bytes16(tenant16);
+
+    const auto skey = SketchKeyForTokens(
+        expected_th, model_hash, tokens.data(), tokens.size());
+
+    const auto blob = pub.EncodeSnapshot();
+    kvcache::node::routing::BloomParams params{0, 0};
+    std::vector<uint8_t> bits;
+    ASSERT_TRUE(DecodeBloomSnapshot(
+        std::string(blob.begin(), blob.end()), &params, &bits));
+
+    // Reconstruct the AggregatedBloom and probe.
+    kvcache::node::routing::AggregatedBloom agg(params);
+    agg.Set(params, std::move(bits));
+    EXPECT_TRUE(agg.MaybeContains(skey))
+        << "Seal hook did not add the chunk-key to the publisher bloom";
+
+    stub.reset();
+    pub.Stop();
+    server->Stop();
+    server.reset();
+    svc.reset();
+    kv_ctx_close(ctx);
+}

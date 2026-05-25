@@ -34,6 +34,7 @@
 
 #if defined(KVCACHE_HAVE_GRPC)
 #include "cluster/etcd_client.h"
+#include "cluster/bloom_publisher.h"
 #include "cluster/node_directory.h"
 #include "cluster/node_registrar.h"
 #include "kvcache/kv_abi.h"
@@ -148,6 +149,10 @@ int main(int argc, char** argv) {
     std::unique_ptr<kvcache::node::routing::HrwRing>            ring;
     std::unique_ptr<kvcache::node::cluster::NodeDirectory>      directory;
     std::unique_ptr<kvcache::node::cluster::NodeRegistrar>      registrar;
+    // Phase K-8 — bloom-sketch publisher. Lives next to the registrar
+    // so it can reuse the same node identity + (eventually) the same
+    // etcd lease.
+    std::unique_ptr<kvcache::node::cluster::BloomPublisher>     publisher;
     if (!node_id.empty() && !etcd_endpoints.empty() &&
         !advertise_host.empty()) {
         // HttpEtcdClient takes a single endpoint URL; the flag accepts
@@ -211,6 +216,27 @@ int main(int argc, char** argv) {
                 svc.EnableForwarding(node_id, ring.get(), directory.get());
                 std::fprintf(stderr,
                     "kvstore-node: cross-node Lookup fan-out enabled\n");
+            }
+
+            // Phase K-8 — bloom publisher. Bound to the same lease as
+            // the NodeRegistrar so it dies with the node identity.
+            if (registrar) {
+                kvcache::node::cluster::BloomPublisher::Options bo;
+                bo.node_id = node_id;
+                bo.lease   = registrar->Lease();
+                publisher = std::make_unique<
+                    kvcache::node::cluster::BloomPublisher>(etcd.get(), bo);
+                std::string berr;
+                if (!publisher->Start(&berr)) {
+                    std::fprintf(stderr,
+                        "kvstore-node: bloom publisher start failed: %s\n",
+                        berr.c_str());
+                    publisher.reset();
+                } else {
+                    svc.EnableSketchPublishing(publisher.get());
+                    std::fprintf(stderr,
+                        "kvstore-node: bloom-sketch fan-out enabled\n");
+                }
             }
         }
     }
