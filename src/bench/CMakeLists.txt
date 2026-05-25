@@ -26,5 +26,13 @@ target_include_directories(bench_fairness PRIVATE
 )
 target_link_libraries(bench_fairness PRIVATE kvcache)
 
+# Phase S-3 — priority-class preemption bench.
+add_executable(bench_priority bench_priority.cpp)
+target_include_directories(bench_priority PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+target_link_libraries(bench_priority PRIVATE kvcache)
+
 # Convenience aggregate target.
-add_custom_target(bench DEPENDS bench_lookup bench_fetch bench_fairness)
+add_custom_target(bench DEPENDS bench_lookup bench_fetch bench_fairness bench_priority)

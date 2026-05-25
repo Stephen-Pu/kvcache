@@ -95,6 +95,16 @@ _Static_assert(sizeof(kv_locator_t) == KV_LOCATOR_SIZE,
 #endif
 
 /* ------------------------------------------------------------------------- */
+/* Priority classes (LLD §5.1) — drives PriorityScheduler reservations.      */
+/* ------------------------------------------------------------------------- */
+
+typedef enum {
+    KV_PRIORITY_P0 = 0, /* control-plane / health  — strict preempt-everything */
+    KV_PRIORITY_P1 = 1, /* default data-plane fetch — most engine traffic     */
+    KV_PRIORITY_P2 = 2, /* background / warmer     — yields to higher classes  */
+} kv_priority_t;
+
+/* ------------------------------------------------------------------------- */
 /* Events — surfaced via kv_subscribe_events (LLD §2.2 KV Event schema).     */
 /* ------------------------------------------------------------------------- */
 

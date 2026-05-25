@@ -172,6 +172,17 @@ KV_API int kv_fetch(kv_ctx_t* ctx, kv_handle_t handle,
                              ranges, n, dst, completion);
 }
 
+KV_API int kv_fetch_with_priority(kv_ctx_t* ctx, kv_handle_t handle,
+                                   const kv_range_t* ranges, size_t n,
+                                   kv_buffer_desc_t dst,
+                                   kv_priority_t priority,
+                                   kv_completion_t* completion) {
+    if (!ctx || !ctx->node) return KV_E_INVAL;
+    return ctx->node->FetchWithPriority(
+        handle, ctx->tenant_id_hash, ranges, n, dst,
+        static_cast<int>(priority), completion);
+}
+
 KV_API int kv_wait(kv_ctx_t* ctx, kv_completion_t cid, uint32_t timeout_ms) {
     if (!ctx || !ctx->node) return KV_E_INVAL;
     return ctx->node->Wait(cid, timeout_ms);

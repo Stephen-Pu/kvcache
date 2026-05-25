@@ -266,12 +266,37 @@ int HeadlessNode::Publish(kv_handle_t handle, kv_buffer_desc_t /*src*/,
 // ---------------------------------------------------------------------------
 
 int HeadlessNode::Fetch(kv_handle_t handle, uint64_t tenant_hash,
-                        const kv_range_t* /*ranges*/, std::size_t /*n_ranges*/,
+                        const kv_range_t* ranges, std::size_t n_ranges,
                         kv_buffer_desc_t dst,
                         kv_completion_t* out_completion) {
+    // Backward-compat thin wrapper — default class is P1 (engine data path).
+    return FetchWithPriority(
+        handle, tenant_hash, ranges, n_ranges, dst,
+        static_cast<int>(node::transport::Priority::P1), out_completion);
+}
+
+int HeadlessNode::FetchWithPriority(kv_handle_t handle, uint64_t tenant_hash,
+                        const kv_range_t* /*ranges*/, std::size_t /*n_ranges*/,
+                        kv_buffer_desc_t dst,
+                        int priority,
+                        kv_completion_t* out_completion) {
+    // Map the integer hop through to the scheduler enum. Unknown
+    // values fall back to P1 so the C ABI can never accidentally
+    // submit work as P0 just because of an enum drift.
+    node::transport::Priority prio = node::transport::Priority::P1;
+    switch (priority) {
+        case static_cast<int>(node::transport::Priority::P0):
+            prio = node::transport::Priority::P0; break;
+        case static_cast<int>(node::transport::Priority::P1):
+            prio = node::transport::Priority::P1; break;
+        case static_cast<int>(node::transport::Priority::P2):
+            prio = node::transport::Priority::P2; break;
+        default: prio = node::transport::Priority::P1;
+    }
     auto span = kvcache::trace::Tracer::Get().StartSpan("kv.fetch");
     span.SetAttribute("kv.tenant_hash", static_cast<int64_t>(tenant_hash));
     span.SetAttribute("kv.dst_bytes",   static_cast<int64_t>(dst.len));
+    span.SetAttribute("kv.priority",    static_cast<int64_t>(priority));
 
     HandleState st;
     {
@@ -332,15 +357,15 @@ int HeadlessNode::Fetch(kv_handle_t handle, uint64_t tenant_hash,
         // uniformly across the data plane.
         node::transport::PushRequest preq{src_mr, 0, dst_mr, 0,
                                             f.data.size()};
-        xfer_ok = nixl_->ScheduledPush(preq, node::transport::Priority::P1,
+        xfer_ok = nixl_->ScheduledPush(preq, prio,
                                         tenant_hash, 5000, &err);
     } else {
         node::transport::PullRequest req{dst_mr, 0, src_mr, 0, f.data.size()};
-        // P1 is the default class for ordinary Fetch. The tenant hash
-        // routes each caller into its own per-tenant FIFO inside the
-        // class — so two tenants' Fetches interleave under round-robin
-        // instead of one tenant's burst monopolising the link.
-        xfer_ok = nixl_->ScheduledPull(req, node::transport::Priority::P1,
+        // Tenant hash routes each caller into its own per-tenant FIFO
+        // inside the class — so two tenants' Fetches interleave under
+        // round-robin instead of one tenant's burst monopolising the
+        // link. `prio` picks the class itself (Phase S-3).
+        xfer_ok = nixl_->ScheduledPull(req, prio,
                                         tenant_hash, 5000, &err);
     }
     if (!xfer_ok) {

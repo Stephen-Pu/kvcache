@@ -93,10 +93,19 @@ class HeadlessNode {
     // PriorityScheduler so per-tenant round-robin actually kicks in. Pass
     // 0 (kSystemTenantHash) for system traffic that should share a single
     // bucket — see kv_abi.cpp for the FNV-1a string→u64 hash the C ABI uses.
+    // Default P1 priority (data-plane fetch).
     int Fetch(kv_handle_t handle, uint64_t tenant_hash,
               const kv_range_t* ranges, std::size_t n_ranges,
               kv_buffer_desc_t dst,
               kv_completion_t* out_completion);
+
+    // Phase S-3 — explicit priority class. priority is the integer
+    // kv_priority_t enum (0=P0 control, 1=P1 default, 2=P2 background).
+    int FetchWithPriority(kv_handle_t handle, uint64_t tenant_hash,
+                           const kv_range_t* ranges, std::size_t n_ranges,
+                           kv_buffer_desc_t dst,
+                           int priority,
+                           kv_completion_t* out_completion);
 
     int Wait(kv_completion_t cid, uint32_t timeout_ms);
     int Seal(kv_handle_t handle, const uint32_t* tokens, std::size_t n_tokens);

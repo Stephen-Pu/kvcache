@@ -114,6 +114,17 @@ int kv_fetch(kv_ctx_t* ctx,
              kv_buffer_desc_t dst,
              kv_completion_t* completion);
 
+/* Phase S-3 — same as kv_fetch but lets the caller pick the
+ * PriorityScheduler class. Defaults via kv_fetch are P1 (the engine
+ * data path). P0 callers preempt P1/P2 under contention; P2 callers
+ * yield to higher classes — see LLD §5.1.                            */
+int kv_fetch_with_priority(kv_ctx_t* ctx,
+                            kv_handle_t handle,
+                            const kv_range_t* ranges, size_t n,
+                            kv_buffer_desc_t dst,
+                            kv_priority_t priority,
+                            kv_completion_t* completion);
+
 /*
  * kv_wait — block until 'completion' is done or 'timeout_ms' elapses.
  * Returns KV_OK on completion, KV_E_TIMEOUT otherwise.
