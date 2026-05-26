@@ -89,6 +89,18 @@ class NodeDataServiceImpl final : public kvcache::proto::NodeData::Service {
                            std::string key_pem,
                            std::string ssl_target_name_override);
 
+    // Phase N-3 — when enabled, the Lookup / Reserve / Seal handlers
+    // require the inbound peer's client-cert CN to match the
+    // request's tenant string (or, for Locator-bearing requests, the
+    // tenant derived from the Locator's tenant_id bytes). Mismatch
+    // surfaces as UNAUTHENTICATED. Forwarded requests
+    // (x-kvcache-forwarded header set) are exempt because the
+    // ORIGINAL hop has already enforced the binding and node→node
+    // traffic uses the cluster's shared peer cert (Phase N-2), not
+    // a per-tenant leaf. Opt-in so existing TLS tests (whose certs
+    // use a generic CN) keep passing. Defaults to OFF.
+    void EnableTenantCertBinding(bool enable);
+
     ::grpc::Status Lookup(::grpc::ServerContext*               context,
                             const kvcache::proto::LookupRequest* request,
                             kvcache::proto::LookupResponse*      response) override;
@@ -177,6 +189,9 @@ class NodeDataServiceImpl final : public kvcache::proto::NodeData::Service {
     std::string                              peer_tls_cert_;
     std::string                              peer_tls_key_;
     std::string                              peer_tls_ssl_target_override_;
+
+    // Phase N-3 — atomic so handler reads don't need to acquire mu_.
+    std::atomic<bool>                        tenant_cert_binding_enabled_{false};
 
     // Per-peer NodeData stub cache. The Channel keeps itself reusable
     // across RPCs; the stub is light-weight on top.

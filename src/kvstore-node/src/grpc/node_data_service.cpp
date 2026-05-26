@@ -13,6 +13,7 @@
 #include "grpc/node_data_service.h"
 
 #include <grpcpp/grpcpp.h>
+#include <grpcpp/security/auth_context.h>
 
 #include <chrono>
 #include <condition_variable>
@@ -159,6 +160,24 @@ NodeDataServiceImpl::~NodeDataServiceImpl() {
 void NodeDataServiceImpl::EnableSketchPublishing(
     cluster::BloomPublisher* publisher) {
     publisher_ = publisher;
+}
+
+void NodeDataServiceImpl::EnableTenantCertBinding(bool enable) {
+    tenant_cert_binding_enabled_.store(enable, std::memory_order_relaxed);
+}
+
+// Phase N-3 — pull the client-cert CN out of the gRPC auth context.
+// Returns empty when no peer cert was presented (insecure listener,
+// or TLS without REQUIRE_CLIENT_CERT). When multiple CNs are
+// reported (rare; cert with multi-valued subject) we take the first.
+static std::string ClientCertCN(::grpc::ServerContext* ctx) {
+    if (!ctx) return {};
+    auto ac = ctx->auth_context();
+    if (!ac) return {};
+    auto props = ac->FindPropertyValues("x509_common_name");
+    if (props.empty()) return {};
+    const auto& p = props.front();
+    return std::string(p.data(), p.size());
 }
 
 void NodeDataServiceImpl::EnableMtlsClient(std::string ca_pem,
@@ -333,6 +352,25 @@ kv_ctx_t* NodeDataServiceImpl::CtxForHandle(uint64_t h) {
     if (context) {
         const auto& md = context->client_metadata();
         already_forwarded = md.find(kForwardedHeader) != md.end();
+    }
+    // Phase N-3 — direct (non-forwarded) requests must show a client
+    // cert whose CN matches the request's tenant. Forwarded requests
+    // ride the cluster's peer cert (N-2) so the binding was already
+    // enforced at the original hop; we skip the check here to avoid
+    // a chicken-and-egg loop.
+    if (tenant_cert_binding_enabled_.load(std::memory_order_relaxed) &&
+        !already_forwarded) {
+        const std::string cn = ClientCertCN(context);
+        if (cn.empty()) {
+            return {::grpc::StatusCode::UNAUTHENTICATED,
+                     "Lookup: client cert required for tenant binding"};
+        }
+        if (cn != request->tenant_id()) {
+            return {::grpc::StatusCode::UNAUTHENTICATED,
+                     "Lookup: client cert CN '" + cn +
+                         "' does not match tenant_id '" +
+                         request->tenant_id() + "'"};
+        }
     }
     if (ring_ && !already_forwarded && !self_node_id_.empty()) {
         // Token vector is read repeatedly; pack as bytes once.

@@ -305,3 +305,62 @@ TEST_F(GrpcTlsFixture, EnableMtlsClientWithBogusMaterialFailsHandshake) {
     EXPECT_FALSE(s.ok())
         << "Bogus mTLS material should produce a handshake failure";
 }
+
+// Phase N-3 — tenant-cert binding: a non-forwarded Lookup whose
+// tenant_id doesn't match the client cert's CN must surface
+// UNAUTHENTICATED. When binding is OFF (default), the same request
+// goes through normally. When CN matches, the request proceeds.
+// The fixture's cert is generated with CN=kvcache-test-client, so
+// we use that as the canonical "authorised" tenant.
+TEST_F(GrpcTlsFixture, TenantCertBindingRejectsCnTenantMismatch) {
+    svc_->EnableTenantCertBinding(true);
+
+    auto stub = StubWithMtls();
+
+    // Mismatch — UNAUTHENTICATED.
+    {
+        ::grpc::ClientContext ctx;
+        ctx.set_deadline(std::chrono::system_clock::now() +
+                          std::chrono::seconds(5));
+        kvcache::proto::LookupRequest req;
+        req.set_tenant_id("some-other-tenant");
+        req.add_tokens(1);
+        kvcache::proto::LookupResponse resp;
+        auto s = stub->Lookup(&ctx, req, &resp);
+        EXPECT_FALSE(s.ok());
+        EXPECT_EQ(s.error_code(), ::grpc::StatusCode::UNAUTHENTICATED)
+            << "mismatched tenant should be rejected, got "
+            << s.error_code() << ": " << s.error_message();
+    }
+
+    // Match — passes.
+    {
+        ::grpc::ClientContext ctx;
+        ctx.set_deadline(std::chrono::system_clock::now() +
+                          std::chrono::seconds(5));
+        kvcache::proto::LookupRequest req;
+        req.set_tenant_id("kvcache-test-client");  // == cert CN
+        req.add_tokens(1);
+        kvcache::proto::LookupResponse resp;
+        auto s = stub->Lookup(&ctx, req, &resp);
+        EXPECT_TRUE(s.ok())
+            << "matching tenant should pass; got "
+            << s.error_code() << ": " << s.error_message();
+    }
+
+    // Toggle binding back OFF — the previously-failing tenant_id
+    // should now succeed. Proves the check is gated on the setter.
+    svc_->EnableTenantCertBinding(false);
+    {
+        ::grpc::ClientContext ctx;
+        ctx.set_deadline(std::chrono::system_clock::now() +
+                          std::chrono::seconds(5));
+        kvcache::proto::LookupRequest req;
+        req.set_tenant_id("some-other-tenant");
+        req.add_tokens(1);
+        kvcache::proto::LookupResponse resp;
+        auto s = stub->Lookup(&ctx, req, &resp);
+        EXPECT_TRUE(s.ok())
+            << "with binding off, any tenant string should pass";
+    }
+}
