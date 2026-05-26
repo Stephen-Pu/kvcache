@@ -158,6 +158,13 @@ class NodeDataServiceImpl final : public kvcache::proto::NodeData::Service {
     // Record that `server_handle` was minted on `ctx` so subsequent
     // handle-based RPCs can find it.
     void RememberHandle(uint64_t server_handle, kv_ctx_t* ctx);
+
+    // Phase N-5 — record / verify handle ownership by cert CN. No-op
+    // when binding is disabled. CheckHandleOwnership returns true if
+    // the handle is unowned-under-binding-off OR the recorded CN
+    // matches `cn`; false on mismatch.
+    void RecordHandleCN(uint64_t server_handle, const std::string& cn);
+    bool CheckHandleOwnership(uint64_t server_handle, const std::string& cn);
     // Drop a remembered (handle → ctx) mapping. Called from Release.
     void ForgetHandle(uint64_t server_handle);
     // Resolve a handle back to its ctx; falls back to default_ctx_ on miss.
@@ -173,6 +180,14 @@ class NodeDataServiceImpl final : public kvcache::proto::NodeData::Service {
     // resolved (the kv_ctx_t* doesn't expose them externally).
     struct HandleHashes { uint64_t tenant_hash; uint64_t model_hash; };
     std::unordered_map<uint64_t, HandleHashes> handle_to_hashes_;
+
+    // Phase N-5 — handle→owner-CN binding. When tenant cert binding
+    // is on, Reserve / Lookup record the minting peer's cert CN here;
+    // Publish / Fetch / Seal / Release reject a handle whose recorded
+    // CN doesn't match the calling peer's CN (guards against a tenant
+    // guessing or replaying another tenant's server_handle). Guarded
+    // by mu_ alongside the other handle maps.
+    std::unordered_map<uint64_t, std::string>  handle_to_cn_;
 
     // Forwarding state — populated by EnableForwarding. All three are
     // either all set (fan-out enabled) or all empty/null (local-only).

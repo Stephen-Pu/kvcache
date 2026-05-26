@@ -166,6 +166,16 @@ void NodeDataServiceImpl::EnableTenantCertBinding(bool enable) {
     tenant_cert_binding_enabled_.store(enable, std::memory_order_relaxed);
 }
 
+// Phase N-5 — true if this RPC arrived as a node→node forward (the
+// `x-kvcache-forwarded` header is set). Forwarded calls ride the
+// cluster peer cert, so per-tenant handle-ownership was already
+// enforced at the original hop.
+static bool IsForwardedCall(::grpc::ServerContext* ctx) {
+    if (!ctx) return false;
+    const auto& md = ctx->client_metadata();
+    return md.find("x-kvcache-forwarded") != md.end();
+}
+
 // Phase N-3 — pull the client-cert CN out of the gRPC auth context.
 // Returns empty when no peer cert was presented (insecure listener,
 // or TLS without REQUIRE_CLIENT_CERT). When multiple CNs are
@@ -325,6 +335,27 @@ void NodeDataServiceImpl::ForgetHandle(uint64_t h) {
     std::lock_guard<std::mutex> lk(mu_);
     handle_to_ctx_.erase(h);
     handle_to_hashes_.erase(h);
+    handle_to_cn_.erase(h);
+}
+
+void NodeDataServiceImpl::RecordHandleCN(uint64_t h, const std::string& cn) {
+    if (cn.empty()) return;
+    std::lock_guard<std::mutex> lk(mu_);
+    handle_to_cn_[h] = cn;
+}
+
+bool NodeDataServiceImpl::CheckHandleOwnership(uint64_t h,
+                                                const std::string& cn) {
+    std::lock_guard<std::mutex> lk(mu_);
+    auto it = handle_to_cn_.find(h);
+    if (it == handle_to_cn_.end()) {
+        // No recorded owner: either the handle was minted while
+        // binding was off, or it's forged. With binding ON the
+        // minting paths (Reserve / Lookup) always record, so a
+        // missing entry under binding is treated as unauthorised.
+        return false;
+    }
+    return it->second == cn;
 }
 
 kv_ctx_t* NodeDataServiceImpl::CtxForHandle(uint64_t h) {
@@ -480,6 +511,10 @@ kv_ctx_t* NodeDataServiceImpl::CtxForHandle(uint64_t h) {
     if (rc != KV_OK) return ToGrpcStatus(rc, "kv_lookup");
 
     RememberHandle(handle, ctx);
+    // Phase N-5 — bind read handle to the caller's cert CN.
+    if (tenant_cert_binding_enabled_.load(std::memory_order_relaxed)) {
+        RecordHandleCN(handle, ClientCertCN(context));
+    }
     response->set_hit(true);
     ToProtoLocator(meta, response->mutable_locator());
     response->set_server_handle(handle);
@@ -592,6 +627,12 @@ kv_ctx_t* NodeDataServiceImpl::CtxForHandle(uint64_t h) {
         std::lock_guard<std::mutex> lk(mu_);
         handle_to_hashes_[h] = HandleHashes{th, mh};
     }
+    // Phase N-5 — bind the handle to the minting peer's cert CN so
+    // Publish / Seal / Release / Fetch on it can verify the caller
+    // is the original owner.
+    if (tenant_cert_binding_enabled_.load(std::memory_order_relaxed)) {
+        RecordHandleCN(h, ClientCertCN(context));
+    }
     response->set_server_handle(h);
     response->set_slot_iova(reinterpret_cast<uint64_t>(slot.addr));
     response->set_slot_bytes(slot.len);
@@ -634,7 +675,14 @@ kv_ctx_t* NodeDataServiceImpl::CtxForHandle(uint64_t h) {
         fctx.AddMetadata("x-kvcache-forwarded", "1");
         return peer->stub->Publish(&fctx, *request, response);
     }
-    (void)context;
+    // Phase N-5 — verify handle ownership for direct calls.
+    if (tenant_cert_binding_enabled_.load(std::memory_order_relaxed) &&
+        !IsForwardedCall(context) &&
+        !CheckHandleOwnership(request->server_handle(),
+                               ClientCertCN(context))) {
+        return {::grpc::StatusCode::UNAUTHENTICATED,
+                 "Publish: handle not owned by caller"};
+    }
     kv_ctx_t* ctx = CtxForHandle(request->server_handle());
     if (!ctx) return {::grpc::StatusCode::FAILED_PRECONDITION, "no ctx"};
     // Send an empty buffer descriptor since the caller has already
@@ -661,7 +709,14 @@ kv_ctx_t* NodeDataServiceImpl::CtxForHandle(uint64_t h) {
         fctx.AddMetadata("x-kvcache-forwarded", "1");
         return peer->stub->Fetch(&fctx, *request, response);
     }
-    (void)context;
+    // Phase N-5 — verify handle ownership for direct calls.
+    if (tenant_cert_binding_enabled_.load(std::memory_order_relaxed) &&
+        !IsForwardedCall(context) &&
+        !CheckHandleOwnership(request->server_handle(),
+                               ClientCertCN(context))) {
+        return {::grpc::StatusCode::UNAUTHENTICATED,
+                 "Fetch: handle not owned by caller"};
+    }
     kv_ctx_t* ctx = CtxForHandle(request->server_handle());
     if (!ctx) return {::grpc::StatusCode::FAILED_PRECONDITION, "no ctx"};
     kv_buffer_desc_t dst{};
@@ -711,7 +766,7 @@ kv_ctx_t* NodeDataServiceImpl::CtxForHandle(uint64_t h) {
 }
 
 ::grpc::Status NodeDataServiceImpl::Seal(
-    ::grpc::ServerContext* /*context*/,
+    ::grpc::ServerContext* context,
     const kvcache::proto::SealRequest* request,
     kvcache::proto::SealResponse*      response) {
     if (const std::string owner =
@@ -723,6 +778,14 @@ kv_ctx_t* NodeDataServiceImpl::CtxForHandle(uint64_t h) {
         ::grpc::ClientContext fctx;
         fctx.AddMetadata("x-kvcache-forwarded", "1");
         return peer->stub->Seal(&fctx, *request, response);
+    }
+    // Phase N-5 — verify handle ownership for direct calls.
+    if (tenant_cert_binding_enabled_.load(std::memory_order_relaxed) &&
+        !IsForwardedCall(context) &&
+        !CheckHandleOwnership(request->server_handle(),
+                               ClientCertCN(context))) {
+        return {::grpc::StatusCode::UNAUTHENTICATED,
+                 "Seal: handle not owned by caller"};
     }
     kv_ctx_t* ctx = CtxForHandle(request->server_handle());
     if (!ctx) return {::grpc::StatusCode::FAILED_PRECONDITION, "no ctx"};
@@ -762,7 +825,7 @@ kv_ctx_t* NodeDataServiceImpl::CtxForHandle(uint64_t h) {
 }
 
 ::grpc::Status NodeDataServiceImpl::Release(
-    ::grpc::ServerContext* /*context*/,
+    ::grpc::ServerContext* context,
     const kvcache::proto::ReleaseRequest* request,
     kvcache::proto::ReleaseResponse*      response) {
     if (const std::string owner =
@@ -776,6 +839,14 @@ kv_ctx_t* NodeDataServiceImpl::CtxForHandle(uint64_t h) {
         auto status = peer->stub->Release(&fctx, *request, response);
         if (status.ok()) ForgetForwardedHandle(request->server_handle());
         return status;
+    }
+    // Phase N-5 — verify handle ownership for direct calls.
+    if (tenant_cert_binding_enabled_.load(std::memory_order_relaxed) &&
+        !IsForwardedCall(context) &&
+        !CheckHandleOwnership(request->server_handle(),
+                               ClientCertCN(context))) {
+        return {::grpc::StatusCode::UNAUTHENTICATED,
+                 "Release: handle not owned by caller"};
     }
     kv_ctx_t* ctx = CtxForHandle(request->server_handle());
     if (!ctx) return {::grpc::StatusCode::FAILED_PRECONDITION, "no ctx"};

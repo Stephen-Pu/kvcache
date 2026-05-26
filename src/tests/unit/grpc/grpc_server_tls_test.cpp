@@ -425,3 +425,93 @@ TEST_F(GrpcTlsFixture, ReserveTenantCertBindingRejectsLocatorMismatch) {
 
     svc_->EnableTenantCertBinding(false);
 }
+
+// Phase N-5 — handle ownership binding. A handle minted by cert CN=A
+// cannot be Published/Sealed/Released by a *different* cert CN=B,
+// even though B holds a valid cluster cert. Guards against a tenant
+// guessing or replaying another tenant's server_handle.
+TEST_F(GrpcTlsFixture, HandleOwnershipRejectsForeignCn) {
+    svc_->EnableTenantCertBinding(true);
+
+    auto sha16_of = [](const std::string& s) {
+        uint8_t d[20];
+        SHA1(reinterpret_cast<const uint8_t*>(s.data()), s.size(), d);
+        return std::string(reinterpret_cast<const char*>(d), 16);
+    };
+
+    // Generate a SECOND client leaf with a different CN, signed by the
+    // same CA so the TLS handshake still succeeds.
+    Sh("openssl genrsa -out " + dir_ + "/client2.key 2048");
+    Sh("openssl req -new -key " + dir_ + "/client2.key "
+       "-subj '/CN=other-client' -out " + dir_ + "/client2.csr");
+    Sh("openssl x509 -req -in " + dir_ + "/client2.csr "
+       "-CA " + dir_ + "/ca.crt -CAkey " + dir_ + "/ca.key -CAcreateserial "
+       "-days 30 -out " + dir_ + "/client2.crt");
+
+    auto stub2 = [&] {
+        ::grpc::SslCredentialsOptions sopts;
+        sopts.pem_root_certs  = SlurpFile(dir_ + "/ca.crt");
+        sopts.pem_cert_chain  = SlurpFile(dir_ + "/client2.crt");
+        sopts.pem_private_key = SlurpFile(dir_ + "/client2.key");
+        ::grpc::ChannelArguments cargs;
+        cargs.SetSslTargetNameOverride("kvcache-test-server");
+        return NodeData::NewStub(::grpc::CreateCustomChannel(
+            addr_, ::grpc::SslCredentials(sopts), cargs));
+    }();
+
+    auto stubA = StubWithMtls();  // CN=kvcache-test-client
+
+    // Client A reserves a slot (N-4: Locator.tenant_id must match its CN).
+    uint64_t handle = 0;
+    {
+        ::grpc::ClientContext ctx;
+        ctx.set_deadline(std::chrono::system_clock::now() +
+                          std::chrono::seconds(5));
+        kvcache::proto::ReserveRequest req;
+        auto* loc = req.mutable_locator();
+        loc->set_tenant_id(sha16_of("kvcache-test-client"));
+        loc->set_model_id_hash(0xABCDull);
+        loc->set_prefix_hash(std::string(16, '\0'));
+        loc->mutable_range()->set_token_count(16);
+        loc->set_version(1);
+        req.set_bytes(4096);
+        kvcache::proto::ReserveResponse resp;
+        auto s = stubA->Reserve(&ctx, req, &resp);
+        ASSERT_TRUE(s.ok()) << s.error_code() << ": " << s.error_message();
+        handle = resp.server_handle();
+        ASSERT_NE(handle, 0u);
+    }
+
+    // Client B (other-client) tries to Publish A's handle — rejected.
+    {
+        ::grpc::ClientContext ctx;
+        ctx.set_deadline(std::chrono::system_clock::now() +
+                          std::chrono::seconds(5));
+        kvcache::proto::PublishRequest req;
+        req.set_server_handle(handle);
+        req.set_watermark(4096);
+        kvcache::proto::PublishResponse resp;
+        auto s = stub2->Publish(&ctx, req, &resp);
+        EXPECT_FALSE(s.ok());
+        EXPECT_EQ(s.error_code(), ::grpc::StatusCode::UNAUTHENTICATED)
+            << "foreign CN must not operate on another tenant's handle; got "
+            << s.error_code() << ": " << s.error_message();
+    }
+
+    // Client A (owner) can Publish its own handle.
+    {
+        ::grpc::ClientContext ctx;
+        ctx.set_deadline(std::chrono::system_clock::now() +
+                          std::chrono::seconds(5));
+        kvcache::proto::PublishRequest req;
+        req.set_server_handle(handle);
+        req.set_watermark(4096);
+        kvcache::proto::PublishResponse resp;
+        auto s = stubA->Publish(&ctx, req, &resp);
+        EXPECT_TRUE(s.ok())
+            << "owner CN should operate on its own handle; got "
+            << s.error_code() << ": " << s.error_message();
+    }
+
+    svc_->EnableTenantCertBinding(false);
+}
