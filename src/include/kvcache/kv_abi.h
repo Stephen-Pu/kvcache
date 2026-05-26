@@ -114,6 +114,13 @@ int kv_fetch(kv_ctx_t* ctx,
              kv_buffer_desc_t dst,
              kv_completion_t* completion);
 
+/* Phase G-3 — scrape the dylib's Prometheus-format metrics into a
+ * caller-supplied buffer. Writes at most `cap` bytes (NUL-terminated
+ * iff there's room) and reports the full content length in *out_len.
+ * Callers can pass cap=0, buf=NULL to size the buffer in one round-
+ * trip. Returns KV_OK on success; KV_E_INVAL on bad args.            */
+int kv_metrics_scrape(char* buf, size_t cap, size_t* out_len);
+
 /* Phase S-3 — same as kv_fetch but lets the caller pick the
  * PriorityScheduler class. Defaults via kv_fetch are P1 (the engine
  * data path). P0 callers preempt P1/P2 under contention; P2 callers

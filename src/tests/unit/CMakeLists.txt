@@ -158,6 +158,13 @@ kvcache_add_test(test_metrics           obs/metrics_test.cpp)
 kvcache_add_test(test_node_runtime      runtime/node_runtime_test.cpp
                  ${KVCACHE_NODE_SRC}/runtime/node_runtime.cpp)
 
+# Phase G-3 — Reserve backpressure surfaces through /metrics. Links
+# the C ABI shared lib (kvcache) so it drives the singleton through
+# its real surface.
+kvcache_add_test(test_reserve_backpressure
+                  abi/reserve_backpressure_test.cpp)
+target_link_libraries(test_reserve_backpressure PRIVATE kvcache)
+
 # Phase M-1: gRPC NodeData service tests. Only built when grpc is
 # present (the service impl + its headers don't exist otherwise).
 if(KVCACHE_HAVE_GRPC)

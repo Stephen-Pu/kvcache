@@ -6,6 +6,7 @@
 #include <cstring>
 
 #include "kvcache/kv_errors.h"
+#include "metrics.h"  // kvcache::metrics::Registry + Counter/Gauge
 #include "prefix/art_snapshot.h"
 #include "prefix/art_wal.h"
 #include "trace.h"
@@ -15,6 +16,69 @@ namespace kvcache::abi {
 namespace {
 
 HeadlessNode*       g_singleton = nullptr;
+
+// Phase G-3 — backpressure metrics. Lazy-initialised on first use so
+// builds without the metrics registry still link. Mirrors the static-
+// + lambda pattern PriorityScheduler uses.
+struct ReserveMetrics {
+    kvcache::metrics::Counter* nomem_total       = nullptr;
+    kvcache::metrics::Counter* invalid_total     = nullptr;
+    kvcache::metrics::Counter* reserves_total    = nullptr;
+    kvcache::metrics::Gauge*   slots_in_use      = nullptr;
+    kvcache::metrics::Gauge*   slots_total       = nullptr;
+    kvcache::metrics::Gauge*   slots_utilization = nullptr;  // [0..1]
+};
+ReserveMetrics& Rm() {
+    static ReserveMetrics m = [] {
+        ReserveMetrics x;
+        auto& r = kvcache::metrics::Registry::Default();
+        x.nomem_total = &r.GetOrCreateCounter(
+            "kv_reserve_nomem_total",
+            "Reserves rejected because the pinned slot pool was exhausted.",
+            /*labels=*/{});
+        x.invalid_total = &r.GetOrCreateCounter(
+            "kv_reserve_invalid_total",
+            "Reserves rejected for argument validation (null / zero-byte / oversized).",
+            {});
+        x.reserves_total = &r.GetOrCreateCounter(
+            "kv_reserves_total",
+            "Successful Reserves issued by the node.",
+            {});
+        x.slots_in_use = &r.GetOrCreateGauge(
+            "kv_pinned_tier_slots_in_use",
+            "Pinned-tier slots currently held by an in-flight Reserve.",
+            {});
+        x.slots_total = &r.GetOrCreateGauge(
+            "kv_pinned_tier_slots_total",
+            "Pinned-tier slot capacity (constant after Init).",
+            {});
+        x.slots_utilization = &r.GetOrCreateGauge(
+            "kv_pinned_tier_slots_utilization_ratio",
+            "Fraction of pinned-tier slots in use (0=idle, 1=saturated).",
+            {});
+        // Seed each series with a zero so Scrape() emits a line for
+        // it even before the first event fires — Prometheus consumers
+        // and dashboards expect the metric to be present at t=0.
+        x.nomem_total->Inc(0.0, {});
+        x.invalid_total->Inc(0.0, {});
+        x.reserves_total->Inc(0.0, {});
+        x.slots_in_use->Set(0.0, {});
+        x.slots_total->Set(0.0, {});
+        x.slots_utilization->Set(0.0, {});
+        return x;
+    }();
+    return m;
+}
+
+inline void BumpPinnedTierGauges(node::tier::TierManager* tm) {
+    if (!tm) return;
+    const auto in_use = static_cast<double>(tm->pinned().SlotsInUse());
+    const auto total  = static_cast<double>(tm->pinned().SlotCount());
+    Rm().slots_in_use->Set(in_use, {});
+    Rm().slots_total->Set(total,  {});
+    Rm().slots_utilization->Set(
+        total > 0 ? in_use / total : 0.0, {});
+}
 
 // Build a DramKey from a Locator's identity (tenant|model|prefix).
 node::tier::DramKey LocatorContentKey(const kv_locator_t& loc) {
@@ -152,6 +216,10 @@ bool HeadlessNode::Init(const Options& opts, std::string* err) {
     // The PriorityScheduler lives inside NixlWrapper (Phase E-2); the
     // backend was constructed above so the pinned tier could register
     // its pool with it.
+    // Phase G-3 — seed pinned-tier gauges so scrapes before the first
+    // Reserve still show meaningful capacity (slots_total constant,
+    // slots_in_use = 0).
+    BumpPinnedTierGauges(tm_.get());
     return true;
 }
 
@@ -215,15 +283,27 @@ int HeadlessNode::Lookup(const char* /*tenant_id*/,
 int HeadlessNode::Reserve(const kv_locator_t* locator, std::size_t bytes,
                           uint64_t tenant_hash, uint64_t model_hash,
                           kv_handle_t* out_handle, kv_buffer_desc_t* out_slot) {
-    if (!locator || bytes == 0 || !out_handle || !out_slot) return KV_E_INVAL;
+    if (!locator || bytes == 0 || !out_handle || !out_slot) {
+        Rm().invalid_total->Inc(1.0, {});
+        return KV_E_INVAL;
+    }
     auto ih = buffers_->Reserve();
-    if (ih == node::ingest::kInvalidIngestHandle) return KV_E_NOMEM;
+    if (ih == node::ingest::kInvalidIngestHandle) {
+        // Phase G-3 — pool exhausted is the canonical backpressure
+        // signal. Counter increment + a fresh gauge snapshot so the
+        // saturation is visible to /metrics callers immediately.
+        Rm().nomem_total->Inc(1.0, {});
+        BumpPinnedTierGauges(tm_.get());
+        return KV_E_NOMEM;
+    }
     wm_->Track(ih);
     auto slot = buffers_->GetSlot(ih);
     if (!slot) { buffers_->Release(ih); return KV_E_INTERNAL; }
     if (slot->bytes < bytes) {
         buffers_->Release(ih);
         wm_->Drop(ih);
+        Rm().nomem_total->Inc(1.0, {});
+        BumpPinnedTierGauges(tm_.get());
         return KV_E_NOMEM;
     }
     out_slot->addr     = slot->addr;
@@ -240,6 +320,8 @@ int HeadlessNode::Reserve(const kv_locator_t* locator, std::size_t bytes,
                                    nullptr, tenant_hash, model_hash};
     }
     *out_handle = h;
+    Rm().reserves_total->Inc(1.0, {});
+    BumpPinnedTierGauges(tm_.get());
     return KV_OK;
 }
 
@@ -492,6 +574,10 @@ int HeadlessNode::Release(kv_handle_t handle) {
     if (st.kind == HandleKind::kIngest && st.ingest_handle) {
         wm_->Drop(st.ingest_handle);
         buffers_->Release(st.ingest_handle);
+        // Phase G-3 — slot returned to the pool, refresh the gauge
+        // so a Prometheus scrape that arrives between Release and
+        // the next Reserve sees the freed capacity.
+        BumpPinnedTierGauges(tm_.get());
     } else if (st.kind == HandleKind::kRead && st.leaf) {
         st.leaf->refcount.Release();
         // Phase G-2 — releasing a reader may unblock a deferred
