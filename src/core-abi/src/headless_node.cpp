@@ -573,6 +573,15 @@ int HeadlessNode::Seal(kv_handle_t handle,
 
     // The SealCommitter requires RocksDB; in headless mode we may not have
     // it, so wire a no-op short-circuit when rocks_ is null.
+    //
+    // Resource-leak fix: previously a kPathConflict from ArtIndex::Insert
+    // (Node256 collision on a leaf-vs-inner / mismatched edge_tail) returned
+    // KV_E_INTERNAL before dropping the watermark / releasing the ingest
+    // slot. Each conflict permanently leaked one pinned-tier slot, so after
+    // ~half the pool depth Reserve started returning NOMEM. Now Drop +
+    // Release + handles_.erase run on EVERY exit path; only the ART
+    // insertion outcome decides the return code.
+    int seal_rc = KV_OK;
     if (!rocks_) {
         // Mirror the seal logic minus RocksDB: ART insert + event publish +
         // book-keeping cleanup.
@@ -587,22 +596,33 @@ int HeadlessNode::Seal(kv_handle_t handle,
             ? art_wal_->Insert(chunk_path, std::move(leaf))
             : art_->Insert(chunk_path, std::move(leaf));
         if (ins == node::prefix::ArtIndex::InsertResult::kPathConflict) {
-            return KV_E_INTERNAL;
+            // Collision today is an MVP limitation of the Node256-only
+            // ART (no edge-split); a future phase implements true
+            // adaptive nodes + lazy expansion. Either way we MUST
+            // release the slot below — fall through to the cleanup tail.
+            seal_rc = KV_E_INTERNAL;
+        } else {
+            node::prefix::Event ev{};
+            ev.type    = node::prefix::EventType::Add;
+            ev.tier    = node::prefix::Tier::Dram;
+            ev.locator = st.locator;
+            events_->Publish(ev);
         }
-        node::prefix::Event ev{};
-        ev.type    = node::prefix::EventType::Add;
-        ev.tier    = node::prefix::Tier::Dram;
-        ev.locator = st.locator;
-        events_->Publish(ev);
-        wm_->Drop(st.ingest_handle);
-        buffers_->Release(st.ingest_handle);
     } else {
         auto r = committer.Commit(req);
-        if (!r.ok) return KV_E_INTERNAL;
+        if (!r.ok) seal_rc = KV_E_INTERNAL;
     }
+    // Single cleanup tail — runs whether the ART insert succeeded or not.
+    wm_->Drop(st.ingest_handle);
+    buffers_->Release(st.ingest_handle);
+    // Phase G-3 — Seal also returns a slot to the pinned pool, so the
+    // backpressure gauge needs the same refresh that kv_release does.
+    // Before this every Seal left the gauge reading stale-Reserve state
+    // until the next Reserve bumped it.
+    BumpPinnedTierGauges(tm_.get());
     std::lock_guard lk(mu_);
     handles_.erase(handle);
-    return KV_OK;
+    return seal_rc;
 }
 
 // ---------------------------------------------------------------------------
