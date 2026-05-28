@@ -152,6 +152,38 @@ jobs:
         run: pytest src/adapters/vllm/tests -v
 
   # ---------------------------------------------------------------------------
+  # Phase S-7 — scheduler fairness + P0-starvation regression gate.
+  # Runs bench_fairness --strict and bench_priority --strict; fails the
+  # build if Jain index < 0.85 or P0 lane completes fewer than 5 ops
+  # over the bench window. Push-to-main only so PRs don't pay the ~5s
+  # cost; the gate catches drift before release.
+  # ---------------------------------------------------------------------------
+  bench-gates:
+    name: Scheduler fairness + priority gates (S-7)
+    needs: cpp
+    runs-on: ubuntu-22.04
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build g++ pkg-config
+
+      - name: Build bench targets
+        run: |
+          cmake -S src -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --target bench_fairness bench_priority -j
+
+      - name: bench_fairness --strict
+        run: build/bench/bench_fairness --strict
+
+      - name: bench_priority --strict
+        run: build/bench/bench_priority --strict
+
+  # ---------------------------------------------------------------------------
   # Phase P-4 — vLLM-present bridge tests. Pip-installs vLLM so the
   # skip-marked tests in test_vllm_bridge.py (full lifecycle, P-3
   # save_kv_layer fan-in, P-3.1 start_load_kv fan-out, P-3.2 async

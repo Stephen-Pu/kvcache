@@ -5,6 +5,9 @@
 #   make go         # Build all Go components
 #   make go-test    # Run all Go tests (excludes integration tag)
 #   make go-it      # Run Go integration tests (embedded etcd)
+#   make bench-strict # Phase S-7: fairness + priority regression gate.
+#                       # Runs bench_fairness --strict and bench_priority
+#                       # --strict; non-zero exit on regression.
 #   make py-test    # Run Python E2E adapter tests
 #   make py-test-vllm # Phase P-4: same as py-test, but installs vLLM
 #                     # first so the skip-marked bridge tests run too.
@@ -24,7 +27,7 @@ CMAKE        ?= cmake
 GENERATOR    ?= Ninja
 JOBS         ?= $(shell nproc 2>/dev/null || sysctl -n hw.ncpu)
 
-.PHONY: help build configure compile test go go-test go-it py-test py-test-vllm clean all e2e-operator docker-image docker-image-cp e2e-operator-workload
+.PHONY: help build configure compile test go go-test go-it py-test py-test-vllm bench-strict clean all e2e-operator docker-image docker-image-cp e2e-operator-workload
 
 help:
 	@grep -E '^# +' Makefile | head -20
@@ -82,6 +85,17 @@ py-test-vllm: build
 	 if [ -z "$$LIB" ]; then echo "libkvcache.{so,dylib} not found under $(BUILD_DIR)/core-abi/"; exit 1; fi; \
 	 echo "Using $$LIB"; \
 	 KVCACHE_LIB=$$PWD/$$LIB pytest src/adapters -v
+
+# Phase S-7 — scheduler fairness + P0-starvation regression gate.
+# Both benches run for ~1.5–2s and exit non-zero if the relevant
+# invariant slips (Jain index below 0.85, or P0 dispatched fewer
+# than 5 ops while P2 saturators are full-tilt).
+bench-strict: build
+	$(CMAKE) --build $(BUILD_DIR) --target bench_fairness bench_priority -j $(JOBS)
+	@echo "--- bench_fairness --strict ---"
+	$(BUILD_DIR)/bench/bench_fairness --strict
+	@echo "--- bench_priority --strict ---"
+	$(BUILD_DIR)/bench/bench_priority --strict
 
 all: test go go-test py-test
 

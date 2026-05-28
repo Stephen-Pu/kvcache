@@ -89,7 +89,14 @@ void SealOne(kv_ctx_t* ctx, const std::vector<uint32_t>& tokens,
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    // Phase S-7 — `--strict` flips the bench from informational into
+    // a CI regression gate (non-zero exit on Jain index below the
+    // LLD §5.1 minimum).
+    bool strict_mode = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::string(argv[i]) == "--strict") strict_mode = true;
+    }
     const std::size_t bytes_per_fetch = kPrefixTokens * kBytesPerToken;
     std::printf("kvcache bench: multi-tenant fairness\n");
     std::printf("  tenants: %zu\n  iterations/tenant: %zu\n"
@@ -213,5 +220,25 @@ int main() {
     std::printf("\nAggregate throughput: %.1f MiB/s\n", aggregate);
     std::printf("Jain's fairness index: %.4f  (1.0 = perfect, %.4f = max unfair)\n",
                   jain, 1.0 / static_cast<double>(kTenants));
+
+    // Phase S-7 — CI regression gate. With `--strict`, the bench exits
+    // non-zero if fairness slips below the LLD §5.1 target. On the
+    // dev rig this currently sits at 1.0000 (the in-tree
+    // PriorityScheduler's per-tenant round-robin is exact under
+    // loopback NIXL), so the 0.85 threshold leaves comfortable
+    // headroom for run-to-run jitter on slower CI hardware.
+    constexpr double kStrictJainMin = 0.85;
+    if (strict_mode) {
+        if (jain < kStrictJainMin) {
+            std::fprintf(stderr,
+                "\nFAIRNESS REGRESSION (--strict): Jain %.4f < %.4f min\n"
+                "  per-tenant throughput should not skew across the %zu "
+                "lanes by more than ~15%%.\n",
+                jain, kStrictJainMin, kTenants);
+            return 1;
+        }
+        std::printf("\n--strict: PASS (Jain %.4f >= %.4f)\n",
+                      jain, kStrictJainMin);
+    }
     return 0;
 }

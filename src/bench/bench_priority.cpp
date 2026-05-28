@@ -85,7 +85,17 @@ void SealOne(kv_ctx_t* ctx, const std::vector<uint32_t>& tokens,
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    // Phase S-7 — `--strict` flips the bench into CI regression gate.
+    // Today only a starvation check fires (P0 must complete >= N ops).
+    // The P2/P0 p99 ratio reported below is informational because
+    // loopback NIXL doesn't generate enough scheduler-queue depth for
+    // priorities to differentiate latency; a real-network bench is
+    // needed to gate that ratio (TODO: S-7.1).
+    bool strict_mode = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::string(argv[i]) == "--strict") strict_mode = true;
+    }
     const std::size_t bytes_per_fetch = kPrefixTokens * kBytesPerToken;
     std::printf("kvcache bench: priority-class preemption\n");
     std::printf("  duration: %lld ms\n  bytes/fetch: %zu KiB\n\n",
@@ -219,6 +229,31 @@ int main() {
         std::printf("\nP2 p99 (avg of %zu saturators) / P0 p99 ratio: %.2f×  "
                       "(higher = more preemption)\n",
                       p2_count, p99_p2 / p99_p0);
+    }
+
+    // Phase S-7 — CI regression gate. The only currently-reliable
+    // assertion is that P0 isn't starved: it must complete at least
+    // N ops within the bench window. (The p99 ratio above stays
+    // informational — see the TODO at the top of main(); loopback
+    // NIXL doesn't generate enough queue depth for priorities to
+    // differentiate latency.) A starvation regression would mean
+    // the scheduler stopped dispatching the P0 lane at all.
+    constexpr std::size_t kStrictMinP0Ops = 5;
+    if (strict_mode) {
+        const std::size_t p0_ops = results[0].ops;
+        if (p0_ops < kStrictMinP0Ops) {
+            std::fprintf(stderr,
+                "\nPRIORITY STARVATION (--strict): P0 completed only %zu ops "
+                "< %zu min over %lld ms.\n"
+                "  The scheduler should always dispatch the P0 lane even "
+                "while %zu P2 saturators are full-tilt.\n",
+                p0_ops, kStrictMinP0Ops,
+                static_cast<long long>(kDuration.count()),
+                p2_count);
+            return 1;
+        }
+        std::printf("\n--strict: PASS (P0 ops=%zu >= %zu)\n",
+                      p0_ops, kStrictMinP0Ops);
     }
     return 0;
 }
