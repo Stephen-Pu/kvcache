@@ -6,6 +6,10 @@
 #   make go-test    # Run all Go tests (excludes integration tag)
 #   make go-it      # Run Go integration tests (embedded etcd)
 #   make py-test    # Run Python E2E adapter tests
+#   make py-test-vllm # Phase P-4: same as py-test, but installs vLLM
+#                     # first so the skip-marked bridge tests run too.
+#                     # Heavyweight install (~4–5 GB); set VLLM_VERSION
+#                     # to pin a version (default: latest pip wheel).
 #   make all        # build + test + go + go-test + py-test
 #   make clean      # Remove build/ and Go artifacts
 #
@@ -20,7 +24,7 @@ CMAKE        ?= cmake
 GENERATOR    ?= Ninja
 JOBS         ?= $(shell nproc 2>/dev/null || sysctl -n hw.ncpu)
 
-.PHONY: help build configure compile test go go-test go-it py-test clean all e2e-operator docker-image docker-image-cp e2e-operator-workload
+.PHONY: help build configure compile test go go-test go-it py-test py-test-vllm clean all e2e-operator docker-image docker-image-cp e2e-operator-workload
 
 help:
 	@grep -E '^# +' Makefile | head -20
@@ -51,6 +55,29 @@ go-it:
 
 py-test: build
 	@command -v pytest >/dev/null 2>&1 || { echo "pytest not installed; pip install cffi pytest"; exit 1; }
+	@LIB=$$(ls $(BUILD_DIR)/core-abi/libkvcache.dylib $(BUILD_DIR)/core-abi/libkvcache.so 2>/dev/null | head -1); \
+	 if [ -z "$$LIB" ]; then echo "libkvcache.{so,dylib} not found under $(BUILD_DIR)/core-abi/"; exit 1; fi; \
+	 echo "Using $$LIB"; \
+	 KVCACHE_LIB=$$PWD/$$LIB pytest src/adapters -v
+
+# Phase P-4 — install vLLM and run the bridge tests against the real
+# engine surface. The 4 skip-marked tests under
+# src/adapters/vllm/tests/test_vllm_bridge.py flip to "executed" and
+# verify the bridge against the actual KVConnectorBase / KVConnectorRole
+# imports. Heavyweight install: torch + xformers + vllm itself runs
+# ~4–5 GB on Linux/CUDA wheels.
+#
+# Use VLLM_VERSION to pin (e.g. ``make py-test-vllm VLLM_VERSION=0.6.2``).
+py-test-vllm: build
+	@command -v pytest >/dev/null 2>&1 || { echo "pytest not installed; pip install cffi pytest"; exit 1; }
+	@if [ -n "$(VLLM_VERSION)" ]; then \
+		echo "Installing vllm==$(VLLM_VERSION)"; \
+		pip install --upgrade "vllm==$(VLLM_VERSION)"; \
+	else \
+		echo "Installing latest vllm"; \
+		pip install --upgrade vllm; \
+	fi
+	@python -c "import vllm; print('vllm', vllm.__version__)"
 	@LIB=$$(ls $(BUILD_DIR)/core-abi/libkvcache.dylib $(BUILD_DIR)/core-abi/libkvcache.so 2>/dev/null | head -1); \
 	 if [ -z "$$LIB" ]; then echo "libkvcache.{so,dylib} not found under $(BUILD_DIR)/core-abi/"; exit 1; fi; \
 	 echo "Using $$LIB"; \

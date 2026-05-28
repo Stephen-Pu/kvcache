@@ -152,6 +152,64 @@ jobs:
         run: pytest src/adapters/vllm/tests -v
 
   # ---------------------------------------------------------------------------
+  # Phase P-4 — vLLM-present bridge tests. Pip-installs vLLM so the
+  # skip-marked tests in test_vllm_bridge.py (full lifecycle, P-3
+  # save_kv_layer fan-in, P-3.1 start_load_kv fan-out, P-3.2 async
+  # load) run against the real KVConnectorBase + KVConnectorRole
+  # imports. Heavyweight install (~4–5 GB) so this lane is opt-in:
+  #
+  #   * Manual: trigger via the Actions tab (workflow_dispatch).
+  #   * On push to main: only when the commit message contains the
+  #     literal token "[ci-vllm]".
+  # ---------------------------------------------------------------------------
+  python-adapter-vllm:
+    name: Python adapter (vLLM bridge — P-4)
+    needs: cpp
+    runs-on: ubuntu-22.04
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      contains(github.event.head_commit.message, '[ci-vllm]')
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build g++ pkg-config
+
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+
+      - name: Cache pip (torch + vllm are heavy)
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-vllm-${{ runner.os }}-py311-v1
+
+      - name: Install Python deps (cffi + pytest + vllm)
+        # vLLM's CUDA-only wheels install cleanly on CPU runners — we
+        # only import KVConnectorBase / KVConnectorRole from
+        # vllm.distributed.kv_transfer.kv_connector.v1.base, which is
+        # CUDA-free. No model is loaded in the bridge tests.
+        run: |
+          pip install --upgrade pip
+          pip install cffi pytest
+          pip install --upgrade vllm
+          python -c "import vllm; print('vllm', vllm.__version__)"
+
+      - name: Build libkvcache.so
+        run: |
+          cmake -S src -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug \
+            -DKVCACHE_BUILD_TESTS=OFF
+          cmake --build build --target kvcache -j
+
+      - name: pytest bridge tests (vllm-present path)
+        env:
+          KVCACHE_LIB: ${{ github.workspace }}/build/core-abi/libkvcache.so
+        run: pytest src/adapters/vllm/tests -v
+
+  # ---------------------------------------------------------------------------
   # Helm chart lint
   # ---------------------------------------------------------------------------
   helm-lint:
