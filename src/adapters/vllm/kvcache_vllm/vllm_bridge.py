@@ -56,7 +56,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (  # noqa: F401
 )
 
 from kvcache_vllm.connector import VllmKVConnector
-from kvcache_vllm.layer_accumulator import LayerAccumulator
+from kvcache_vllm.layer_accumulator import LayerAccumulator, LayerSplitter
 
 
 # Default per-token KV byte budget — sized for Llama-3-70B at FP16
@@ -121,6 +121,11 @@ class KVCacheVllmConnector(KVConnectorBase):  # type: ignore[misc]
         # concatenated blob through the P-1 inner connector when
         # ``wait_for_save`` fires at end-of-step.
         self._accum = LayerAccumulator()
+        # Per-layer LOAD fan-out (Phase P-3.1). The bridge fetches each
+        # active request's saved blob into a staging buffer; this
+        # splitter slices it into the engine's per-layer destination
+        # tensors in registered-layer order.
+        self._splitter = LayerSplitter()
 
     # -- helpers ---------------------------------------------------------
 
@@ -204,8 +209,12 @@ class KVCacheVllmConnector(KVConnectorBase):  # type: ignore[misc]
         """vLLM calls this when it's about to discard a request — we
         drop our tracking + release the Core ABI handle. Optional in
         the base class; we provide it so leak-on-cancel doesn't bite.
+        Also clears any P-3.1 load-staging state for the request so
+        the splitter doesn't leak the staged blob.
         """
-        self._inner.release(self._request_id(request))
+        rid = self._request_id(request)
+        self._splitter.finish_request(rid)
+        self._inner.release(rid)
 
     # -- worker-side callbacks -------------------------------------------
 
@@ -217,27 +226,70 @@ class KVCacheVllmConnector(KVConnectorBase):  # type: ignore[misc]
         """
         if isinstance(kv_caches, dict):
             self._kv_caches = kv_caches
-            self._accum.register_layer_order(list(kv_caches.keys()))
+            order = list(kv_caches.keys())
         else:
             # vLLM occasionally passes a list keyed by layer index;
             # normalise to dict.
             self._kv_caches = {str(i): t for i, t in enumerate(kv_caches)}
-            self._accum.register_layer_order(
-                [str(i) for i in range(len(kv_caches))])
+            order = [str(i) for i in range(len(kv_caches))]
+        self._accum.register_layer_order(order)
+        self._splitter.register_layer_order(order)
 
-    def start_load_kv(self, forward_context=None, **_kwargs) -> None:
-        """Per-layer load is Phase P-3.1. vLLM treats this as a no-op
-        today because the prefix match already happens synchronously
-        inside ``get_num_new_matched_tokens`` (the inner connector
-        re-uses the recorded handle on the next Fetch). The real
-        per-layer Fetch driven by ``forward_context`` lands when we
-        wire slicing back into the engine's per-layer tensors.
+    def start_load_kv(self, forward_context=None, **kwargs) -> None:
+        """Phase P-3.1: fetch each active request's saved blob into a
+        staging buffer and stage it for per-layer slicing.
+
+        Two argument paths:
+
+          * ``request_ids`` (list[str]) + ``layer_destinations``
+            (``{rid: {layer_name: bytearray}}``) passed via ``kwargs``
+            — the canonical test-driver path, also usable by any
+            engine that owns its destination buffers directly.
+          * ``forward_context`` exposing the same two fields as
+            attributes — the real-vLLM path.
+
+        For each request we look up the inner connector's recorded
+        ``handle`` + ``matched_tokens`` (set by
+        :meth:`get_num_new_matched_tokens`), allocate a staging
+        ``bytearray`` of the matching size, drive a synchronous
+        Fetch through the inner connector, then stage
+        ``(rid, bytes, layer_destinations[rid])`` in the splitter so
+        each later ``wait_for_layer_load(layer_name)`` slices the
+        right range into the engine's per-layer tensor. The fetch is
+        synchronous in this phase; an async-aware path (real
+        ``is_async=True`` on the matching ``get_num_new_matched_tokens``)
+        is Phase P-3.2.
         """
-        del forward_context
+        request_ids = kwargs.get("request_ids")
+        layer_destinations = kwargs.get("layer_destinations") or {}
+        if not request_ids and forward_context is not None:
+            request_ids = getattr(forward_context, "request_ids", None) or []
+            layer_destinations = (
+                getattr(forward_context, "layer_destinations", {}) or {})
+        if not request_ids:
+            return
+        for rid in request_ids:
+            entry = self._inner._reqs.get(rid)
+            if not entry or not entry.handle:
+                continue
+            n_bytes = entry.matched_tokens * self._inner._bytes_per_token
+            if n_bytes <= 0:
+                continue
+            staging = bytearray(n_bytes)
+            cid = self._inner.start_load_kv(rid, staging)
+            self._inner.wait_for_layer_load(rid, cid)
+            self._splitter.stage_load(
+                rid, bytes(staging), layer_destinations.get(rid, {}))
 
     def wait_for_layer_load(self, layer_name: str) -> None:
-        """No-op for now — see ``start_load_kv`` (Phase P-3.1)."""
-        del layer_name
+        """Phase P-3.1: slice this layer's bytes from each staged blob
+        into the registered per-request destination buffer. Safe to
+        call for layer names the engine didn't stage destinations for
+        — the splitter no-ops cleanly. After every layer has drained,
+        callers should issue ``request_finished`` (or the splitter
+        clears via ``release``) to release the staging memory.
+        """
+        self._splitter.drain_layer(layer_name)
 
     def save_kv_layer(
         self, layer_name, kv_layer, attn_metadata=None, **kwargs

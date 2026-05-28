@@ -123,3 +123,98 @@ class LayerAccumulator:
         order = [ln for ln in self._layer_order if ln in present]
         leftover = sorted(present - set(self._layer_order))
         return order + leftover
+
+
+class LayerSplitter:
+    """Phase P-3.1 — per-layer LOAD fan-out, companion to
+    :class:`LayerAccumulator`.
+
+    The bridge fetches a request's saved blob into a single staging
+    buffer; this class slices that blob into the engine's per-layer
+    destination buffers in the same registered order the accumulator
+    used at save time. Standard transformers have uniform per-layer
+    byte count (``num_heads × head_dim × 2 (k+v) × num_tokens ×
+    dtype_size``), so per-layer offsets are just
+    ``i * (total / num_layers)``.
+
+    Also vllm-import-free — unit tests exercise the slicing logic on
+    the default dev rig.
+    """
+
+    def __init__(self) -> None:
+        self._layer_order: List[str] = []
+        # request_id → full fetched blob
+        self._blob: Dict[str, bytes] = {}
+        # request_id → {layer_name → destination bytearray}
+        self._dests: Dict[str, Dict[str, bytearray]] = {}
+
+    # ---- registration --------------------------------------------------
+
+    def register_layer_order(self, layer_names: Sequence[str]) -> None:
+        """Set the canonical layer order. MUST match the order used at
+        save time or per-layer destinations receive scrambled bytes."""
+        self._layer_order = list(layer_names)
+
+    # ---- staging -------------------------------------------------------
+
+    def stage_load(self, request_id: str, fetched_bytes: bytes,
+                    layer_destinations: Dict[str, bytearray]) -> None:
+        """Record a Fetched blob + the per-layer destination buffers for
+        ``request_id``. The blob is sliced lazily, on each
+        :meth:`drain_layer` call, so the engine can interleave its own
+        per-layer compute with our per-layer copies.
+
+        Destination buffers are written via ``bytearray`` slice
+        assignment. They MUST be at least ``total_bytes / num_layers``
+        long; shorter buffers are filled to capacity, longer buffers
+        keep their trailing bytes untouched.
+        """
+        self._blob[request_id] = bytes(fetched_bytes)
+        # Take a shallow copy so the caller can reuse the dict.
+        self._dests[request_id] = dict(layer_destinations)
+
+    # ---- per-layer drain ----------------------------------------------
+
+    def drain_layer(self, layer_name: str) -> int:
+        """Write each staged request's ``layer_name`` slice into its
+        recorded destination. Returns the number of requests served.
+
+        No-op (returns 0) if the layer isn't registered or no staged
+        request lists it as a destination. The blob stays staged so
+        a later layer-drain call still sees it; call
+        :meth:`finish_request` once every layer has been drained.
+        """
+        if not self._layer_order or layer_name not in self._layer_order:
+            return 0
+        idx = self._layer_order.index(layer_name)
+        n = len(self._layer_order)
+        served = 0
+        for rid, blob in self._blob.items():
+            dests = self._dests.get(rid)
+            if not dests or layer_name not in dests:
+                continue
+            per = len(blob) // n
+            slice_ = blob[idx * per : (idx + 1) * per]
+            dst = dests[layer_name]
+            write = min(len(slice_), len(dst))
+            dst[:write] = slice_[:write]
+            served += 1
+        return served
+
+    # ---- lifecycle -----------------------------------------------------
+
+    def finish_request(self, request_id: str) -> None:
+        """Drop staged state for ``request_id``. Call once every layer
+        has been drained so memory doesn't grow unboundedly."""
+        self._blob.pop(request_id, None)
+        self._dests.pop(request_id, None)
+
+    def has_staged(self, request_id: Optional[str] = None) -> bool:
+        if request_id is None:
+            return bool(self._blob)
+        return request_id in self._blob
+
+    def clear(self) -> None:
+        """Drop all staged state (e.g. on connector close)."""
+        self._blob.clear()
+        self._dests.clear()

@@ -256,3 +256,176 @@ def test_p3_bridge_save_kv_layer_fan_in_then_commit():
 
     conn.request_finished(types.SimpleNamespace(request_id=rid))
     conn.request_finished(req_b)
+
+
+# ---------------------------------------------------------------------------
+# Phase P-3.1 — per-layer LOAD fan-out. Splitter is vllm-free so the
+# slicing logic gets real unit coverage on the default dev rig; the
+# bridge wiring is exercised via a skip-marked vllm-present test.
+# ---------------------------------------------------------------------------
+
+def test_p3_1_layer_splitter_slices_in_registered_order():
+    """A staged blob slices into per-layer destination buffers in the
+    order ``register_layer_order`` declared, regardless of dict-key
+    insertion order in ``layer_destinations``."""
+    from kvcache_vllm.layer_accumulator import LayerSplitter
+
+    splitter = LayerSplitter()
+    splitter.register_layer_order(["L0", "L1", "L2", "L3"])
+
+    # Build a blob of four 64-byte layers with distinctive bytes per
+    # layer so a mis-ordered slice is easy to detect.
+    layer_payloads = [bytes(((j + 0x10 * i) & 0xff for j in range(64)))
+                       for i in range(4)]
+    blob = b"".join(layer_payloads)
+    # Destinations passed in scrambled order — registration order wins.
+    dests = {f"L{i}": bytearray(64) for i in (2, 0, 3, 1)}
+    splitter.stage_load("rp31", blob, dests)
+
+    for i, name in enumerate(("L0", "L1", "L2", "L3")):
+        served = splitter.drain_layer(name)
+        assert served == 1
+        assert bytes(dests[name]) == layer_payloads[i], (
+            f"layer {name} got wrong slice")
+
+    splitter.finish_request("rp31")
+    assert not splitter.has_staged()
+
+
+def test_p3_1_layer_splitter_noops_on_unregistered_layer():
+    """Draining a layer the splitter has never heard of MUST be a
+    no-op (return 0) — no exception, no destination writes."""
+    from kvcache_vllm.layer_accumulator import LayerSplitter
+
+    splitter = LayerSplitter()
+    splitter.register_layer_order(["L0", "L1"])
+    dest = bytearray(b"\x00" * 16)
+    splitter.stage_load("rid", b"\xaa" * 32, {"L0": dest})
+
+    assert splitter.drain_layer("L42") == 0
+    assert bytes(dest) == b"\x00" * 16  # untouched
+
+
+def test_p3_1_round_trip_accumulator_to_splitter_via_inner_connector():
+    """Full P-3 → P-3.1 round-trip on the no-vllm rig:
+
+      1. Accumulator fans 4 layers in for a save.
+      2. Inner connector commits the concatenated blob.
+      3. A second request matching the same tokens hits — we use
+         ``start_load_kv`` to fetch the blob back into a staging
+         buffer.
+      4. Splitter slices it into 4 per-layer destination bytearrays.
+      5. Each destination MUST byte-match its original layer payload.
+    """
+    from kvcache_vllm.layer_accumulator import (LayerAccumulator,
+                                                  LayerSplitter)
+    from kvcache_vllm import VllmKVConnector
+
+    layer_order = ["L0", "L1", "L2", "L3"]
+    # 16 tokens × 64 bytes-per-token-total = 1024 B; 4 layers
+    # → 256 B per layer.
+    bytes_per_layer = 256
+    layer_payloads = {
+        ln: bytes(((j * (i + 7) + 0x20 * i) & 0xff
+                    for j in range(bytes_per_layer)))
+        for i, ln in enumerate(layer_order)
+    }
+    tokens = list(range(3200, 3216))
+
+    # Fan in via accumulator, drain, commit through inner connector.
+    acc = LayerAccumulator()
+    acc.register_layer_order(layer_order)
+    acc.bind_request("rp31r", tokens)
+    for ln, payload in layer_payloads.items():
+        acc.accumulate("rp31r", ln, payload)
+    _, concat = acc.drain_request("rp31r")
+    assert len(concat) == bytes_per_layer * len(layer_order)
+
+    conn = VllmKVConnector(tenant_id="p31-tenant",
+                            model_id="p31-model",
+                            bytes_per_token=64)
+    try:
+        conn.save("rp31r", tokens, concat)
+
+        # Second request, same tokens — hit + fetch into a staging buf.
+        load_rid = "rp31r-load"
+        n = conn.get_num_new_matched_tokens(load_rid, tokens, 0)
+        assert n == 16
+
+        staging = bytearray(len(concat))
+        cid = conn.start_load_kv(load_rid, staging)
+        conn.wait_for_layer_load(load_rid, cid)
+
+        # Splitter slices into per-layer destinations.
+        splitter = LayerSplitter()
+        splitter.register_layer_order(layer_order)
+        dests = {ln: bytearray(bytes_per_layer) for ln in layer_order}
+        splitter.stage_load(load_rid, bytes(staging), dests)
+        for ln in layer_order:
+            assert splitter.drain_layer(ln) == 1
+            assert bytes(dests[ln]) == layer_payloads[ln], (
+                f"layer {ln} content mismatch after round-trip")
+    finally:
+        conn.release("rp31r")
+        conn.release("rp31r-load")
+        conn.close()
+
+
+@pytest.mark.skipif(not _vllm_available(),
+                     reason="vllm not installed; install kvcache_vllm[vllm]")
+def test_p3_1_bridge_start_load_kv_fans_out_to_per_layer_dests():
+    """Drive the bridge through the full P-3 → P-3.1 wire: save via
+    ``save_kv_layer``, then for a second request use ``start_load_kv``
+    + ``wait_for_layer_load`` per layer and verify each engine-side
+    destination buffer receives the original layer's bytes.
+    """
+    from kvcache_vllm.vllm_bridge import KVCacheVllmConnector
+    from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+        KVConnectorRole)
+
+    extra = {"tenant_id":       "p31-bridge-tenant",
+              "model_id":        "p31-bridge-model",
+              "bytes_per_token": 64}
+    cfg = types.SimpleNamespace(
+        kv_transfer_config=types.SimpleNamespace(
+            kv_connector_extra_config=extra,
+        ),
+    )
+    conn = KVCacheVllmConnector(cfg, KVConnectorRole.WORKER)
+
+    layer_order = ["L0", "L1", "L2", "L3"]
+    conn.register_kv_caches({ln: object() for ln in layer_order})
+
+    save_rid = "rp31-bridge-save"
+    tokens = list(range(4100, 4116))
+    save_meta = types.SimpleNamespace(
+        request_ids=[save_rid],
+        token_ids_by_request={save_rid: tokens},
+    )
+    # 256 B per layer × 4 layers = 1024 B = 16 tokens × 64 B/token.
+    layer_payloads = {ln: bytes((((j + 1) * (i + 3)) & 0xff
+                                  for j in range(256)))
+                       for i, ln in enumerate(layer_order)}
+    for ln, payload in layer_payloads.items():
+        conn.save_kv_layer(ln, payload, save_meta)
+    conn.wait_for_save()
+
+    # Second request: same tokens, drive the load fan-out.
+    load_rid = "rp31-bridge-load"
+    req = types.SimpleNamespace(request_id=load_rid,
+                                  prompt_token_ids=tokens)
+    n_hit, _ = conn.get_num_new_matched_tokens(req, 0)
+    assert n_hit == 16
+
+    dests = {ln: bytearray(256) for ln in layer_order}
+    conn.start_load_kv(request_ids=[load_rid],
+                        layer_destinations={load_rid: dests})
+    for ln in layer_order:
+        conn.wait_for_layer_load(ln)
+
+    for ln, expected in layer_payloads.items():
+        assert bytes(dests[ln]) == expected, (
+            f"bridge load fan-out: layer {ln} mismatch")
+
+    conn.request_finished(types.SimpleNamespace(request_id=save_rid))
+    conn.request_finished(req)
