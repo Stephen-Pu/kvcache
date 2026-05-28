@@ -61,7 +61,12 @@ namespace kvcache::node::prefix {
 
 class ArtIndex;
 
-inline constexpr uint32_t kSnapshotVersion = 1;
+// Phase D-4 — bumped from 1 to 2. v2 emits a per-slot sibling chain
+// (zero or more nodes per slot, each followed by a ``chain_continues``
+// byte). v1 snapshots are incompatible — load fails with
+// ``unsupported version``. The WAL is rebuildable from current state,
+// so operators upgrade by checkpointing fresh and discarding old files.
+inline constexpr uint32_t kSnapshotVersion = 2;
 inline constexpr uint8_t  kSnapshotMagic[4] = {'P', 'A', 'R', 'T'};
 inline constexpr std::size_t kSnapshotHeaderBytes = 72;
 

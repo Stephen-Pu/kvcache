@@ -25,9 +25,25 @@ struct ArtNode {
     ArtNodeTag             tag;
     std::array<uint8_t, 7> edge_tail{};
     bool                   edge_tail_valid = false;
+    // Phase D-4 — sibling chain at the same parent-slot. Two
+    // ChunkHashes with the same first byte but different bytes 1..7
+    // share a parent slot but live as separate chain entries
+    // distinguished by ``edge_tail``. Atomic so readers can walk the
+    // list concurrently with writers; writers serialise through
+    // ArtIndex::writer_mu_ and publish appends with release stores.
+    // Pre-D-4 the tree could store only one (slot, edge_tail) pair
+    // per parent slot — second hashes returned kPathConflict and
+    // never landed; with chaining the conflict cap goes away.
+    std::atomic<ArtNode*>  chain_next{nullptr};
 
     explicit ArtNode(ArtNodeTag t) : tag(t) {}
-    virtual ~ArtNode() = default;
+    // Recursive — deletes the rest of the chain when this node is
+    // dropped. Safe at structure-destruction time (no readers) and
+    // through EBR retires (whole chain link retires together when
+    // the chain head is replaced).
+    virtual ~ArtNode() {
+        delete chain_next.load(std::memory_order_relaxed);
+    }
 };
 
 struct ArtInner256 : ArtNode {

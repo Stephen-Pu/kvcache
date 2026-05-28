@@ -106,16 +106,18 @@ void SerializeNode(const ArtNode* node, std::vector<uint8_t>& out,
         const auto* inner = static_cast<const ArtInner256*>(node);
         stats.inner_nodes++;
 
-        // Pre-scan to compute child_count and collect non-null slots.
-        // 256 children at most → a 256-byte local buffer is fine.
+        // D-4: collect (slot, chain_head) for non-empty slots. Each
+        // slot may now be the head of a sibling chain; we serialise
+        // chain length implicitly via a `chain_continues` byte after
+        // every entry (1 = another sibling follows, 0 = end of chain).
         uint8_t  slots[256];
-        ArtNode* kids[256];
+        ArtNode* heads[256];
         uint16_t n = 0;
         for (int i = 0; i < 256; ++i) {
             ArtNode* c = inner->children[i].load(std::memory_order_relaxed);
             if (c) {
                 slots[n] = static_cast<uint8_t>(i);
-                kids[n]  = c;
+                heads[n] = c;
                 ++n;
             }
         }
@@ -126,7 +128,18 @@ void SerializeNode(const ArtNode* node, std::vector<uint8_t>& out,
         PutU16(out, n);
         for (uint16_t i = 0; i < n; ++i) {
             PutU8(out, slots[i]);
-            SerializeNode(kids[i], out, stats);
+            // Walk the per-slot chain — serialise each sibling with a
+            // continuation byte. The recursive SerializeNode handles
+            // sub-tree children; the `chain_continues` flag only
+            // covers same-slot siblings at THIS level.
+            ArtNode* cur = heads[i];
+            while (cur) {
+                ArtNode* next = cur->chain_next.load(
+                    std::memory_order_relaxed);
+                SerializeNode(cur, out, stats);
+                PutU8(out, next ? 1 : 0);
+                cur = next;
+            }
         }
     } else {
         const auto* leaf = static_cast<const ArtLeaf*>(node);
@@ -166,17 +179,32 @@ ArtNode* DeserializeNode(Cursor& c, ArtSnapshot::ReadStats& stats) {
         stats.inner_nodes++;
         for (uint16_t i = 0; i < n; ++i) {
             uint8_t slot = c.U8();
-            ArtNode* child = DeserializeNode(c, stats);
-            if (c.failed || !child) {
-                // inner's dtor cascades delete of any already-attached
-                // children, so the allocations above are not leaked.
-                return nullptr;
+            // D-4: read the per-slot sibling chain. Each chain entry
+            // is followed by a `chain_continues` byte (1 = another
+            // sibling follows, 0 = end of chain). We attach the head
+            // to children[slot] and link subsequent siblings via
+            // chain_next.
+            ArtNode* head = nullptr;
+            ArtNode* tail = nullptr;
+            while (true) {
+                ArtNode* child = DeserializeNode(c, stats);
+                if (c.failed || !child) {
+                    // inner's dtor cascades delete of any already-
+                    // attached children + their chains.
+                    return nullptr;
+                }
+                if (!head) {
+                    head = child;
+                } else {
+                    tail->chain_next.store(
+                        child, std::memory_order_relaxed);
+                }
+                tail = child;
+                uint8_t cont = c.U8();
+                if (c.failed) return nullptr;
+                if (!cont) break;
             }
-            // Slots are strictly increasing in our writer; but the format
-            // does not require it, so just store at the named slot. If two
-            // children name the same slot the second wins (malformed file
-            // — caller detects via leaf_count / inner_count verification).
-            inner->children[slot].store(child, std::memory_order_relaxed);
+            inner->children[slot].store(head, std::memory_order_relaxed);
         }
         return inner.release();
     }
