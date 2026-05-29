@@ -517,14 +517,27 @@ class KVCacheVllmConnector(KVConnectorBase_V1, SupportsHMA):  # type: ignore[mis
     def _to_bytes(kv_layer) -> bytes:
         """Coerce a layer payload to ``bytes``. Accepts:
           * ``bytes`` / ``bytearray`` / ``memoryview`` (tests)
-          * objects exposing ``.tobytes()`` (numpy arrays, ctypes bufs)
-          * torch tensors (via ``.cpu().contiguous().numpy().tobytes()``)
+          * objects exposing ``.tobytes()`` (numpy arrays, ctypes bufs,
+            CPU torch tensors since 1.13)
+          * torch CUDA tensors (via the ``.cpu()`` fallback — bare
+            ``.tobytes()`` on a CUDA tensor raises
+            ``NotImplementedError``, so we catch and fall through)
         """
         if isinstance(kv_layer, (bytes, bytearray, memoryview)):
             return bytes(kv_layer)
         tobytes = getattr(kv_layer, "tobytes", None)
         if callable(tobytes):
-            return tobytes()
+            try:
+                return tobytes()
+            except NotImplementedError:
+                # Production audit #4 (post-D-6): torch CUDA tensors
+                # define ``.tobytes`` as a callable but raise
+                # NotImplementedError when invoked — the unguarded
+                # call used to propagate that error and the
+                # ``.cpu()`` fallback below was never reached. Catch
+                # explicitly (not bare Exception) so genuine errors
+                # from other callables still surface.
+                pass
         if hasattr(kv_layer, "cpu"):
             try:
                 return kv_layer.cpu().contiguous().numpy().tobytes()

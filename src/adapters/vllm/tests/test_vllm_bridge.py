@@ -705,3 +705,44 @@ def test_d6_bridge_supports_hma_request_finished_all_groups():
     result = conn.request_finished_all_groups(req, ([1, 2, 3],))
     assert result == (False, None), \
         f"expected (False, None), got {result!r}"
+
+
+# ---------------------------------------------------------------------------
+# Production audit fix #4 — _to_bytes falls through to the .cpu() path
+# when the bare .tobytes() call raises NotImplementedError. torch CUDA
+# tensors hit this in real workloads; we simulate the failure mode
+# with a mock that exposes the same shape (.tobytes raises, .cpu()
+# returns the chain that produces real bytes) so CPU-only CI can
+# verify the fallback works.
+# ---------------------------------------------------------------------------
+@pytest.mark.skipif(not _vllm_available(),
+                     reason="vllm not installed; install kvcache_vllm[vllm]")
+def test_audit_4_to_bytes_falls_back_when_tobytes_raises():
+    from kvcache_vllm.vllm_bridge import KVCacheVllmConnector
+
+    class _FakeCudaTensor:
+        """Mimics a torch CUDA tensor for _to_bytes fallback testing:
+        ``.tobytes`` is callable but raises NotImplementedError;
+        ``.cpu()`` returns a chain that produces real bytes at the
+        end."""
+        def tobytes(self):
+            raise NotImplementedError("CUDA tensors can't tobytes()")
+
+        def cpu(self):
+            return types.SimpleNamespace(
+                contiguous=lambda: types.SimpleNamespace(
+                    numpy=lambda: types.SimpleNamespace(
+                        tobytes=lambda: b"cuda-fallback-ok")))
+
+    assert KVCacheVllmConnector._to_bytes(_FakeCudaTensor()) == \
+        b"cuda-fallback-ok"
+
+    # Negative: a callable .tobytes that raises something OTHER than
+    # NotImplementedError should still surface (audit-fix scope is
+    # narrow — don't accidentally swallow real errors).
+    class _BrokenTobytes:
+        def tobytes(self):
+            raise RuntimeError("synthetic error")
+
+    with pytest.raises(RuntimeError, match="synthetic error"):
+        KVCacheVllmConnector._to_bytes(_BrokenTobytes())
