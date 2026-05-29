@@ -221,14 +221,22 @@ TEST(ReserveBackpressure, SealKPathConflictReleasesSlot) {
     ASSERT_EQ(seal_one(/*token_seed=*/1, /*n_tokens=*/16), KV_OK);
 
     // Seal a 32-token (two-chunk) path under seed=2. The first chunk
-    // (tokens[0..15]) matches the just-sealed path, so the inner-walk
-    // reaches a terminal leaf at slot path[0] and returns kPathConflict
-    // → headless Seal surfaces KV_E_INTERNAL. Pre-fix this leaked the
-    // ingest slot; post-fix the cleanup tail still runs.
-    EXPECT_EQ(seal_one(/*token_seed=*/2, /*n_tokens=*/32), KV_E_INTERNAL)
-        << "expected kPathConflict to surface as KV_E_INTERNAL — if this "
-           "starts returning KV_OK the ART grew edge-split support and "
-           "the test no longer exercises the leak path";
+    // (tokens[0..15]) matches the just-sealed path. Pre-D-4 the ART
+    // returned kPathConflict here (edge-tail collision) AND the
+    // headless Seal leaked the ingest slot before the D-3.1 fix. Now:
+    //   * D-4 chains siblings at the same parent slot
+    //   * D-5 demotes the terminal leaf into an Inner with an
+    //     embedded_leaf so the deeper path can land alongside
+    // … so this Seal returns KV_OK. The leak-fix test continues to
+    // assert the real invariant: NO matter the kv_seal return code,
+    // the in-use gauge must return to baseline by the end. We exercise
+    // the cleanup tail in the KV_OK branch instead of the
+    // KV_E_INTERNAL branch (which is no longer reachable for any
+    // valid non-empty path).
+    EXPECT_EQ(seal_one(/*token_seed=*/2, /*n_tokens=*/32), KV_OK)
+        << "D-5 makes path-extension Seals succeed (embedded_leaf "
+           "promotion); if this regresses to KV_E_INTERNAL the D-5 "
+           "leaf-demotion path likely broke";
 
     // In-use gauge MUST be at baseline. If the conflicting Seal leaked,
     // the gauge would sit 1 above baseline until ctx_close.

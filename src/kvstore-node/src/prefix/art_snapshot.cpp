@@ -98,6 +98,33 @@ struct Cursor {
     }
 };
 
+// Phase D-5 — LeafData wire body (96 bytes: locator 64 + bitmap 4 +
+// refcount 4 + sealed_at 8 + last_access 8 + bytes_total 8). Pulled
+// into a helper because v3 Inner serialisation reuses the same layout
+// for the optional ``embedded_leaf`` block.
+inline void PutLeafPayload(std::vector<uint8_t>& out, const LeafData& d) {
+    PutBytes(out, &d.locator, sizeof(d.locator));
+    PutU32(out, d.tier_residency_bitmap);
+    PutU32(out, d.refcount.Load());
+    PutU64(out, d.sealed_at_nanos);
+    PutU64(out, d.last_access_nanos.load(std::memory_order_acquire));
+    PutU64(out, d.bytes_total);
+}
+
+// Companion reader. Returns nullptr on cursor failure.
+inline std::unique_ptr<LeafData> ReadLeafPayload(Cursor& c) {
+    auto data = std::make_unique<LeafData>();
+    c.Bytes(&data->locator, sizeof(data->locator));
+    data->tier_residency_bitmap = c.U32();
+    uint32_t rc = c.U32();
+    data->refcount.Reset(rc);
+    data->sealed_at_nanos = c.U64();
+    data->last_access_nanos.store(c.U64(), std::memory_order_relaxed);
+    data->bytes_total = c.U64();
+    if (c.failed) return nullptr;
+    return data;
+}
+
 // ---- recursive serializer (writer) ---------------------------------------
 
 void SerializeNode(const ArtNode* node, std::vector<uint8_t>& out,
@@ -141,6 +168,17 @@ void SerializeNode(const ArtNode* node, std::vector<uint8_t>& out,
                 cur = next;
             }
         }
+        // Phase D-5 — embedded_leaf block. Emit a presence byte; on
+        // ``1`` write the 96-byte LeafData payload. Counts toward
+        // ``stats.leaves`` because an embedded entry IS a logical leaf
+        // for capacity / cardinality reporting.
+        const LeafData* emb =
+            inner->embedded_leaf.load(std::memory_order_relaxed);
+        PutU8(out, emb ? 1 : 0);
+        if (emb) {
+            PutLeafPayload(out, *emb);
+            stats.leaves++;
+        }
     } else {
         const auto* leaf = static_cast<const ArtLeaf*>(node);
         stats.leaves++;
@@ -148,16 +186,7 @@ void SerializeNode(const ArtNode* node, std::vector<uint8_t>& out,
         PutU8(out, kTagLeaf);
         PutU8(out, leaf->edge_tail_valid ? 1 : 0);
         PutBytes(out, leaf->edge_tail.data(), 7);
-
-        const LeafData& d = *leaf->data;
-        // kv_locator_t is a packed POD of exactly 64 bytes — memcpy is the
-        // wire encoding (LLD §2.1: little-endian, packed).
-        PutBytes(out, &d.locator, sizeof(d.locator));
-        PutU32(out, d.tier_residency_bitmap);
-        PutU32(out, d.refcount.Load());
-        PutU64(out, d.sealed_at_nanos);
-        PutU64(out, d.last_access_nanos.load(std::memory_order_acquire));
-        PutU64(out, d.bytes_total);
+        PutLeafPayload(out, *leaf->data);
     }
 }
 
@@ -206,6 +235,18 @@ ArtNode* DeserializeNode(Cursor& c, ArtSnapshot::ReadStats& stats) {
             }
             inner->children[slot].store(head, std::memory_order_relaxed);
         }
+        // Phase D-5 — read the embedded_leaf block. Presence byte +
+        // (optional) LeafData payload. The 96-byte body matches the
+        // pure-leaf encoding so the helper is shared.
+        uint8_t has_emb = c.U8();
+        if (c.failed) return nullptr;
+        if (has_emb) {
+            auto data = ReadLeafPayload(c);
+            if (!data) return nullptr;
+            inner->embedded_leaf.store(
+                data.release(), std::memory_order_relaxed);
+            stats.leaves++;
+        }
         return inner.release();
     }
 
@@ -213,16 +254,8 @@ ArtNode* DeserializeNode(Cursor& c, ArtSnapshot::ReadStats& stats) {
         auto leaf = std::make_unique<ArtLeaf>();
         leaf->edge_tail_valid = c.U8() != 0;
         c.Bytes(leaf->edge_tail.data(), 7);
-
-        auto data = std::make_unique<LeafData>();
-        c.Bytes(&data->locator, sizeof(data->locator));
-        data->tier_residency_bitmap = c.U32();
-        uint32_t refc                = c.U32();
-        data->sealed_at_nanos        = c.U64();
-        data->last_access_nanos.store(c.U64(), std::memory_order_relaxed);
-        data->bytes_total            = c.U64();
-        data->refcount.Reset(refc);
-
+        auto data = ReadLeafPayload(c);
+        if (!data) return nullptr;
         leaf->data = std::move(data);
         stats.leaves++;
         return leaf.release();

@@ -97,15 +97,57 @@ TEST(ArtIndexTest, RemoveLeaf) {
     EXPECT_EQ(r.matched_chunks, 0u);
 }
 
-TEST(ArtIndexTest, RejectInsertOnTopOfDeeperPath) {
-    // MVP limitation: leaves are terminal. Inserting "1,2" then "1" must fail
-    // because that would require splitting an inner node back into a leaf.
+TEST(ArtIndexTest, ShallowAfterDeepAttachesEmbeddedLeaf) {
+    // Phase D-5 — inserting "1" after "1,2" used to return kPathConflict
+    // because the position at slot 1 was an Inner with children. Now the
+    // shallow leaf attaches as an embedded_leaf on that Inner; both
+    // paths resolve.
     ArtIndex art;
     std::vector<ChunkHash> deep{H(1), H(2)};
-    art.Insert({deep.data(), deep.size()}, MakeLeaf(10));
     std::vector<ChunkHash> shallow{H(1)};
-    auto res = art.Insert({shallow.data(), shallow.size()}, MakeLeaf(20));
-    EXPECT_EQ(res, ArtIndex::InsertResult::kPathConflict);
+    ASSERT_EQ(art.Insert({deep.data(), deep.size()}, MakeLeaf(10)),
+                ArtIndex::InsertResult::kInserted);
+    EXPECT_EQ(art.Insert({shallow.data(), shallow.size()}, MakeLeaf(20)),
+                ArtIndex::InsertResult::kInserted);
+    EXPECT_EQ(art.LeafCount(), 2u);
+
+    auto g = art.EnterRead();
+    auto r_deep = art.Lookup({deep.data(), deep.size()}, g);
+    auto r_shallow = art.Lookup({shallow.data(), shallow.size()}, g);
+    ASSERT_NE(r_deep.leaf, nullptr);
+    ASSERT_NE(r_shallow.leaf, nullptr);
+    EXPECT_EQ(r_deep.leaf->bytes_total, 10u);
+    EXPECT_EQ(r_shallow.leaf->bytes_total, 20u);
+    EXPECT_EQ(r_shallow.matched_chunks, 1u);
+    EXPECT_EQ(r_deep.matched_chunks, 2u);
+}
+
+TEST(ArtIndexTest, DeepAfterShallowDemoteesLeafIntoInner) {
+    // Phase D-5 — the inverse: Insert "1" then "1,2". The "1" leaf
+    // sits at slot 1; the deeper insert promotes it into an Inner
+    // whose embedded_leaf carries the original data, then attaches
+    // "2" as a child.
+    ArtIndex art;
+    std::vector<ChunkHash> shallow{H(1)};
+    std::vector<ChunkHash> deep{H(1), H(2)};
+    ASSERT_EQ(art.Insert({shallow.data(), shallow.size()}, MakeLeaf(100)),
+                ArtIndex::InsertResult::kInserted);
+    EXPECT_EQ(art.Insert({deep.data(), deep.size()}, MakeLeaf(200)),
+                ArtIndex::InsertResult::kInserted);
+    EXPECT_EQ(art.LeafCount(), 2u);
+
+    auto g = art.EnterRead();
+    auto r_shallow = art.Lookup({shallow.data(), shallow.size()}, g);
+    auto r_deep    = art.Lookup({deep.data(), deep.size()}, g);
+    ASSERT_NE(r_shallow.leaf, nullptr);
+    EXPECT_EQ(r_shallow.leaf->bytes_total, 100u);
+    ASSERT_NE(r_deep.leaf, nullptr);
+    EXPECT_EQ(r_deep.leaf->bytes_total, 200u);
+
+    // LPM: querying the deep path also reveals that the shallow leaf
+    // existed at depth 1 along the way — but the Lookup contract
+    // returns the LONGEST match, which is the deep leaf.
+    EXPECT_EQ(r_deep.matched_chunks, 2u);
 }
 
 // Phase D-4 — sibling chaining at a parent slot. Two ChunkHashes that

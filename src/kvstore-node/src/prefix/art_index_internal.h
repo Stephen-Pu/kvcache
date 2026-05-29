@@ -52,6 +52,16 @@ struct ArtInner256 : ArtNode {
     // release stores.
     std::array<std::atomic<ArtNode*>, 256> children{};
 
+    // Phase D-5 — "stop-here" data carried on an inner node. Set when
+    // a terminal leaf at this exact path needs to coexist with deeper
+    // children (e.g. Insert([A]) after Insert([A, B])), or when a
+    // deeper Insert demotes a previously terminal leaf at this
+    // position (e.g. Insert([A, B]) after Insert([A])). Atomic raw
+    // pointer (not unique_ptr) so writers can atomic-swap on Replace
+    // and readers see a fully-published store via acquire.
+    // Memory: 8 bytes per Inner — cheap.
+    std::atomic<LeafData*>  embedded_leaf{nullptr};
+
     ArtInner256() : ArtNode(ArtNodeTag::Inner256) {
         for (auto& c : children) c.store(nullptr, std::memory_order_relaxed);
     }
@@ -63,6 +73,8 @@ struct ArtInner256 : ArtNode {
             ArtNode* p = c.load(std::memory_order_relaxed);
             delete p;
         }
+        // D-5: free the embedded leaf data (raw owned pointer).
+        delete embedded_leaf.load(std::memory_order_relaxed);
     }
 };
 
