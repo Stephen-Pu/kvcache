@@ -55,6 +55,24 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (  # noqa: F401
     KVConnectorRole,
 )
 
+# Phase D-6 — opt into the SupportsHMA mixin when this vLLM exposes it.
+# SupportsHMA was added in vLLM v0.10ish; older versions (v0.8/v0.9)
+# don't have it. When present, vLLM workflows may pattern-match on
+# `isinstance(conn, SupportsHMA)` to enable heterogeneous-memory-access
+# code paths; opting in tells the engine "this connector understands
+# the SupportsHMA lifecycle." Our implementation of the mixin's
+# abstract method (request_finished_all_groups) delegates to
+# request_finished, since the bridge operates at request-level not
+# block-level. The placeholder `object` keeps inheritance valid on
+# older vLLM versions without forking the class definition.
+try:
+    from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+        SupportsHMA)
+    _HAS_SUPPORTS_HMA = True
+except ImportError:
+    SupportsHMA = type("_NoSupportsHMA", (object,), {})
+    _HAS_SUPPORTS_HMA = False
+
 from kvcache_vllm.async_load import AsyncLoadDriver
 from kvcache_vllm.connector import VllmKVConnector
 from kvcache_vllm.layer_accumulator import LayerAccumulator, LayerSplitter
@@ -92,7 +110,7 @@ def _extract_extra(vllm_config) -> dict:
     return extra
 
 
-class KVCacheVllmConnector(KVConnectorBase_V1):  # type: ignore[misc]
+class KVCacheVllmConnector(KVConnectorBase_V1, SupportsHMA):  # type: ignore[misc]
     """vLLM v1 ``KVConnectorBase_V1`` subclass over P-1's
     :class:`VllmKVConnector`.
 
@@ -299,6 +317,22 @@ class KVCacheVllmConnector(KVConnectorBase_V1):  # type: ignore[misc]
             self._async_driver.cancel(rid)
         self._inner.release(rid)
         return False, None
+
+    # Phase D-6 — SupportsHMA contract. vLLM ≥ v0.10 may call this
+    # INSTEAD of ``request_finished`` when the connector subclasses
+    # ``SupportsHMA`` (which we do, conditionally — see the
+    # placeholder at module-top). Semantically equivalent for us
+    # because the bridge operates at request-level, not at
+    # per-block-group granularity — we don't differentiate between
+    # "blocks for group 0 are freed" vs "blocks for all groups are
+    # freed", we just release the Core ABI handle once per
+    # request. The ``block_ids`` arg (``tuple[list[int], ...]``)
+    # is accepted but ignored. Return value matches
+    # ``request_finished``: ``(False, None)`` = "engine owns blocks,
+    # release them now; no transfer params."
+    def request_finished_all_groups(self, request, block_ids):
+        del block_ids
+        return self.request_finished(request)
 
     # -- worker-side callbacks -------------------------------------------
 

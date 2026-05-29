@@ -650,3 +650,58 @@ def test_p3_2_bridge_async_load_flips_is_async_and_streams_via_get_finished():
 
     conn.request_finished(types.SimpleNamespace(request_id=save_rid))
     conn.request_finished(req)
+
+
+# ---------------------------------------------------------------------------
+# Phase D-6 — SupportsHMA mixin. vLLM ≥ v0.10 may call
+# ``request_finished_all_groups`` instead of ``request_finished`` when the
+# connector subclasses ``SupportsHMA``. The bridge opts in conditionally
+# (placeholder type on older vLLM where the symbol doesn't exist) and
+# the abstract method delegates to ``request_finished`` because we
+# operate at request-level not per-block-group.
+# ---------------------------------------------------------------------------
+@pytest.mark.skipif(not _vllm_available(),
+                     reason="vllm not installed; install kvcache_vllm[vllm]")
+def test_d6_bridge_supports_hma_request_finished_all_groups():
+    from kvcache_vllm.vllm_bridge import KVCacheVllmConnector
+    from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+        KVConnectorRole)
+    try:
+        from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+            SupportsHMA)
+    except ImportError:
+        pytest.skip("This vLLM version doesn't expose SupportsHMA "
+                      "(pre-v0.10); the bridge falls back to a "
+                      "placeholder base and request_finished is "
+                      "always called instead.")
+
+    extra = {"tenant_id":       "d6-hma-tenant",
+              "model_id":        "d6-hma-model",
+              "bytes_per_token": 64}
+    cfg = types.SimpleNamespace(
+        kv_transfer_config=types.SimpleNamespace(
+            kv_connector_extra_config=extra,
+        ),
+    )
+    conn = KVCacheVllmConnector(cfg, KVConnectorRole.SCHEDULER)
+
+    # Pattern-match contract: real vLLM workflows check this to decide
+    # whether to route through the HMA codepath.
+    assert isinstance(conn, SupportsHMA), \
+        "bridge must opt into SupportsHMA when the symbol is available"
+
+    # Drive a Lookup first so the inner connector has per-request
+    # state to clean up.
+    req = types.SimpleNamespace(
+        request_id="rd6-hma",
+        prompt_token_ids=list(range(5000, 5032)),
+    )
+    conn.get_num_new_matched_tokens(req, 0)
+
+    # SupportsHMA contract: block_ids is tuple[list[int], ...] (per
+    # group). The bridge accepts and ignores it. Return value mirrors
+    # request_finished: (False, None) — engine owns blocks, no
+    # transfer params.
+    result = conn.request_finished_all_groups(req, ([1, 2, 3],))
+    assert result == (False, None), \
+        f"expected (False, None), got {result!r}"
