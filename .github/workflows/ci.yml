@@ -151,7 +151,12 @@ jobs:
       - name: pytest E2E demo
         env:
           KVCACHE_LIB: ${{ github.workspace }}/build/core-abi/libkvcache.so
-        run: pytest src/adapters/vllm/tests -v
+        # Note: must invoke at src/adapters (not src/adapters/vllm/tests)
+        # so the adapters-level conftest.py runs — it puts
+        # kvcache_core / kvcache_vllm on sys.path. Drilling deeper
+        # pins pytest's rootdir to src/adapters/vllm/ (because of its
+        # pyproject.toml) and the conftest is then out-of-scope.
+        run: pytest src/adapters -v
 
   # ---------------------------------------------------------------------------
   # Phase S-7 — scheduler fairness + P0-starvation regression gate.
@@ -243,7 +248,12 @@ jobs:
       - name: pytest bridge tests (vllm-present path)
         env:
           KVCACHE_LIB: ${{ github.workspace }}/build/core-abi/libkvcache.so
-        run: pytest src/adapters/vllm/tests -v
+        # Note: must invoke at src/adapters (not src/adapters/vllm/tests)
+        # so the adapters-level conftest.py runs — it puts
+        # kvcache_core / kvcache_vllm on sys.path. Drilling deeper
+        # pins pytest's rootdir to src/adapters/vllm/ (because of its
+        # pyproject.toml) and the conftest is then out-of-scope.
+        run: pytest src/adapters -v
 
   # ---------------------------------------------------------------------------
   # Helm chart lint
