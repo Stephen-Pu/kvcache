@@ -25,7 +25,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            cmake ninja-build g++ pkg-config
+            cmake ninja-build g++ pkg-config \
+            libcurl4-openssl-dev
 
       - name: Configure
         run: cmake -S src -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
@@ -132,7 +133,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            cmake ninja-build g++ pkg-config
+            cmake ninja-build g++ pkg-config \
+            libcurl4-openssl-dev
 
       - uses: actions/setup-python@v5
         with: { python-version: "3.11" }
@@ -170,7 +172,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            cmake ninja-build g++ pkg-config
+            cmake ninja-build g++ pkg-config \
+            libcurl4-openssl-dev
 
       - name: Build bench targets
         run: |
@@ -208,7 +211,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            cmake ninja-build g++ pkg-config
+            cmake ninja-build g++ pkg-config \
+            libcurl4-openssl-dev
 
       - uses: actions/setup-python@v5
         with: { python-version: "3.11" }
