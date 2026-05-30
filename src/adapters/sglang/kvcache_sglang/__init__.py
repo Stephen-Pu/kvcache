@@ -12,9 +12,12 @@ from kvcache_core import (
     ReserveResult,
 )
 
-from .backend import SGLangKVBackend
+from .async_load import AsyncLoadDriver
+from .backend import AsyncSGLangKVBackend, SGLangKVBackend
 
 __all__ = [
+    "AsyncLoadDriver",
+    "AsyncSGLangKVBackend",
     "SGLangKVBackend",
     "KVCacheConnector",
     "KVCacheError",
