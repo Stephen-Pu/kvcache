@@ -1,8 +1,14 @@
 #include "prefix/refcount.h"
 
 #include <gtest/gtest.h>
+#include <memory>
+#include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
+
+#include "log_sink.h"
+#include "logging.h"
 
 using kvcache::node::prefix::Refcount;
 
@@ -100,4 +106,43 @@ TEST(RefcountTest, ConcurrentAcquireRelease) {
     }
     for (auto& th : ts) th.join();
     EXPECT_TRUE(rc.IsZero());
+}
+
+// Phase O-2 — Release()-under-flow now routes through kvcache::log.
+// Drive Release() once with a zero counter and assert the sink captured
+// an Error record from the "refcount" subsystem with the leaf address
+// embedded in the message.
+namespace {
+class CapturingSink : public kvcache::log::sink::Logger {
+   public:
+    struct Rec { kvcache::log::sink::LogLevel level; std::string msg; };
+    void Log(kvcache::log::sink::LogLevel level, const char*, int,
+              const std::string& msg) override {
+        std::lock_guard lk(mu_);
+        recs_.push_back({level, msg});
+    }
+    std::vector<Rec> snapshot() {
+        std::lock_guard lk(mu_); return recs_;
+    }
+   private:
+    std::mutex mu_;
+    std::vector<Rec> recs_;
+};
+}  // namespace
+
+TEST(RefcountTest, UnderflowRoutesThroughLoggingFacade) {
+    auto cap = std::make_shared<CapturingSink>();
+    kvcache::log::sink::SetDefault(cap);
+    kvcache::log::Init({.level = kvcache::log::Level::Trace});
+    kvcache::log::sink::SetDefault(cap);  // Init() reinstalls Console
+
+    Refcount rc;  // starts at 0
+    // Under-flow: prev = 0, Release() returns wraparound (UINT32_MAX).
+    EXPECT_EQ(rc.Release(), static_cast<uint32_t>(-1));
+
+    auto recs = cap->snapshot();
+    ASSERT_FALSE(recs.empty());
+    EXPECT_EQ(recs[0].level, kvcache::log::sink::LogLevel::kError);
+    EXPECT_NE(recs[0].msg.find("[refcount]"), std::string::npos);
+    EXPECT_NE(recs[0].msg.find("under-flow"), std::string::npos);
 }

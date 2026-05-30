@@ -1,6 +1,10 @@
 // LLD §3.3 — TierManager.
 #include "tier/tier_manager.h"
 
+#include <cstdio>
+
+#include "logging.h"
+
 namespace kvcache::node::tier {
 
 std::unique_ptr<TierManager> TierManager::Create(const Options& opts, std::string* err) {
@@ -92,9 +96,19 @@ TierManager::FetchResult TierManager::Fetch(const DramKey& key, std::string* err
             if (opts_.promote_cold_to_nvme && nvme_) {
                 std::string nvme_err;
                 if (!nvme_->Put(key, r.data.data(), r.data.size(), &nvme_err)) {
-                    // Promotion failure is non-fatal — the bytes were served
-                    // from cold and the next lookup will retry.
-                    // TODO(stephen): route through logging facade.
+                    // Phase O-2: promotion failure is non-fatal — the
+                    // bytes were already served from cold and the next
+                    // lookup will retry — but a sustained failure mode
+                    // here means the NVMe tier is full / wedged / lost
+                    // its mount, and the cluster will keep paying cold-
+                    // tier latency on every Fetch. Warn so the operator
+                    // sees it.
+                    char buf[160];
+                    std::snprintf(buf, sizeof(buf),
+                                  "cold->nvme promotion failed for key "
+                                  "size=%zu: %s",
+                                  r.data.size(), nvme_err.c_str());
+                    ::kvcache::log::Get("tier_manager").Warn(buf);
                 }
             }
             if (opts_.promote_cold_to_dram) {

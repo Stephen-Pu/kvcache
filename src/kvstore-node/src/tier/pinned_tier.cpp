@@ -2,9 +2,12 @@
 #include "tier/pinned_tier.h"
 
 #include <cerrno>
+#include <cstdio>
 #include <cstring>
 #include <sys/mman.h>
 #include <unistd.h>
+
+#include "logging.h"
 
 namespace kvcache::node::tier {
 
@@ -39,11 +42,21 @@ std::unique_ptr<PinnedTier> PinnedTier::Create(const Options& opts, std::string*
     if (opts.use_mlock) {
         if (::mlock(p, t->pool_bytes_) == 0) {
             t->mlocked_ = true;
+        } else {
+            // Phase O-2: mlock failure is non-fatal — the caller may not
+            // have CAP_IPC_LOCK or may be exceeding ulimit -l — but the
+            // tier silently runs without page pinning, which the operator
+            // needs to know about (RDMA registration may pay a faulting
+            // cost on first touch, and benchmarks won't match the spec).
+            // Warn-level: degraded-but-running.
+            char buf[128];
+            std::snprintf(buf, sizeof(buf),
+                          "mlock(%zu bytes) failed: %s — tier running "
+                          "without page pinning (check ulimit -l / "
+                          "CAP_IPC_LOCK)",
+                          t->pool_bytes_, std::strerror(errno));
+            ::kvcache::log::Get("pinned_tier").Warn(buf);
         }
-        // mlock failure is non-fatal — the caller may not have CAP_IPC_LOCK
-        // or may be exceeding ulimit -l. We log it via the err out-param so
-        // operations can be surfaced in startup logs.
-        // TODO(stephen): route through the logging facade rather than err.
     }
 
     // Register the entire pool with NIXL via the caller-supplied callback.

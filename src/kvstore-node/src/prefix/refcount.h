@@ -35,8 +35,16 @@ class Refcount {
     // the caller is not under-flowing.
     uint32_t Release() noexcept {
         uint32_t prev = v_.fetch_sub(1, std::memory_order_acq_rel);
-        // TODO(stephen): convert to DCHECK once logging facade is wired in.
-        // Underflow indicates a missing Acquire/Release pairing somewhere.
+        // Phase O-2: surface refcount under-flow through the logging
+        // facade. Under-flow means a missing Acquire/Release pairing
+        // somewhere — we don't abort (the atomic has already wrapped, the
+        // damage is done) but we do shout about it so the operator can
+        // grep their logs and the test suite's UBSan / TSan runs notice.
+        // ReportUnderflow is out-of-line in refcount.cpp so refcount.h
+        // doesn't have to drag logging.h into every TU that holds a leaf.
+        if (prev == 0) [[unlikely]] {
+            ReportUnderflow(this);
+        }
         return prev - 1;
     }
 
@@ -82,6 +90,10 @@ class Refcount {
     }
 
    private:
+    // Out-of-line so the only TU that has to include logging.h is
+    // refcount.cpp — the hot path stays header-only and zero-include.
+    static void ReportUnderflow(const Refcount* self) noexcept;
+
     std::atomic<uint32_t> v_{0};
 };
 
