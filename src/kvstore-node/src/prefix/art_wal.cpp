@@ -14,9 +14,12 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
+#include <cstdio>
 #include <fstream>
 #include <utility>
 #include <vector>
+
+#include "logging.h"
 
 #include "prefix/art_snapshot.h"
 
@@ -196,8 +199,23 @@ std::unique_ptr<ArtWal> ArtWal::Open(const Options& opts, std::string* err) {
                                                 &snap_err);
             if (restored) {
                 self->art_ = std::move(restored);
-            } else if (err) {
-                *err = "snapshot ignored: " + snap_err;  // non-fatal
+            } else {
+                // Phase O-2.2: snapshot file exists but couldn't be
+                // parsed (truncated / format-mismatch / bad checksum).
+                // Non-fatal — boot continues with an empty ART that the
+                // WAL replay below will rebuild — but the operator
+                // MUST see this because (a) data loss window between
+                // last good snapshot and now is real if WAL replay
+                // also stops short, and (b) it almost always indicates
+                // underlying disk corruption or a partial flush from a
+                // prior unclean shutdown that wants investigation.
+                char buf[256];
+                std::snprintf(buf, sizeof(buf),
+                              "snapshot ignored (path=%s): %s — booting "
+                              "from empty ART, will rebuild from WAL",
+                              opts.snapshot_path.c_str(), snap_err.c_str());
+                ::kvcache::log::Get("art_wal").Warn(buf);
+                if (err) *err = "snapshot ignored: " + snap_err;
             }
         }
     }
@@ -245,8 +263,20 @@ std::unique_ptr<ArtWal> ArtWal::Open(const Options& opts, std::string* err) {
         const std::size_t good_bytes =
             static_cast<std::size_t>(cur - buf.data());
         if (good_bytes < buf.size()) {
-            // Reopen with truncation point; safe to ignore failures
-            // here — the boot path proceeds with the good prefix.
+            // Phase O-2.2: torn-tail recovery. We replayed `replay_ok`
+            // records cleanly then hit a partial/corrupt one — almost
+            // always a write that was in flight when the previous
+            // process crashed or the host lost power. Truncating at
+            // the last-good boundary is the right move (and is itself
+            // safe to ignore failure on — boot proceeds with what
+            // we did replay), but the operator deserves to know it
+            // happened: it confirms the unclean-shutdown story.
+            char buf2[192];
+            std::snprintf(buf2, sizeof(buf2),
+                          "WAL torn tail detected: replayed %zu records, "
+                          "truncating %zu junk bytes at offset %zu",
+                          replay_ok, buf.size() - good_bytes, good_bytes);
+            ::kvcache::log::Get("art_wal").Warn(buf2);
             ::truncate(opts.wal_path.c_str(),
                         static_cast<off_t>(good_bytes));
         }
