@@ -21,8 +21,13 @@
 #include <atomic>
 #include <cstdio>
 #include <filesystem>
+#include <memory>
+#include <mutex>
 #include <random>
+#include <string>
 #include <thread>
+
+#include "log_sink.h"
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -275,4 +280,93 @@ TEST(ArtWalTest, NoWalPathIsTransparentPassthrough) {
                 ArtIndex::InsertResult::kInserted);
     EXPECT_EQ(w->wal_record_count(), 0u);
     EXPECT_EQ(w->art().LeafCount(),   1u);
+}
+
+// Phase O-2.2: torn-tail recovery is no longer silent — Warn fires on the
+// "art_wal" subsystem so the operator can correlate boot-time WAL
+// truncation with the prior unclean shutdown.
+namespace {
+class CapturingSink : public kvcache::log::sink::Logger {
+   public:
+    struct Rec { kvcache::log::sink::LogLevel level; std::string msg; };
+    void Log(kvcache::log::sink::LogLevel level, const char*, int,
+              const std::string& msg) override {
+        std::lock_guard lk(mu_);
+        recs_.push_back({level, msg});
+    }
+    std::vector<Rec> snapshot() {
+        std::lock_guard lk(mu_); return recs_;
+    }
+   private:
+    std::mutex mu_;
+    std::vector<Rec> recs_;
+};
+}  // namespace
+
+TEST(ArtWalTest, TornTailLogsWarnViaFacade) {
+    auto cap = std::make_shared<CapturingSink>();
+    kvcache::log::sink::SetDefault(cap);
+
+    TempPair t;
+    ArtWal::Options o{t.snap, t.wal, true};
+    std::string err;
+    auto w = ArtWal::Open(o, &err);
+    ASSERT_NE(w, nullptr);
+    ASSERT_EQ(w->Insert(PathFor(4, 1), MakeLeaf(42)),
+                ArtIndex::InsertResult::kInserted);
+    w.reset();
+    {
+        FILE* f = std::fopen(t.wal.c_str(), "ab");
+        ASSERT_NE(f, nullptr);
+        const char garbage[] = "\xAA\xAA\xAA\xAA\xAA";
+        std::fwrite(garbage, 1, sizeof(garbage), f);
+        std::fclose(f);
+    }
+    auto w2 = ArtWal::Open(o, &err);
+    ASSERT_NE(w2, nullptr);
+
+    auto recs = cap->snapshot();
+    bool found = false;
+    for (const auto& r : recs) {
+        if (r.level == kvcache::log::sink::LogLevel::kWarn &&
+            r.msg.find("[art_wal]") != std::string::npos &&
+            r.msg.find("torn tail") != std::string::npos) {
+            found = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(found) << "expected an [art_wal] torn-tail Warn";
+}
+
+TEST(ArtWalTest, CorruptSnapshotLogsWarnAndContinuesWithEmptyArt) {
+    auto cap = std::make_shared<CapturingSink>();
+    kvcache::log::sink::SetDefault(cap);
+
+    TempPair t;
+    // Write a garbage snapshot file so Read() fails parse-side.
+    {
+        FILE* f = std::fopen(t.snap.c_str(), "wb");
+        ASSERT_NE(f, nullptr);
+        const char junk[] = "not a valid snapshot header";
+        std::fwrite(junk, 1, sizeof(junk), f);
+        std::fclose(f);
+    }
+    ArtWal::Options o{t.snap, t.wal, true};
+    std::string err;
+    auto w = ArtWal::Open(o, &err);
+    ASSERT_NE(w, nullptr) << err;
+    // Empty ART — boot fell back to fresh.
+    EXPECT_EQ(w->art().LeafCount(), 0u);
+
+    auto recs = cap->snapshot();
+    bool found = false;
+    for (const auto& r : recs) {
+        if (r.level == kvcache::log::sink::LogLevel::kWarn &&
+            r.msg.find("[art_wal]") != std::string::npos &&
+            r.msg.find("snapshot ignored") != std::string::npos) {
+            found = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(found) << "expected an [art_wal] snapshot-ignored Warn";
 }
