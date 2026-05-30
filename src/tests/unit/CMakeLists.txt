@@ -157,8 +157,7 @@ kvcache_add_test(test_audit             security/audit_test.cpp              ${N
 kvcache_add_test(test_metrics           obs/metrics_test.cpp)
 # LLD §6.2 — logging facade. Foundation only; per-callsite migration
 # of fprintf/cerr → KV_LOG_* is per-file follow-on work.
-kvcache_add_test(test_logs              obs/logs_test.cpp
-                 ${KVCACHE_NODE_SRC}/obs/logs.cpp)
+kvcache_add_test(test_logs              common/log_sink_test.cpp)
 kvcache_add_test(test_node_runtime      runtime/node_runtime_test.cpp
                  ${KVCACHE_NODE_SRC}/runtime/node_runtime.cpp)
 

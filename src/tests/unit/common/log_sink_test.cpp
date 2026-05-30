@@ -21,14 +21,15 @@
 #include <thread>
 #include <vector>
 
-#include "obs/logs.h"
+#include "log_sink.h"
+#include "logging.h"  // Phase O-2: kvcache::log public facade routes here
 
-using kvcache::node::obs::ConsoleLogger;
-using kvcache::node::obs::Default;
-using kvcache::node::obs::Logger;
-using kvcache::node::obs::LogLevel;
-using kvcache::node::obs::NullLogger;
-using kvcache::node::obs::SetDefault;
+using kvcache::log::sink::ConsoleLogger;
+using kvcache::log::sink::Default;
+using kvcache::log::sink::Logger;
+using kvcache::log::sink::LogLevel;
+using kvcache::log::sink::NullLogger;
+using kvcache::log::sink::SetDefault;
 
 namespace {
 
@@ -83,7 +84,7 @@ TEST_F(LoggerFixture, KVLogMacroForwardsLevelFileLineMsg) {
     ASSERT_EQ(recs.size(), 3u);
     EXPECT_EQ(recs[0].level, LogLevel::kInfo);
     EXPECT_EQ(recs[0].msg, "hello info");
-    EXPECT_NE(recs[0].file.find("logs_test.cpp"), std::string::npos);
+    EXPECT_NE(recs[0].file.find("log_sink_test.cpp"), std::string::npos);
     EXPECT_GT(recs[0].line, 0);
     EXPECT_EQ(recs[1].level, LogLevel::kWarn);
     EXPECT_EQ(recs[2].level, LogLevel::kError);
@@ -157,10 +158,33 @@ TEST_F(LoggerFixture, SetDefaultIsConcurrencySafe) {
 }
 
 TEST(LogLevelName, AllLevelsHaveNames) {
-    using kvcache::node::obs::LogLevelName;
+    using kvcache::log::sink::LogLevelName;
     EXPECT_STREQ(LogLevelName(LogLevel::kTrace), "trace");
     EXPECT_STREQ(LogLevelName(LogLevel::kDebug), "debug");
     EXPECT_STREQ(LogLevelName(LogLevel::kInfo),  "info");
     EXPECT_STREQ(LogLevelName(LogLevel::kWarn),  "warn");
     EXPECT_STREQ(LogLevelName(LogLevel::kError), "error");
+}
+
+// Phase O-2: prove kvcache::log::Get(subsystem).Info(msg) routes through
+// the sink with the subsystem prefix attached to the flat msg field.
+// This is the contract that lets per-callsite migration of fprintf/cerr
+// happen against the public facade without touching the sink call.
+TEST(LogFacadeO2, RoutesThroughSinkWithSubsystemPrefix) {
+    auto cap = std::make_shared<CapturingLogger>();
+    SetDefault(cap);
+    kvcache::log::Init({.level = kvcache::log::Level::Trace});
+    // Re-install the capturing sink — Init() swaps in a ConsoleLogger.
+    SetDefault(cap);
+
+    auto& lg = kvcache::log::Get("scheduler");
+    lg.Info("queue depth=42");
+    lg.Warn("slow tier");
+
+    auto recs = cap->snapshot();
+    ASSERT_EQ(recs.size(), 2u);
+    EXPECT_EQ(recs[0].level, LogLevel::kInfo);
+    EXPECT_EQ(recs[0].msg, "[scheduler] queue depth=42");
+    EXPECT_EQ(recs[1].level, LogLevel::kWarn);
+    EXPECT_EQ(recs[1].msg, "[scheduler] slow tier");
 }

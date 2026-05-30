@@ -48,7 +48,8 @@ set(NODE_CORE_SRCS
     src/routing/bloom_sketch.cpp
     # obs
     src/obs/metrics.cpp
-    src/obs/logs.cpp
+    # logs.cpp moved to core/common/log_sink.cpp in Phase O-2 — pulled in
+    # transitively through kvcache_common.
     # runtime (Phase L-1)
     src/runtime/node_runtime.cpp
 )

@@ -35,7 +35,7 @@
 #include <mutex>
 #include <string>
 
-namespace kvcache::node::obs {
+namespace kvcache::log::sink {
 
 enum class LogLevel : int {
     kTrace = 0,
@@ -131,7 +131,7 @@ class NullLogger : public Logger {
 std::shared_ptr<Logger> Default();
 void                    SetDefault(std::shared_ptr<Logger> logger);
 
-}  // namespace kvcache::node::obs
+}  // namespace kvcache::log::sink
 
 // Macro sugar — the standard call shape. ``msg`` can be any
 // expression convertible to ``std::string`` (e.g. a literal, a
@@ -140,14 +140,14 @@ void                    SetDefault(std::shared_ptr<Logger> logger);
 // argument expression isn't evaluated either.
 #define KV_LOG(level, msg)                                                 \
     do {                                                                   \
-        auto _kv_log = ::kvcache::node::obs::Default();                    \
+        auto _kv_log = ::kvcache::log::sink::Default();                    \
         if (_kv_log->ShouldLog(level)) {                                   \
             _kv_log->Log((level), __FILE__, __LINE__, (msg));              \
         }                                                                  \
     } while (0)
 
-#define KV_LOG_TRACE(msg) KV_LOG(::kvcache::node::obs::LogLevel::kTrace, (msg))
-#define KV_LOG_DEBUG(msg) KV_LOG(::kvcache::node::obs::LogLevel::kDebug, (msg))
-#define KV_LOG_INFO(msg)  KV_LOG(::kvcache::node::obs::LogLevel::kInfo,  (msg))
-#define KV_LOG_WARN(msg)  KV_LOG(::kvcache::node::obs::LogLevel::kWarn,  (msg))
-#define KV_LOG_ERROR(msg) KV_LOG(::kvcache::node::obs::LogLevel::kError, (msg))
+#define KV_LOG_TRACE(msg) KV_LOG(::kvcache::log::sink::LogLevel::kTrace, (msg))
+#define KV_LOG_DEBUG(msg) KV_LOG(::kvcache::log::sink::LogLevel::kDebug, (msg))
+#define KV_LOG_INFO(msg)  KV_LOG(::kvcache::log::sink::LogLevel::kInfo,  (msg))
+#define KV_LOG_WARN(msg)  KV_LOG(::kvcache::log::sink::LogLevel::kWarn,  (msg))
+#define KV_LOG_ERROR(msg) KV_LOG(::kvcache::log::sink::LogLevel::kError, (msg))

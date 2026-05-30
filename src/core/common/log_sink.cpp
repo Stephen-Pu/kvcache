@@ -1,5 +1,5 @@
 // LLD §6.2 — Structured JSON logging facade.
-#include "obs/logs.h"
+#include "log_sink.h"
 
 #include <atomic>
 #include <chrono>
@@ -9,7 +9,7 @@
 #include <mutex>
 #include <string>
 
-namespace kvcache::node::obs {
+namespace kvcache::log::sink {
 
 namespace {
 
@@ -122,4 +122,4 @@ void SetDefault(std::shared_ptr<Logger> logger) {
     g_default = std::move(logger);
 }
 
-}  // namespace kvcache::node::obs
+}  // namespace kvcache::log::sink

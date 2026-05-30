@@ -4,6 +4,7 @@ add_library(kvcache_common STATIC
     locator.cpp
     b3_facade.cpp        # BLAKE3 facade (real impl via BLAKE3::blake3)
     logging.cpp
+    log_sink.cpp         # JSON-line ConsoleLogger backend (Phase O-1, merged O-2)
     metrics.cpp
     hashing.cpp
     trace.cpp            # OTel-shaped tracing facade (Phase J-1)
