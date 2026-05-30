@@ -139,6 +139,9 @@ Four layers, twelve subsystems, **83 traceable design decisions**. Every line of
 └─────────────────────────────────────────────────────────────┘
 ```
 
+> 📐 **Detailed diagrams** — see [`docs/architecture/`](./docs/architecture/) for the rendered system overview (Control Plane + GPU Node Pool + Cold Tier) and the integration / transport stack (engines → APIs → NIXL → hardware).
+
+
 **Six first principles** drive every decision:
 
 | # | Principle |
