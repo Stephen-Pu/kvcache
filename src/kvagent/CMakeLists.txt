@@ -1,23 +1,33 @@
-# kvagent — sidecar daemon.
+# kvagent — sidecar daemon (Phase A1).
+#
+# Library + binary split so unit tests can link the modules in
+# isolation without the main.cpp entrypoint dragging in.
 
-set(KVAGENT_SRCS
-    src/main.cpp
+set(KVAGENT_LIB_SRCS
     src/shmem_ring/sq_cq.cpp
     src/shmem_ring/doorbell.cpp
     src/routing_cache/routing_cache.cpp
     src/bloom_view/bloom_view.cpp
+    # BloomView wraps kvcache::node::routing::AggregatedBloom — pull in
+    # the one TU so the agent lib is self-contained at link time. Once
+    # kvstore-node grows a 'kvcache_routing' static lib we can drop
+    # this direct path inclusion.
+    ${CMAKE_SOURCE_DIR}/kvstore-node/src/routing/bloom_sketch.cpp
 )
 
-add_executable(kvagent ${KVAGENT_SRCS})
+add_library(kvagent_lib STATIC ${KVAGENT_LIB_SRCS})
 
-target_include_directories(kvagent
-    PRIVATE
+target_include_directories(kvagent_lib
+    PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/kvstore-node/src
         ${CMAKE_SOURCE_DIR}/include
 )
 
-target_link_libraries(kvagent
-    PRIVATE
+target_link_libraries(kvagent_lib
+    PUBLIC
         kvcache_common
-        # TODO: grpc++, nixl, spdlog, abseil.
 )
+
+add_executable(kvagent src/main.cpp)
+target_link_libraries(kvagent PRIVATE kvagent_lib)

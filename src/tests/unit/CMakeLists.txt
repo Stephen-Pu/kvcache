@@ -230,3 +230,16 @@ endif()
 kvcache_add_test(test_trace             obs/trace_test.cpp)
 kvcache_add_test(test_trace_otlp        obs/trace_otlp_test.cpp)
 target_link_libraries(test_trace_otlp PRIVATE kvcache_otlp CURL::libcurl nlohmann_json::nlohmann_json)
+
+# Phase A1 — kvagent module tests. Each test links the agent's
+# static lib; the include surface is the kvagent_lib PUBLIC dirs.
+if(KVCACHE_BUILD_AGENT)
+    kvcache_add_test(test_sq_cq          kvagent/sq_cq_test.cpp)
+    target_link_libraries(test_sq_cq PRIVATE kvagent_lib)
+    kvcache_add_test(test_doorbell       kvagent/doorbell_test.cpp)
+    target_link_libraries(test_doorbell PRIVATE kvagent_lib)
+    kvcache_add_test(test_routing_cache  kvagent/routing_cache_test.cpp)
+    target_link_libraries(test_routing_cache PRIVATE kvagent_lib)
+    kvcache_add_test(test_bloom_view     kvagent/bloom_view_test.cpp)
+    target_link_libraries(test_bloom_view PRIVATE kvagent_lib)
+endif()
