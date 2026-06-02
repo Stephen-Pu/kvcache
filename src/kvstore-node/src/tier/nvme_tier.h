@@ -88,6 +88,13 @@ class NvmeTier {
     // Put/Get is taking the async path.
     bool UsingUring() const noexcept;
 
+    // Phase B1.1 — high-watermark of concurrent in-flight io_uring
+    // ops the reaper has tracked. Returns 0 on non-uring builds or
+    // when use_uring=false. The "did we actually achieve concurrency?"
+    // gate for the MPC test; production scrape would expose this as a
+    // metric.
+    uint64_t UringPeakInFlight() const noexcept;
+
     uint64_t    UsedBytes() const noexcept;
     uint64_t    Capacity() const noexcept { return pool_bytes_; }
     uint32_t    SlotsInUse() const noexcept {

@@ -23,62 +23,154 @@ namespace kvcache::node::tier {
 // Defined unconditionally so the header's std::unique_ptr<UringImpl>
 // dtor has a complete type at every TU boundary. On non-uring builds
 // the body is just a placeholder — Create() will never construct one.
+//
+// Phase B1.1 — async path:
+//   * submit_mu is held ONLY around io_uring_get_sqe + prep + submit.
+//     Brief — no waiting under the lock.
+//   * Each call heap-allocates a Completion holding a std::promise<int>
+//     and tags the SQE's user_data with its address.
+//   * A dedicated reaper thread blocks on io_uring_wait_cqe and, on
+//     each CQE, recovers the Completion, sets the promise with
+//     cqe->res, and decrements in_flight. Callers wait on the future
+//     — no syscalls, just a condvar.
+//   * On shutdown the dtor flips running=false, submits a NOP SQE
+//     tagged with a static sentinel address, and joins the reaper.
+//     The reaper drains pending real I/O before exiting (loop
+//     condition: running || in_flight > 0).
+
+#ifdef KVCACHE_ENABLE_URING
+#include <future>
+#endif
 
 struct NvmeTier::UringImpl {
 #ifdef KVCACHE_ENABLE_URING
-    struct io_uring ring;
-    std::mutex      submit_mu;
-    bool            ring_init = false;
+    struct io_uring                ring;
+    std::mutex                     submit_mu;     // SQE alloc + submit
+    std::atomic<bool>              running{true};
+    std::atomic<uint64_t>          in_flight{0};
+    std::atomic<uint64_t>          peak_in_flight{0};  // observability
+    std::thread                    reaper;
+    bool                           ring_init = false;
 
-    ~UringImpl() {
-        if (ring_init) io_uring_queue_exit(&ring);
+    struct Completion {
+        std::promise<int> p;  // resolved with cqe->res by the reaper
+    };
+
+    // Distinct address used as the NOP SQE's user_data on shutdown.
+    // Reaper compares cqe user_data to &wake_sentinel_ to recognise
+    // the shutdown wake (a heap Completion's address can't collide
+    // because static storage and heap don't overlap).
+    static inline int wake_sentinel_ = 0;
+
+    void StartReaper() {
+        reaper = std::thread([this] {
+            for (;;) {
+                struct io_uring_cqe* cqe = nullptr;
+                int rc = io_uring_wait_cqe(&ring, &cqe);
+                if (rc < 0) {
+                    // EINTR / shutdown — re-check loop condition.
+                    if (!running.load(std::memory_order_acquire) &&
+                        in_flight.load(std::memory_order_acquire) == 0) {
+                        return;
+                    }
+                    continue;
+                }
+                void* ud = io_uring_cqe_get_data(cqe);
+                if (ud == static_cast<void*>(&wake_sentinel_)) {
+                    io_uring_cqe_seen(&ring, cqe);
+                    // Wake-up NOP: re-check the loop condition.
+                    if (!running.load(std::memory_order_acquire) &&
+                        in_flight.load(std::memory_order_acquire) == 0) {
+                        return;
+                    }
+                    continue;
+                }
+                auto* c = static_cast<Completion*>(ud);
+                const int res = cqe->res;
+                io_uring_cqe_seen(&ring, cqe);
+                c->p.set_value(res);
+                // Decrement AFTER set_value so the caller's
+                // future.get() return is sequenced after the counter
+                // drop — keeps the shutdown drain invariant clean.
+                in_flight.fetch_sub(1, std::memory_order_acq_rel);
+            }
+        });
     }
 
-    // Single SQE + submit_and_wait(1). Caller holds submit_mu through
-    // the whole request so we don't have to demux completions across
-    // concurrent waiters. The future B1.1 phase lifts this serialisation
-    // by adding a reaper thread + per-call promise.
+    ~UringImpl() {
+        if (!ring_init) return;
+        // Stop accepting new I/O.
+        running.store(false, std::memory_order_release);
+        // Wake the reaper with a NOP so it gets out of wait_cqe and
+        // re-checks the loop condition. If real I/O is still pending,
+        // the reaper drains it (loop guard: running || in_flight > 0).
+        {
+            std::lock_guard lk(submit_mu);
+            struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
+            if (sqe) {
+                io_uring_prep_nop(sqe);
+                io_uring_sqe_set_data(sqe, static_cast<void*>(&wake_sentinel_));
+                (void)io_uring_submit(&ring);
+            }
+        }
+        if (reaper.joinable()) reaper.join();
+        io_uring_queue_exit(&ring);
+    }
+
     bool DoOp(int fd, void* buf, std::size_t n, off_t off, bool is_write,
               std::string* err) {
-        std::lock_guard lk(submit_mu);
-        struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
-        if (!sqe) {
-            if (err) *err = "nvme_tier(uring): no SQE available";
+        if (!running.load(std::memory_order_acquire)) {
+            if (err) *err = "nvme_tier(uring): tier is shutting down";
             return false;
         }
-        if (is_write) {
-            io_uring_prep_write(sqe, fd, buf, static_cast<unsigned>(n),
-                                 static_cast<__u64>(off));
-        } else {
-            io_uring_prep_read(sqe, fd, buf, static_cast<unsigned>(n),
-                                static_cast<__u64>(off));
+        // Heap-allocate so the address is stable across the submit /
+        // reap rendezvous. The reaper deletes it after set_value.
+        // Actually — we own it on the caller side and pass by pointer.
+        // Simpler: stack-allocate; the future lives at least until
+        // fut.get() returns, which is after the reaper signalled.
+        Completion c;
+        auto fut = c.p.get_future();
+        {
+            std::lock_guard lk(submit_mu);
+            struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
+            if (!sqe) {
+                if (err) *err = "nvme_tier(uring): no SQE available";
+                return false;
+            }
+            if (is_write) {
+                io_uring_prep_write(sqe, fd, buf, static_cast<unsigned>(n),
+                                     static_cast<__u64>(off));
+            } else {
+                io_uring_prep_read(sqe, fd, buf, static_cast<unsigned>(n),
+                                    static_cast<__u64>(off));
+            }
+            io_uring_sqe_set_data(sqe, static_cast<void*>(&c));
+            // Bump in_flight BEFORE submit so a fast-completing CQE
+            // can't make the reaper see an underflow. The matching
+            // decrement happens in the reaper on CQE.
+            const uint64_t now = in_flight.fetch_add(1, std::memory_order_acq_rel) + 1;
+            // Track peak for observability (single-writer-on-the-fast-
+            // path; relaxed CAS is fine).
+            uint64_t peak = peak_in_flight.load(std::memory_order_relaxed);
+            while (peak < now && !peak_in_flight.compare_exchange_weak(
+                       peak, now, std::memory_order_relaxed)) {}
+            int rc = io_uring_submit(&ring);
+            if (rc < 0) {
+                in_flight.fetch_sub(1, std::memory_order_acq_rel);
+                if (err) *err = std::string("nvme_tier(uring): submit: ")
+                              + std::strerror(-rc);
+                return false;
+            }
         }
-        // user_data is unused while we serialise — pin to a sentinel so
-        // it's distinct from any future async path's tags.
-        io_uring_sqe_set_data(sqe, reinterpret_cast<void*>(uintptr_t{0xC0DEC0DE}));
-        int rc = io_uring_submit_and_wait(&ring, 1);
-        if (rc < 0) {
-            if (err) *err = std::string("nvme_tier(uring): submit: ")
-                          + std::strerror(-rc);
-            return false;
-        }
-        struct io_uring_cqe* cqe = nullptr;
-        rc = io_uring_peek_cqe(&ring, &cqe);
-        if (rc < 0 || !cqe) {
-            if (err) *err = "nvme_tier(uring): no CQE after wait";
-            return false;
-        }
-        const int res = cqe->res;
-        io_uring_cqe_seen(&ring, cqe);
+        // Block on the reaper. No syscall — just a condvar inside the
+        // promise machinery.
+        const int res = fut.get();
         if (res < 0) {
             if (err) *err = std::string("nvme_tier(uring): op: ")
                           + std::strerror(-res);
             return false;
         }
         if (static_cast<std::size_t>(res) != n) {
-            // Short I/O — uncommon for io_uring against a regular file
-            // but possible. Treat as an error rather than complicating
-            // the inline retry loop; the caller will surface it.
             if (err) {
                 char buf2[128];
                 std::snprintf(buf2, sizeof(buf2),
@@ -170,6 +262,7 @@ std::unique_ptr<NvmeTier> NvmeTier::Create(const Options& opts, std::string* err
             return nullptr;
         }
         u->ring_init = true;
+        u->StartReaper();
         t->uring_ = std::move(u);
 #else
         // Build doesn't include io_uring; honour the request as a warn
@@ -293,6 +386,13 @@ bool NvmeTier::Get(const DramKey& key, uint8_t* dst, std::size_t dst_capacity,
 
 bool NvmeTier::UsingUring() const noexcept {
     return uring_ != nullptr;
+}
+
+uint64_t NvmeTier::UringPeakInFlight() const noexcept {
+#ifdef KVCACHE_ENABLE_URING
+    if (uring_) return uring_->peak_in_flight.load(std::memory_order_relaxed);
+#endif
+    return 0;
 }
 
 bool NvmeTier::Get(const DramKey& key, std::vector<uint8_t>* out, std::string* err) const {
