@@ -98,6 +98,57 @@ TEST(RocksdbStoreTest, OpenAndPutSealedChunkRoundTrip) {
     EXPECT_EQ(got->bytes_total, 1024u);
 }
 
+// Phase B10 — open with the full production tuning surface and verify
+// (a) it still round-trips, (b) the Statistics object is live + dumps
+// after writes. Exercises the rate-limiter / WBM / block-cache / stats
+// code paths that were unreachable before B10.
+TEST(RocksdbStoreTest, ProductionTuningOpensAndStatsDump) {
+    auto path = std::filesystem::temp_directory_path() / "kvcache_rocks_tuned";
+    std::filesystem::remove_all(path);
+
+    RocksdbStore::Options opts;
+    opts.path                       = path.string();
+    opts.block_cache_bytes          = 8ull << 20;    // 8 MiB
+    opts.rate_limit_bytes_per_sec   = 16ull << 20;   // 16 MiB/s
+    opts.write_buffer_manager_bytes = 32ull << 20;   // 32 MiB total memtable
+    opts.enable_statistics          = true;
+
+    std::string err;
+    auto store = RocksdbStore::Open(opts, &err);
+    ASSERT_NE(store, nullptr) << err;
+
+    // A few writes so the statistics counters move off zero.
+    for (uint64_t i = 1; i <= 8; ++i) {
+        kv_locator_t loc{};
+        loc.model_id_hash = i;
+        SealedChunkValue v{};
+        v.version = kSchemaVersion;
+        v.bytes_total = i * 256;
+        ASSERT_TRUE(store->PutSealedChunkAtomic(SealedChunkKey::From(loc), v, i, &err)) << err;
+    }
+    EXPECT_EQ(store->CurrentEpoch(), 8u);
+
+    // StatsString must be non-empty and look like a rocksdb dump.
+    const std::string stats = store->StatsString();
+    EXPECT_FALSE(stats.empty());
+    // rocksdb's ToString() always contains ticker lines like
+    // "rocksdb.block.cache." — assert one well-known token is present.
+    EXPECT_NE(stats.find("rocksdb."), std::string::npos)
+        << "stats dump didn't look like rocksdb output";
+}
+
+TEST(RocksdbStoreTest, StatsStringEmptyWhenDisabled) {
+    auto path = std::filesystem::temp_directory_path() / "kvcache_rocks_nostats";
+    std::filesystem::remove_all(path);
+    RocksdbStore::Options opts;
+    opts.path              = path.string();
+    opts.enable_statistics = false;
+    std::string err;
+    auto store = RocksdbStore::Open(opts, &err);
+    ASSERT_NE(store, nullptr) << err;
+    EXPECT_TRUE(store->StatsString().empty());
+}
+
 #else
 
 TEST(RocksdbStoreFacadeTest, OpenReturnsErrorWithoutRocksdb) {

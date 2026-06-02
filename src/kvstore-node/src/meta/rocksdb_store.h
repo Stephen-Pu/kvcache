@@ -37,6 +37,14 @@
 namespace rocksdb {
 class DB;
 class ColumnFamilyHandle;
+// Phase B10 — held as shared_ptr members below. Forward-declared so the
+// facade build (no rocksdb headers) still has a stable class layout;
+// the members stay null there and ~shared_ptr<Incomplete> on a null
+// pointer is well-defined.
+class Statistics;
+class RateLimiter;
+class Cache;
+class WriteBufferManager;
 }  // namespace rocksdb
 
 namespace kvcache::node::meta {
@@ -103,11 +111,30 @@ class RocksdbStore {
         std::string path;
         bool        create_if_missing = true;
         bool        use_direct_io     = false;
-        uint64_t    block_cache_bytes = 64ull << 20;
-        // TODO(stephen): RateLimiter, WriteBufferManager, Statistics, etc.
+        // Shared block cache across all CFs. Pre-B10 this field was
+        // declared but never wired; B10 drives a BlockBasedTableOptions
+        // LRUCache from it.
+        uint64_t    block_cache_bytes = 64ull << 20;   // 64 MiB
+
+        // Phase B10 — production tuning. 0 = "rocksdb default / off".
+        //   rate_limit_bytes_per_sec: caps background compaction + flush
+        //     write throughput so a compaction storm doesn't starve
+        //     foreground Seal writes / Lookup reads on a shared NVMe.
+        uint64_t    rate_limit_bytes_per_sec = 0;
+        //   write_buffer_manager_bytes: hard cap on TOTAL memtable memory
+        //     across every CF (otherwise 4 CFs each size independently).
+        uint64_t    write_buffer_manager_bytes = 0;
+        //   enable_statistics: attach a rocksdb Statistics object so
+        //     StatsString() returns the counter dump for /metrics + ops.
+        bool        enable_statistics = true;
     };
 
     static std::unique_ptr<RocksdbStore> Open(const Options& opts, std::string* err);
+
+    // Phase B10 — rocksdb Statistics dump (empty string when stats were
+    // not enabled, on the facade build, or before Open). Operators
+    // scrape this; tests assert it's non-empty after a few writes.
+    std::string StatsString() const;
 
     RocksdbStore() = default;
     ~RocksdbStore();
@@ -159,6 +186,16 @@ class RocksdbStore {
     [[maybe_unused]] rocksdb::ColumnFamilyHandle* cf_sealed_  = nullptr;
     [[maybe_unused]] rocksdb::ColumnFamilyHandle* cf_quota_   = nullptr;
     [[maybe_unused]] rocksdb::ColumnFamilyHandle* cf_audit_   = nullptr;
+
+    // Phase B10 — shared tuning objects that must outlive db_ (rocksdb
+    // holds raw pointers to these internally). Destroyed AFTER db_ in
+    // the dtor (members destruct in reverse declaration order, so these
+    // sit below the handles and tear down last — db_ is deleted
+    // explicitly in the dtor before these go).
+    [[maybe_unused]] std::shared_ptr<rocksdb::Statistics>         stats_;
+    [[maybe_unused]] std::shared_ptr<rocksdb::RateLimiter>        rate_limiter_;
+    [[maybe_unused]] std::shared_ptr<rocksdb::Cache>             block_cache_;
+    [[maybe_unused]] std::shared_ptr<rocksdb::WriteBufferManager> wbm_;
 
     mutable uint64_t cached_epoch_ = 0;
 };

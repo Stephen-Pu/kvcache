@@ -9,10 +9,16 @@
 #include <cstring>
 
 #if defined(KVCACHE_HAVE_ROCKSDB)
+#include <memory>
+#include <rocksdb/cache.h>
 #include <rocksdb/db.h>
 #include <rocksdb/options.h>
+#include <rocksdb/rate_limiter.h>
 #include <rocksdb/slice.h>
+#include <rocksdb/statistics.h>
+#include <rocksdb/table.h>
 #include <rocksdb/write_batch.h>
+#include <rocksdb/write_buffer_manager.h>
 #endif
 
 namespace kvcache::node::meta {
@@ -190,15 +196,48 @@ std::unique_ptr<RocksdbStore> RocksdbStore::Open(const Options& opts, std::strin
     db_opts.use_direct_reads                        = opts.use_direct_io;
     db_opts.use_direct_io_for_flush_and_compaction  = opts.use_direct_io;
 
+    // Phase B10 — production tuning. Each shared object is stashed on
+    // the store so it outlives db_ (rocksdb keeps raw pointers to them).
+    if (opts.enable_statistics) {
+        store->stats_ = rocksdb::CreateDBStatistics();
+        db_opts.statistics = store->stats_;
+    }
+    if (opts.rate_limit_bytes_per_sec > 0) {
+        store->rate_limiter_.reset(rocksdb::NewGenericRateLimiter(
+            static_cast<int64_t>(opts.rate_limit_bytes_per_sec)));
+        db_opts.rate_limiter = store->rate_limiter_;
+    }
+    if (opts.write_buffer_manager_bytes > 0) {
+        store->wbm_ = std::make_shared<rocksdb::WriteBufferManager>(
+            static_cast<size_t>(opts.write_buffer_manager_bytes));
+        db_opts.write_buffer_manager = store->wbm_;
+    }
+
+    // Shared block cache → BlockBasedTableOptions applied to every CF.
+    rocksdb::ColumnFamilyOptions cf_tmpl;
+    if (opts.block_cache_bytes > 0) {
+        store->block_cache_ = rocksdb::NewLRUCache(
+            static_cast<size_t>(opts.block_cache_bytes));
+        rocksdb::BlockBasedTableOptions table_opts;
+        table_opts.block_cache = store->block_cache_;
+        cf_tmpl.table_factory.reset(
+            rocksdb::NewBlockBasedTableFactory(table_opts));
+    }
+
     std::vector<ColumnFamilyDescriptor> cfs = {
-        {std::string(kCfDefault),             ColumnFamilyOptions()},
-        {std::string(kCfSealedChunks),        ColumnFamilyOptions()},
-        {std::string(kCfTenantQuotaState),    ColumnFamilyOptions()},
-        {std::string(kCfAuditBufferOverflow), ColumnFamilyOptions()},
+        {std::string(kCfDefault),             cf_tmpl},
+        {std::string(kCfSealedChunks),        cf_tmpl},
+        {std::string(kCfTenantQuotaState),    cf_tmpl},
+        {std::string(kCfAuditBufferOverflow), cf_tmpl},
     };
     std::vector<ColumnFamilyHandle*> handles;
-    Status s = DB::Open(db_opts, opts.path, cfs, &handles, &store->db_);
+    // rocksdb 11.x: DB::Open takes std::unique_ptr<DB>*. Open into a
+    // local unique_ptr then release into the raw db_ member (the dtor
+    // does the matching delete).
+    std::unique_ptr<DB> db_holder;
+    Status s = DB::Open(db_opts, opts.path, cfs, &handles, &db_holder);
     if (!s.ok()) { if (err) *err = s.ToString(); return nullptr; }
+    store->db_ = db_holder.release();
     store->cf_default_ = handles[0];
     store->cf_sealed_  = handles[1];
     store->cf_quota_   = handles[2];
@@ -334,6 +373,11 @@ RocksdbStore::GetConfig(std::string_view key, std::string* err) {
 
 uint64_t RocksdbStore::CurrentEpoch() const noexcept { return cached_epoch_; }
 
+std::string RocksdbStore::StatsString() const {
+    if (!stats_) return {};  // statistics were not enabled at Open
+    return stats_->ToString();
+}
+
 #else  // !KVCACHE_HAVE_ROCKSDB
 
 // Facade: every accessor errors. Lets the tree compile/link without rocksdb.
@@ -360,6 +404,7 @@ bool RocksdbStore::AppendAuditOverflow(std::span<const uint8_t>, std::string*) {
 bool RocksdbStore::PutConfig(std::string_view, std::string_view, std::string*) { return false; }
 std::optional<std::string> RocksdbStore::GetConfig(std::string_view, std::string*) { return std::nullopt; }
 uint64_t RocksdbStore::CurrentEpoch() const noexcept { return cached_epoch_; }
+std::string RocksdbStore::StatsString() const { return {}; }
 
 #endif  // KVCACHE_HAVE_ROCKSDB
 

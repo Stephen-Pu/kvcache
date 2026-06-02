@@ -52,7 +52,29 @@ option(KVCACHE_ENABLE_ROCKSDB "Link against RocksDB"             OFF)
 option(KVCACHE_ENABLE_URING   "Build NvmeTier with liburing path" OFF)
 
 if(KVCACHE_ENABLE_ROCKSDB)
-    find_package(RocksDB REQUIRED CONFIG)
+    # Phase B10 — prefer the CMake CONFIG package (Homebrew, vcpkg, a
+    # from-source install all ship RocksDBConfig.cmake → RocksDB::rocksdb).
+    # Distro packages (Ubuntu librocksdb-dev) often DON'T ship the config,
+    # so fall back to a manual find_library + find_path and synthesise the
+    # imported target ourselves. Either way downstream links RocksDB::rocksdb.
+    find_package(RocksDB CONFIG QUIET)
+    if(NOT RocksDB_FOUND AND NOT TARGET RocksDB::rocksdb)
+        find_library(ROCKSDB_LIBRARY NAMES rocksdb)
+        find_path(ROCKSDB_INCLUDE_DIR NAMES rocksdb/db.h)
+        if(NOT ROCKSDB_LIBRARY OR NOT ROCKSDB_INCLUDE_DIR)
+            message(FATAL_ERROR
+                "KVCACHE_ENABLE_ROCKSDB=ON but RocksDB not found via "
+                "find_package(CONFIG) nor find_library. Install "
+                "librocksdb-dev (Ubuntu) or rocksdb (Homebrew).")
+        endif()
+        add_library(RocksDB::rocksdb UNKNOWN IMPORTED)
+        set_target_properties(RocksDB::rocksdb PROPERTIES
+            IMPORTED_LOCATION             "${ROCKSDB_LIBRARY}"
+            INTERFACE_INCLUDE_DIRECTORIES "${ROCKSDB_INCLUDE_DIR}")
+        message(STATUS "RocksDB found via find_library: ${ROCKSDB_LIBRARY}")
+    else()
+        message(STATUS "RocksDB found via find_package(CONFIG)")
+    endif()
     add_compile_definitions(KVCACHE_HAVE_ROCKSDB=1)
 endif()
 
