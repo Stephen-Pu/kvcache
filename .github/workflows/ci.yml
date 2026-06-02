@@ -26,7 +26,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             cmake ninja-build g++ pkg-config \
-            libcurl4-openssl-dev
+            libcurl4-openssl-dev \
+            liburing-dev
 
       - name: Configure
         run: cmake -S src -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
@@ -42,6 +43,25 @@ jobs:
         run: |
           ls -la build/core-abi || true
           file build/core-abi/libkvcache.so 2>/dev/null || true
+
+      # Phase B1 — io_uring opt-in build. Reuses the toolchain step
+      # above (liburing-dev is in the apt list). Runs only the
+      # NvmeTier tests with --output-on-failure so a regression here
+      # surfaces loudly; the rest of ctest stays in the default
+      # blocking-path build above. Keep these as one extra ~5s job
+      # rather than doubling the matrix.
+      - name: Configure (io_uring)
+        run: |
+          cmake -S src -B build-uring -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DKVCACHE_ENABLE_URING=ON
+
+      - name: Build (io_uring)
+        run: cmake --build build-uring -j --target test_nvme_tier
+
+      - name: ctest (io_uring nvme_tier only)
+        run: ctest --test-dir build-uring --output-on-failure --timeout 60 \
+                   -R '^NvmeTier'
 
   # ---------------------------------------------------------------------------
   # Go control-plane — fast unit tests (excluded: integration tag)

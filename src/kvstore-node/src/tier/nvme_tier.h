@@ -3,10 +3,15 @@
 // Persistent on-NVMe slab allocator. One backing file; fixed-size slots; an
 // in-memory index from content key to slot id. Free slots tracked as a stack.
 //
-// MVP backend selection:
+// Backend selection (Phase B1):
 //   * Default: blocking pread/pwrite. Adequate for unit tests and bring-up.
-//   * KVCACHE_ENABLE_URING: linux-aio path via liburing — TODO(stephen). The
-//     surface area below stays the same; the differences live inside Put/Get.
+//   * KVCACHE_ENABLE_URING (compile-time, Linux-only): wires an
+//     io_uring submission ring per tier. Put/Get dispatch to the ring
+//     when ``Options::use_uring=true``; both APIs stay synchronous
+//     (submit + wait inline), trading one syscall for two and getting
+//     the infrastructure in place for a future async Put/Get surface.
+//     A single std::mutex serialises ring access today — the obvious
+//     follow-on (per-call promise + reaper thread) is left to B1.1.
 //   * KVCACHE_ENABLE_SPDK : SPDK direct-NVMe path — TODO. LLD §3.3 calls out
 //     io_uring + SPDK as a dual-backend.
 //
@@ -17,7 +22,8 @@
 //     wire the rebuild path; for MVP we treat the NVMe tier as best-effort
 //     cache that may need re-population across restarts).
 //   * O_DIRECT is intentionally not used yet — it requires aligned buffers
-//     and sizes, and gains real value only with io_uring. TODO(stephen).
+//     and sizes, and gains real value only with io_uring. Pairs well
+//     with KVCACHE_ENABLE_URING above — left for a follow-on phase.
 #pragma once
 
 #include <atomic>
@@ -41,6 +47,17 @@ class NvmeTier {
         uint64_t    slot_bytes        = 64ull << 20;  // 64 MiB default
         bool        create_if_missing = true;
         bool        fdatasync_on_put  = true;
+        // Phase B1 — opt-in to the io_uring backend (Linux-only,
+        // requires building with -DKVCACHE_ENABLE_URING=ON). Ignored
+        // when the binary was built without io_uring support; falls
+        // back to the blocking pread/pwrite path with a single
+        // ::kvcache::log warn at Create time.
+        bool        use_uring         = false;
+        // Ring depth — number of in-flight SQEs the tier reserves.
+        // 128 is the io_uring "sweet spot" recommended in the docs:
+        // enough to amortise the submit_and_wait syscall under
+        // realistic concurrency, small enough to fit in one page.
+        uint32_t    uring_queue_depth = 128;
     };
 
     static std::unique_ptr<NvmeTier> Create(const Options& opts, std::string* err);
@@ -65,6 +82,11 @@ class NvmeTier {
 
     bool Erase(const DramKey& key);
     bool Contains(const DramKey& key) const;
+
+    // True iff this tier was built + opened with the io_uring
+    // backend live. Operators and tests inspect this to know whether
+    // Put/Get is taking the async path.
+    bool UsingUring() const noexcept;
 
     uint64_t    UsedBytes() const noexcept;
     uint64_t    Capacity() const noexcept { return pool_bytes_; }
@@ -92,6 +114,13 @@ class NvmeTier {
     std::vector<uint32_t> free_stack_;
     std::unordered_map<DramKey, Entry, DramKeyHash> index_;
     std::atomic<uint32_t> in_use_{0};
+
+    // Phase B1 — io_uring state. ``Impl`` is forward-declared so the
+    // header doesn't pull in <liburing.h> (which doesn't exist on
+    // macOS / non-uring builds). Always nullptr when built without
+    // KVCACHE_ENABLE_URING or when use_uring=false was passed.
+    struct UringImpl;
+    std::unique_ptr<UringImpl> uring_;
 };
 
 }  // namespace kvcache::node::tier

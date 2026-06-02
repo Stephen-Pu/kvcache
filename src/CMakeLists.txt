@@ -48,10 +48,21 @@ option(KVCACHE_BUILD_ABI      "Build libkvcache.so (Core ABI)"   ON)
 option(KVCACHE_ENABLE_SPDK    "Enable SPDK NVMe backend"         OFF)
 option(KVCACHE_ENABLE_CUDA    "Enable CUDA / GDS code paths"     OFF)
 option(KVCACHE_ENABLE_ROCKSDB "Link against RocksDB"             OFF)
+# Phase B1 — Linux-only io_uring backend for NvmeTier.
+option(KVCACHE_ENABLE_URING   "Build NvmeTier with liburing path" OFF)
 
 if(KVCACHE_ENABLE_ROCKSDB)
     find_package(RocksDB REQUIRED CONFIG)
     add_compile_definitions(KVCACHE_HAVE_ROCKSDB=1)
+endif()
+
+if(KVCACHE_ENABLE_URING)
+    # liburing is Linux-only; find it via pkg-config (the upstream
+    # package ships liburing.pc). Failing here is a build error rather
+    # than a silent skip — the user explicitly asked for it.
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(LIBURING REQUIRED liburing)
+    add_compile_definitions(KVCACHE_ENABLE_URING=1)
 endif()
 
 # --------------------------------------------------------------------------

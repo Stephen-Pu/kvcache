@@ -115,3 +115,60 @@ TEST(NvmeTierTest, GetMissingKeyFails) {
     EXPECT_FALSE(t->Get(Key(99), &out, &err));
     std::filesystem::remove(o.path);
 }
+
+// Phase B1 — io_uring path:
+//
+//   * UsingUring reports false by default (the blocking path is the
+//     contract every existing test above already exercises).
+//   * UringRoundTrip is gated on KVCACHE_ENABLE_URING + a non-zero
+//     liburing being linked in. Asserts a full Put → Contains → Get
+//     round-trip through the SQE submit/wait path and that the
+//     payload comes back byte-identical.
+//
+// The gated test is skipped at runtime rather than `#if`-excluded so
+// the file's TEST count is identical across build flavours — operators
+// running ctest on a non-uring build see the test marked SKIPPED, not
+// missing.
+
+TEST(NvmeTierTest, UringDisabledByDefault) {
+    NvmeTier::Options o;
+    o.path       = TmpPath("uring-default");
+    o.pool_bytes = 4 * 4096;
+    o.slot_bytes = 4096;
+    std::string err;
+    auto t = NvmeTier::Create(o, &err);
+    ASSERT_NE(t, nullptr) << err;
+    EXPECT_FALSE(t->UsingUring());
+    std::filesystem::remove(o.path);
+}
+
+TEST(NvmeTierTest, UringRoundTripWhenEnabled) {
+#ifndef KVCACHE_ENABLE_URING
+    GTEST_SKIP() << "built without KVCACHE_ENABLE_URING";
+#else
+    NvmeTier::Options o;
+    o.path       = TmpPath("uring-rt");
+    o.pool_bytes = 4 * 4096;
+    o.slot_bytes = 4096;
+    o.use_uring  = true;
+    o.uring_queue_depth = 32;
+    std::string err;
+    auto t = NvmeTier::Create(o, &err);
+    ASSERT_NE(t, nullptr) << err;
+    ASSERT_TRUE(t->UsingUring())
+        << "use_uring=true but UsingUring()=false; CMake wiring broken?";
+
+    // Slightly varied payload so a memcpy bug shows up as a diff.
+    std::vector<uint8_t> data(2048, 0);
+    for (std::size_t i = 0; i < data.size(); ++i) {
+        data[i] = static_cast<uint8_t>(i * 37);
+    }
+    EXPECT_TRUE(t->Put(Key(42), data.data(), data.size(), &err)) << err;
+    EXPECT_TRUE(t->Contains(Key(42)));
+
+    std::vector<uint8_t> out;
+    EXPECT_TRUE(t->Get(Key(42), &out, &err)) << err;
+    EXPECT_EQ(out, data);
+    std::filesystem::remove(o.path);
+#endif
+}

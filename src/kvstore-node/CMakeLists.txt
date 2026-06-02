@@ -69,9 +69,17 @@ target_link_libraries(kvstore_node_core
         kvcache_common
         CURL::libcurl
         nlohmann_json::nlohmann_json
-    # TODO: rocksdb, nixl, ucx, uring, prometheus-cpp,
-    # spdlog, abseil, openssl, $<IF:$<BOOL:${KVCACHE_ENABLE_SPDK}>,spdk,>.
+    # TODO: rocksdb, nixl, ucx, prometheus-cpp, spdlog, abseil,
+    # openssl, $<IF:$<BOOL:${KVCACHE_ENABLE_SPDK}>,spdk,>.
 )
+
+# Phase B1 — when KVCACHE_ENABLE_URING is on, link liburing + thread
+# its include dirs through. The compile-time define KVCACHE_ENABLE_URING
+# was added at the top level so the `#ifdef` in nvme_tier.cpp resolves.
+if(KVCACHE_ENABLE_URING)
+    target_include_directories(kvstore_node_core PUBLIC ${LIBURING_INCLUDE_DIRS})
+    target_link_libraries(kvstore_node_core      PUBLIC ${LIBURING_LIBRARIES})
+endif()
 
 # Phase F-2: when gRPC + the vendored etcd proto lib are available,
 # enable the real GrpcEtcdClient by defining KVCACHE_HAVE_GRPC and

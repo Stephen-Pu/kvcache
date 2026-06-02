@@ -1,13 +1,97 @@
-// LLD §3.3 T3 — NVMe tier implementation (blocking pread/pwrite path).
+// LLD §3.3 T3 — NVMe tier. Blocking pread/pwrite is always available;
+// the io_uring path lives behind KVCACHE_ENABLE_URING (Phase B1).
 #include "tier/nvme_tier.h"
 
 #include <cerrno>
+#include <cstdio>
 #include <cstring>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
+#ifdef KVCACHE_ENABLE_URING
+#  include <liburing.h>
+#endif
+
+#include "logging.h"  // Phase B1 — Warn at Create() when use_uring is
+                      // ignored because the build doesn't include it.
+
 namespace kvcache::node::tier {
+
+// ----- UringImpl --------------------------------------------------------
+//
+// Defined unconditionally so the header's std::unique_ptr<UringImpl>
+// dtor has a complete type at every TU boundary. On non-uring builds
+// the body is just a placeholder — Create() will never construct one.
+
+struct NvmeTier::UringImpl {
+#ifdef KVCACHE_ENABLE_URING
+    struct io_uring ring;
+    std::mutex      submit_mu;
+    bool            ring_init = false;
+
+    ~UringImpl() {
+        if (ring_init) io_uring_queue_exit(&ring);
+    }
+
+    // Single SQE + submit_and_wait(1). Caller holds submit_mu through
+    // the whole request so we don't have to demux completions across
+    // concurrent waiters. The future B1.1 phase lifts this serialisation
+    // by adding a reaper thread + per-call promise.
+    bool DoOp(int fd, void* buf, std::size_t n, off_t off, bool is_write,
+              std::string* err) {
+        std::lock_guard lk(submit_mu);
+        struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
+        if (!sqe) {
+            if (err) *err = "nvme_tier(uring): no SQE available";
+            return false;
+        }
+        if (is_write) {
+            io_uring_prep_write(sqe, fd, buf, static_cast<unsigned>(n),
+                                 static_cast<__u64>(off));
+        } else {
+            io_uring_prep_read(sqe, fd, buf, static_cast<unsigned>(n),
+                                static_cast<__u64>(off));
+        }
+        // user_data is unused while we serialise — pin to a sentinel so
+        // it's distinct from any future async path's tags.
+        io_uring_sqe_set_data(sqe, reinterpret_cast<void*>(uintptr_t{0xC0DEC0DE}));
+        int rc = io_uring_submit_and_wait(&ring, 1);
+        if (rc < 0) {
+            if (err) *err = std::string("nvme_tier(uring): submit: ")
+                          + std::strerror(-rc);
+            return false;
+        }
+        struct io_uring_cqe* cqe = nullptr;
+        rc = io_uring_peek_cqe(&ring, &cqe);
+        if (rc < 0 || !cqe) {
+            if (err) *err = "nvme_tier(uring): no CQE after wait";
+            return false;
+        }
+        const int res = cqe->res;
+        io_uring_cqe_seen(&ring, cqe);
+        if (res < 0) {
+            if (err) *err = std::string("nvme_tier(uring): op: ")
+                          + std::strerror(-res);
+            return false;
+        }
+        if (static_cast<std::size_t>(res) != n) {
+            // Short I/O — uncommon for io_uring against a regular file
+            // but possible. Treat as an error rather than complicating
+            // the inline retry loop; the caller will surface it.
+            if (err) {
+                char buf2[128];
+                std::snprintf(buf2, sizeof(buf2),
+                              "nvme_tier(uring): short I/O: %d of %zu bytes",
+                              res, n);
+                *err = buf2;
+            }
+            return false;
+        }
+        return true;
+    }
+#endif
+};
 
 namespace {
 ssize_t PwriteAll(int fd, const void* buf, std::size_t n, off_t off) {
@@ -71,6 +155,32 @@ std::unique_ptr<NvmeTier> NvmeTier::Create(const Options& opts, std::string* err
     for (uint32_t i = t->slot_count_; i > 0; --i) {
         t->free_stack_.push_back(i - 1);
     }
+
+    // Phase B1 — wire io_uring when asked + available.
+    if (opts.use_uring) {
+#ifdef KVCACHE_ENABLE_URING
+        auto u = std::make_unique<UringImpl>();
+        int rc = io_uring_queue_init(opts.uring_queue_depth, &u->ring,
+                                       /*flags=*/0);
+        if (rc < 0) {
+            if (err) *err = std::string("nvme_tier(uring): queue_init: ")
+                          + std::strerror(-rc);
+            // ftruncate + open already happened — let the std::unique_ptr
+            // dtor clean fd_ via ~NvmeTier when we return nullptr.
+            return nullptr;
+        }
+        u->ring_init = true;
+        t->uring_ = std::move(u);
+#else
+        // Build doesn't include io_uring; honour the request as a warn
+        // rather than a hard fail so config can be uniform across hosts
+        // (Linux gets the fast path, others get the blocking path).
+        ::kvcache::log::Get("nvme_tier").Warn(
+            "Options::use_uring=true ignored: built without "
+            "KVCACHE_ENABLE_URING — falling back to blocking pread/pwrite");
+#endif
+    }
+
     return t;
 }
 
@@ -105,8 +215,22 @@ bool NvmeTier::Put(const DramKey& key, const uint8_t* data, std::size_t n,
     }
 
     const off_t off = static_cast<off_t>(slot) * static_cast<off_t>(slot_bytes_);
-    if (PwriteAll(fd_, data, n, off) != static_cast<ssize_t>(n)) {
-        if (err) *err = std::string("nvme_tier: pwrite: ") + std::strerror(errno);
+    bool write_ok = false;
+#ifdef KVCACHE_ENABLE_URING
+    if (uring_) {
+        // const_cast: io_uring_prep_write takes void*, but we never
+        // mutate the buffer — the kernel only reads it.
+        write_ok = uring_->DoOp(fd_, const_cast<uint8_t*>(data), n, off,
+                                  /*is_write=*/true, err);
+    } else
+#endif
+    {
+        write_ok = (PwriteAll(fd_, data, n, off) == static_cast<ssize_t>(n));
+        if (!write_ok && err) {
+            *err = std::string("nvme_tier: pwrite: ") + std::strerror(errno);
+        }
+    }
+    if (!write_ok) {
         // Restore index on failure.
         std::lock_guard lk(mu_);
         auto it = index_.find(key);
@@ -150,12 +274,25 @@ bool NvmeTier::Get(const DramKey& key, uint8_t* dst, std::size_t dst_capacity,
         return false;
     }
     const off_t off = static_cast<off_t>(e.slot_id) * static_cast<off_t>(slot_bytes_);
-    if (PreadAll(fd_, dst, e.bytes, off) != static_cast<ssize_t>(e.bytes)) {
-        if (err) *err = std::string("nvme_tier: pread: ") + std::strerror(errno);
-        return false;
+#ifdef KVCACHE_ENABLE_URING
+    if (uring_) {
+        if (!uring_->DoOp(fd_, dst, e.bytes, off, /*is_write=*/false, err)) {
+            return false;
+        }
+    } else
+#endif
+    {
+        if (PreadAll(fd_, dst, e.bytes, off) != static_cast<ssize_t>(e.bytes)) {
+            if (err) *err = std::string("nvme_tier: pread: ") + std::strerror(errno);
+            return false;
+        }
     }
     if (out_bytes) *out_bytes = e.bytes;
     return true;
+}
+
+bool NvmeTier::UsingUring() const noexcept {
+    return uring_ != nullptr;
 }
 
 bool NvmeTier::Get(const DramKey& key, std::vector<uint8_t>* out, std::string* err) const {
