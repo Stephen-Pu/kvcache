@@ -1,11 +1,12 @@
 # Architecture Diagrams
 
-Two diagrams covering the kvcache system architecture.
+Three documents covering the kvcache system architecture.
 
 | Diagram | Audience | Focus |
 |:---|:---|:---|
 | **[System Overview](./system-overview.md)** | Architects, ops | Deployment topology — Control Plane + GPU Node Pool + Cold Tier |
 | **[Integration & Transport Stack](./integration-stack.md)** | Integrators, eng leads | Layered stack from engines down to hardware |
+| **[NVIDIA Storage-Next / CMX Integration](./cmx-integration.md)** | Strategy, customers | Phase 2 plan: kvcache as multi-tenant layer above CMX |
 
 Both are authored in [Mermaid](https://mermaid.js.org/), which GitHub renders natively. To edit, open the `.md` file and modify the Mermaid block; no graphics tool needed.
 

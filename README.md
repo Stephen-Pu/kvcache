@@ -139,7 +139,7 @@ Four layers, twelve subsystems, **83 traceable design decisions**. Every line of
 └─────────────────────────────────────────────────────────────┘
 ```
 
-> 📐 **Detailed diagrams** — see [`docs/architecture/`](./docs/architecture/) for the rendered system overview (Control Plane + GPU Node Pool + Cold Tier) and the integration / transport stack (engines → APIs → NIXL → hardware).
+> 📐 **Detailed diagrams** — see [`docs/architecture/`](./docs/architecture/) for the rendered system overview (Control Plane + GPU Node Pool + Cold Tier), the integration / transport stack (engines → APIs → NIXL → hardware), and the [NVIDIA Storage-Next / CMX positioning](./docs/architecture/cmx-integration.md) (Phase 2 — kvcache as the multi-tenant layer above CMX).
 
 
 **Six first principles** drive every decision:
@@ -368,6 +368,7 @@ gantt
     KV compression (CacheGen-class)       :2026-08-01, 90d
     EFA / Azure IB / GCP TCPx certif.     :2026-09-01, 90d
     Dynamo / LMDeploy / TGI adapters      :2026-10-01, 90d
+    NVIDIA CMX backend (Storage-Next)     :2027-01-01, 120d
     section Phase 3 — 12–24 mo
     FedRAMP / sovereign-cloud path        :2027-05-22, 180d
     Cross-cluster KV federation           :2027-07-01, 180d
@@ -383,6 +384,8 @@ The inference layer of the AI stack is being rebuilt right now — disaggregated
 > **Our bet**: in three years, every serious enterprise inference platform will have a dedicated KV cache **data layer**. It will be separate from any single inference engine. It will be multi-tenant by design. It will integrate with multi-cloud data infrastructure, not reinvent it.
 
 That's what we're building.
+
+**NVIDIA validated this thesis at GTC 2026** by announcing [CMX (Storage-Next)](./docs/architecture/cmx-integration.md) — a dedicated G3.5 KV cache storage tier built on BlueField-4 + Spectrum-X + KIOXIA GP-Series. CMX bundles hardware, fabric, and software into a NVIDIA-locked vertical stack. **kvcache is the orthogonal play**: the multi-tenant, vendor-neutral service layer that runs on any hardware **today** and integrates as a [Phase 2 backend on top of CMX](./docs/architecture/cmx-integration.md) for customers who do go all-in on the NVIDIA pod. Two markets, one logical layer.
 
 ---
 
