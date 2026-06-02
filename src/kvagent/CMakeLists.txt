@@ -11,6 +11,12 @@ set(KVAGENT_LIB_SRCS
     src/router/router.cpp
     src/router/hrw_resolver.cpp
     src/router/cluster_view.cpp
+    src/router/etcd_view_loader.cpp
+    # Phase A1.9 — InMemoryEtcdClient (the grpc client in the same TU is
+    # #if'd out: kvagent doesn't define KVCACHE_HAVE_GRPC, so no grpc/
+    # curl link is dragged in). Lets the ClusterViewWatcher read the
+    # view straight from etcd via MakeEtcdViewLoader.
+    ${CMAKE_SOURCE_DIR}/kvstore-node/src/cluster/etcd_client.cpp
     # BloomView wraps kvcache::node::routing::AggregatedBloom and the
     # HrwResolver (Phase A1.7) wraps kvcache::node::routing::HrwRing —
     # pull in those TUs so the agent lib is self-contained at link time.
