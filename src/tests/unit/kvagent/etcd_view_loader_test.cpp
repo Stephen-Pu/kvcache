@@ -79,3 +79,18 @@ TEST(EtcdViewLoaderTest, LiveUpdateFollowedOnRefresh) {
     EXPECT_EQ(w.RefreshOnce(), 3);
     EXPECT_EQ(hrw.NodeCount(), 3u);
 }
+
+// Phase A1.10 — the REAL cross-process client (HttpEtcdClient) is now
+// linked into the agent. Against an unreachable endpoint its Create
+// smoke-test fails fast, which is exactly the startup path main.cpp
+// guards (etcd down → fall back to file/seed). Port 1 refuses
+// connection ~instantly; a short dial_timeout caps the worst case.
+TEST(EtcdViewLoaderTest, HttpClientCreateFailsOnUnreachableEndpoint) {
+    kvcache::node::cluster::HttpEtcdClient::Options eo;
+    eo.endpoint     = "http://127.0.0.1:1";  // nothing listens here
+    eo.dial_timeout = std::chrono::milliseconds(500);
+    std::string err;
+    auto client = kvcache::node::cluster::HttpEtcdClient::Create(eo, &err);
+    EXPECT_EQ(client, nullptr) << "Create must fail against a dead endpoint";
+    EXPECT_FALSE(err.empty()) << "failure must carry a diagnostic";
+}

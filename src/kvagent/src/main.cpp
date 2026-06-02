@@ -37,7 +37,9 @@
 #include <vector>
 
 #include "bloom_view/bloom_view.h"
+#include "cluster/etcd_client.h"
 #include "router/cluster_view.h"
+#include "router/etcd_view_loader.h"
 #include "router/hrw_resolver.h"
 #include "router/router.h"
 #include "routing_cache/routing_cache.h"
@@ -176,27 +178,60 @@ int main(int argc, char** argv) {
                      hrw.NodeCount());
     }
 
-    // Phase A1.8 — keep the node set fresh from the CP's published
-    // cluster view. The Loader reads the JSON snapshot the leader
-    // writes to etcd /kvcache/cluster/view. We don't link an etcd
-    // client into the agent yet (A1.9), so the loader reads a file the
-    // deployment refreshes (KVCACHE_CLUSTER_VIEW_FILE) — a sidecar /
-    // initContainer can `etcdctl get` into it, or a future in-process
-    // etcd client replaces this hook. Absent the env, the watcher
-    // isn't started and the KVCACHE_NODES seed above stands.
+    // Phase A1.8/A1.9/A1.10 — keep the node set fresh from the CP's
+    // published cluster view at etcd /kvcache/cluster/view. Loader
+    // selection, in priority order:
+    //   1. KVCACHE_ETCD_ENDPOINTS — dial a real etcd over the HTTP/JSON
+    //      gateway (A1.10) and read the live key cross-process.
+    //   2. KVCACHE_CLUSTER_VIEW_FILE — read a file a sidecar refreshes
+    //      (A1.8 fallback for deployments without direct etcd access).
+    //   3. neither — watcher not started; the KVCACHE_NODES seed stands.
+    // etcd_client is declared before view_watcher so it outlives it
+    // (members destruct bottom-up: watcher Stops first, then the client).
+    std::unique_ptr<kvcache::node::cluster::HttpEtcdClient> etcd_client;
     std::unique_ptr<router::ClusterViewWatcher> view_watcher;
-    if (const char* view_file = std::getenv("KVCACHE_CLUSTER_VIEW_FILE")) {
-        std::string path(view_file);
-        router::ClusterViewWatcher::Options vopts;
-        vopts.loader = [path]() -> std::optional<std::string> {
-            std::ifstream in(path, std::ios::binary);
-            if (!in) return std::string{};  // absent → empty set, not error
-            return std::string(std::istreambuf_iterator<char>(in),
-                               std::istreambuf_iterator<char>());
-        };
+
+    router::ClusterViewWatcher::Options vopts;
+    bool have_loader = false;
+
+    if (const char* endpoints = std::getenv("KVCACHE_ETCD_ENDPOINTS")) {
+        // HttpEtcdClient is single-endpoint — take the first.
+        std::string ep(endpoints);
+        if (const auto comma = ep.find(','); comma != std::string::npos) {
+            ep = ep.substr(0, comma);
+        }
+        if (ep.find("://") == std::string::npos) ep = "http://" + ep;
+        kvcache::node::cluster::HttpEtcdClient::Options eo;
+        eo.endpoint = ep;
+        std::string err;
+        etcd_client = kvcache::node::cluster::HttpEtcdClient::Create(eo, &err);
+        if (etcd_client) {
+            vopts.loader = router::MakeEtcdViewLoader(*etcd_client);
+            have_loader = true;
+            std::fprintf(stderr, "kvagent: cluster-view watcher → etcd %s\n",
+                         ep.c_str());
+        } else {
+            std::fprintf(stderr, "kvagent: etcd client init failed (%s); "
+                         "falling back to file/seed\n", err.c_str());
+        }
+    }
+    if (!have_loader) {
+        if (const char* view_file = std::getenv("KVCACHE_CLUSTER_VIEW_FILE")) {
+            std::string path(view_file);
+            vopts.loader = [path]() -> std::optional<std::string> {
+                std::ifstream in(path, std::ios::binary);
+                if (!in) return std::string{};  // absent → empty set, not error
+                return std::string(std::istreambuf_iterator<char>(in),
+                                   std::istreambuf_iterator<char>());
+            };
+            have_loader = true;
+            std::fprintf(stderr, "kvagent: cluster-view watcher polling %s\n",
+                         path.c_str());
+        }
+    }
+    if (have_loader) {
         view_watcher = std::make_unique<router::ClusterViewWatcher>(hrw, vopts);
         view_watcher->Start();
-        std::fprintf(stderr, "kvagent: cluster-view watcher polling %s\n", path.c_str());
     }
 
     router::RequestRouter request_router(rcache, bloom, hrw.AsCallback());

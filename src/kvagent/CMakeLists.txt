@@ -13,10 +13,15 @@ set(KVAGENT_LIB_SRCS
     src/router/cluster_view.cpp
     src/router/etcd_view_loader.cpp
     # Phase A1.9 — InMemoryEtcdClient (the grpc client in the same TU is
-    # #if'd out: kvagent doesn't define KVCACHE_HAVE_GRPC, so no grpc/
-    # curl link is dragged in). Lets the ClusterViewWatcher read the
-    # view straight from etcd via MakeEtcdViewLoader.
+    # #if'd out: kvagent doesn't define KVCACHE_HAVE_GRPC, so no grpc
+    # link is dragged in). Lets the ClusterViewWatcher read the view
+    # straight from etcd via MakeEtcdViewLoader.
     ${CMAKE_SOURCE_DIR}/kvstore-node/src/cluster/etcd_client.cpp
+    # Phase A1.10 — HttpEtcdClient: a real cross-process etcd v3 client
+    # over the JSON/HTTP gateway (libcurl + nlohmann, no grpc). main.cpp
+    # dials this when KVCACHE_ETCD_ENDPOINTS is set so the view watcher
+    # reads the live /kvcache/cluster/view across processes.
+    ${CMAKE_SOURCE_DIR}/kvstore-node/src/cluster/http_etcd_client.cpp
     # BloomView wraps kvcache::node::routing::AggregatedBloom and the
     # HrwResolver (Phase A1.7) wraps kvcache::node::routing::HrwRing —
     # pull in those TUs so the agent lib is self-contained at link time.
@@ -40,6 +45,8 @@ target_link_libraries(kvagent_lib
         kvcache_common
         # Phase A1.8 — ClusterViewWatcher parses the CP's JSON view.
         nlohmann_json::nlohmann_json
+        # Phase A1.10 — HttpEtcdClient talks the etcd JSON gateway.
+        CURL::libcurl
 )
 
 add_executable(kvagent src/main.cpp)
