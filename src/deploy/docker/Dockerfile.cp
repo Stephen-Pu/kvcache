@@ -25,11 +25,25 @@
 # -----------------------------------------------------------------------
 FROM golang:1.22-bookworm AS build
 
+# Phase A-6: gRPC server uses generated pb stubs that are gitignored
+# (see Makefile go-proto target). Install protoc + the go/go-grpc
+# plugins so the build can regenerate them inside the image.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends protobuf-compiler && \
+    rm -rf /var/lib/apt/lists/* && \
+    go install google.golang.org/protobuf/cmd/protoc-gen-go@latest && \
+    go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
+ENV PATH=/root/go/bin:$PATH
+
 WORKDIR /work
-COPY src/control-plane/ src/control-plane/
+# core/proto is the SOT for the .proto files — copy it alongside the
+# control-plane tree so `make proto` can find them at ../core/proto/.
+COPY src/core/proto/        src/core/proto/
+COPY src/control-plane/     src/control-plane/
 
 WORKDIR /work/src/control-plane
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags='-s -w' \
+RUN make proto && \
+    CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags='-s -w' \
         -o /out/cp ./cmd/cp
 
 # -----------------------------------------------------------------------

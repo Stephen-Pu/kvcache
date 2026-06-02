@@ -13,7 +13,8 @@
 //   6. As follower: serve read-only RPCs (delegate writes to leader).
 //
 // The gRPC server surface mapping the cp.proto schema lives in
-// internal/server/ (TODO(stephen) — once the full proto codegen is wired).
+// internal/server/ — wired in Phase A-6 (Register + Heartbeat real;
+// Sync stays Unimplemented until quota + bloom-fanout scaffolds land).
 package main
 
 import (
@@ -34,9 +35,12 @@ import (
 
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.etcd.io/etcd/client/v3/concurrency"
+	"google.golang.org/grpc"
 
 	myetcd "github.com/Stephen-Pu/kvcache/control-plane/internal/etcd"
 	"github.com/Stephen-Pu/kvcache/control-plane/internal/membership"
+	pb "github.com/Stephen-Pu/kvcache/control-plane/internal/pb"
+	cpserver "github.com/Stephen-Pu/kvcache/control-plane/internal/server"
 )
 
 // Set to true once etcd is reachable; /readyz flips from 503 -> 200.
@@ -51,7 +55,9 @@ func main() {
 	leaderElectionPath := flag.String("election", "/cp/leader", "etcd path for leader election")
 	leaseTTL := flag.Int("lease-ttl", 10, "leader-election lease TTL in seconds")
 	listenAddr := flag.String("listen", env("KVCACHE_CP_LISTEN", ":7100"),
-		"address the CP gRPC/HTTP server binds (host:port; :0 = OS-picked)")
+		"address the CP HTTP probe + metrics server binds (host:port; :0 = OS-picked)")
+	grpcListenAddr := flag.String("grpc-listen", env("KVCACHE_CP_GRPC_LISTEN", ":7101"),
+		"address the CP gRPC ControlPlane service binds (host:port; :0 = OS-picked)")
 	// Operator-emitted but currently unused — record so the log line
 	// makes the configured paths visible.
 	_ = flag.String("tls-ca", env("KVCACHE_TLS_CA", ""), "path to mTLS CA bundle (logged only)")
@@ -88,6 +94,28 @@ func main() {
 	etcdConnected.Store(true)
 
 	registry := membership.NewRegistry(cli)
+
+	// Phase A-6 — gRPC ControlPlane service. Bound on a sibling port
+	// to the HTTP probe so K8s readiness can stay on a simple TCPSocket
+	// check; production wraps the gRPC port in mTLS via the existing
+	// TLS flags (Phase H-3 material). MVP serves Register + Heartbeat;
+	// Sync returns Unimplemented until quota/routing scaffolds land.
+	grpcSrv, grpcLn, err := startGrpcServer(*grpcListenAddr, registry)
+	if err != nil {
+		log.Fatalf("control-plane: grpc listen %s: %v", *grpcListenAddr, err)
+	}
+	log.Printf("control-plane: gRPC listening on %s", grpcLn.Addr())
+	defer func() {
+		// GracefulStop drains in-flight RPCs first; bounded by the
+		// shutdown deadline of the surrounding signal context.
+		stopped := make(chan struct{})
+		go func() { grpcSrv.GracefulStop(); close(stopped) }()
+		select {
+		case <-stopped:
+		case <-time.After(5 * time.Second):
+			grpcSrv.Stop()
+		}
+	}()
 
 	// Leader election. Followers still serve read-only queries (list nodes,
 	// stream watches) but writes (quota updates, bloom fan-out) are leader-only.
@@ -245,4 +273,31 @@ func runLeaderDuties(ctx context.Context, registry *membership.Registry,
 		log.Printf("control-plane: cluster-view publisher: %v", err)
 	}
 	wg.Wait()
+}
+
+// startGrpcServer binds `addr`, constructs a cpserver.Server backed by
+// the shared membership.Registry, registers it with a fresh grpc.Server,
+// and starts serving in a sibling goroutine. Returns the server + the
+// resolved listener (with .Addr() populated so :0 callers can read
+// the OS-picked port). Plain text for now — mTLS gets bolted on once
+// the operator-provisioned key material reaches the CP pod via the
+// same Secret mechanism the kvstore-node side uses (Phase H-3).
+func startGrpcServer(addr string, registry *membership.Registry) (*grpc.Server, net.Listener, error) {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, nil, err
+	}
+	svc, err := cpserver.New(cpserver.Options{Registry: registry})
+	if err != nil {
+		_ = ln.Close()
+		return nil, nil, err
+	}
+	srv := grpc.NewServer()
+	pb.RegisterControlPlaneServer(srv, svc)
+	go func() {
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
+			log.Printf("control-plane: grpc server: %v", err)
+		}
+	}()
+	return srv, ln, nil
 }

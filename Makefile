@@ -27,7 +27,7 @@ CMAKE        ?= cmake
 GENERATOR    ?= Ninja
 JOBS         ?= $(shell nproc 2>/dev/null || sysctl -n hw.ncpu)
 
-.PHONY: help build configure compile test go go-test go-it py-test py-test-vllm bench-strict clean all e2e-operator docker-image docker-image-cp e2e-operator-workload
+.PHONY: help build configure compile test go go-proto go-test go-it py-test py-test-vllm bench-strict clean all e2e-operator docker-image docker-image-cp e2e-operator-workload
 
 help:
 	@grep -E '^# +' Makefile | head -20
@@ -43,12 +43,19 @@ build: configure compile
 test: build
 	ctest --test-dir $(BUILD_DIR) --output-on-failure --timeout 60
 
-go:
+go: go-proto
 	cd src/control-plane && go build ./...
 	cd src/operator      && go build ./...
 	cd src/kvctl         && go build ./...
 
-go-test:
+# Phase A-6 — Go proto stubs are gitignored; regenerate from .proto files.
+# Pre-req: protoc-gen-go + protoc-gen-go-grpc on $PATH
+#   go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
+#   go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
+go-proto:
+	$(MAKE) -C src/control-plane proto
+
+go-test: go-proto
 	cd src/control-plane && go test -short -count=1 ./...
 	cd src/operator      && go vet ./...
 	cd src/kvctl         && go vet ./...
