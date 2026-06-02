@@ -19,6 +19,7 @@
 #include <thread>
 #include <vector>
 
+#include "cluster/drain_gate.h"
 #include "grpc/grpc_server.h"
 #include "grpc/node_data_service.h"
 #include "kvcache/kv_abi.h"
@@ -169,6 +170,45 @@ TEST_F(NodeDataFixture, LookupMissReturnsHitFalse) {
     auto s = stub_->Lookup(&ctx, req, &resp);
     ASSERT_TRUE(s.ok()) << s.error_message();
     EXPECT_FALSE(resp.hit());
+}
+
+TEST_F(NodeDataFixture, DrainGateRejectsReserve) {
+    // Phase A2.3 — with a draining gate installed, Reserve must reject
+    // new writes with FAILED_PRECONDITION; clearing the gate restores
+    // normal service.
+    kvcache::node::cluster::DrainGate gate;
+    svc_->SetDrainGate(&gate);
+
+    const auto tokens = RangeTokens(8500, 2 * kChunkTokens);
+    const std::size_t bytes_total = tokens.size() * 64;
+    auto makeReserve = [&](kvcache::proto::ReserveResponse* rresp) {
+        ::grpc::ClientContext rctx;
+        kvcache::proto::ReserveRequest rreq;
+        *rreq.mutable_locator() = BuildLocator(tenant_id_, model_id_, tokens,
+                                                 bytes_total);
+        rreq.set_bytes(bytes_total);
+        rreq.set_priority(1);
+        rreq.set_ttl_seconds(60);
+        return stub_->Reserve(&rctx, rreq, rresp);
+    };
+
+    // Draining → rejected.
+    gate.SetDraining(true);
+    {
+        kvcache::proto::ReserveResponse rresp;
+        auto s = makeReserve(&rresp);
+        EXPECT_EQ(s.error_code(), ::grpc::StatusCode::FAILED_PRECONDITION)
+            << "draining node must reject Reserve";
+    }
+    // Cleared → accepted again.
+    gate.SetDraining(false);
+    {
+        kvcache::proto::ReserveResponse rresp;
+        auto s = makeReserve(&rresp);
+        EXPECT_TRUE(s.ok()) << s.error_message();
+        EXPECT_NE(rresp.server_handle(), 0u);
+    }
+    svc_->SetDrainGate(nullptr);  // unhook before fixture teardown
 }
 
 TEST_F(NodeDataFixture, ReservePublishSealLookupRoundTrip) {

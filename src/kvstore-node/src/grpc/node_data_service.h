@@ -46,6 +46,7 @@
 
 namespace kvcache::node::cluster { class NodeDirectory; }
 namespace kvcache::node::cluster { class BloomPublisher; }
+namespace kvcache::node::cluster { class DrainGate; }
 namespace kvcache::node::routing { class HrwRing; }
 
 namespace kvcache::node::grpc_server {
@@ -100,6 +101,13 @@ class NodeDataServiceImpl final : public kvcache::proto::NodeData::Service {
     // a per-tenant leaf. Opt-in so existing TLS tests (whose certs
     // use a generic CN) keep passing. Defaults to OFF.
     void EnableTenantCertBinding(bool enable);
+
+    // Phase A2.3 — point Reserve at a DrainGate. When the gate reports
+    // draining, Reserve rejects NEW writes with FAILED_PRECONDITION so
+    // a draining node bleeds out (reads + in-flight Seals still flow).
+    // The gate must outlive the service; nullptr (default) disables the
+    // check. The DrainWatcher (Phase A2.2) drives the gate from etcd.
+    void SetDrainGate(const cluster::DrainGate* gate) { drain_gate_ = gate; }
 
     ::grpc::Status Lookup(::grpc::ServerContext*               context,
                             const kvcache::proto::LookupRequest* request,
@@ -207,6 +215,9 @@ class NodeDataServiceImpl final : public kvcache::proto::NodeData::Service {
 
     // Phase N-3 — atomic so handler reads don't need to acquire mu_.
     std::atomic<bool>                        tenant_cert_binding_enabled_{false};
+
+    // Phase A2.3 — optional drain gate (owned elsewhere; see SetDrainGate).
+    const cluster::DrainGate*                drain_gate_ = nullptr;
 
     // Per-peer NodeData stub cache. The Channel keeps itself reusable
     // across RPCs; the stub is light-weight on top.

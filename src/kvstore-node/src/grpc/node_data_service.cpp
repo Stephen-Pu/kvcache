@@ -26,6 +26,7 @@
 #include <openssl/sha.h>
 
 #include "cluster/bloom_publisher.h"  // SketchKeyForTokens
+#include "cluster/drain_gate.h"       // Phase A2.3 — Reserve gate
 #include "cluster/node_directory.h"
 #include "kvcache/kv_errors.h"
 #include "kvcache/kv_types.h"
@@ -526,6 +527,16 @@ kv_ctx_t* NodeDataServiceImpl::CtxForHandle(uint64_t h) {
     ::grpc::ServerContext* context,
     const kvcache::proto::ReserveRequest* request,
     kvcache::proto::ReserveResponse*      response) {
+    // Phase A2.3 — drain gate. A draining node refuses NEW writes so it
+    // can bleed out (reads + in-flight Seals still flow). The client
+    // should re-Reserve elsewhere — FAILED_PRECONDITION signals "not
+    // me, try the current primary" rather than a hard error. Checked
+    // before forwarding so we don't bounce a write toward a node that's
+    // on its way out.
+    if (drain_gate_ != nullptr && drain_gate_->ShouldRejectNewWork()) {
+        return {::grpc::StatusCode::FAILED_PRECONDITION,
+                "node draining: not accepting new reservations"};
+    }
     // Phase Q-2 — sticky-write fan-out. Reserve carries the locator
     // (tenant_id bytes + model_id_hash + prefix_hash); compute HRW
     // primary off those and forward when we're not the owner. The
