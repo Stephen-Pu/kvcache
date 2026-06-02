@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <memory>
+#include <string_view>
 #include <utility>
 
 #ifdef KVCACHE_HAVE_OPENSSL
@@ -46,6 +47,94 @@ std::optional<Identity> MtlsRegistry::Resolve(const std::string& cn) const {
 std::size_t MtlsRegistry::Size() const noexcept {
     std::lock_guard lk(mu_);
     return by_cn_.size();
+}
+
+// ----- Phase B8.1 — SPIFFE-first authz -------------------------------------
+
+bool MtlsRegistry::UpsertSpiffeMapping(const std::string& spiffe_id,
+                                       const Identity& id) {
+    std::lock_guard lk(mu_);
+    auto [it, inserted] = by_spiffe_.emplace(spiffe_id, id);
+    if (!inserted) it->second = id;
+    return inserted;
+}
+
+bool MtlsRegistry::RemoveSpiffeMapping(const std::string& spiffe_id) {
+    std::lock_guard lk(mu_);
+    return by_spiffe_.erase(spiffe_id) > 0;
+}
+
+std::optional<Identity> MtlsRegistry::ResolveBySpiffe(
+    const std::string& spiffe_id) const {
+    std::lock_guard lk(mu_);
+    auto it = by_spiffe_.find(spiffe_id);
+    if (it == by_spiffe_.end()) return std::nullopt;
+    return it->second;
+}
+
+std::size_t MtlsRegistry::SpiffeSize() const noexcept {
+    std::lock_guard lk(mu_);
+    return by_spiffe_.size();
+}
+
+void MtlsRegistry::SetRequiredTrustDomain(std::string trust_domain) {
+    std::lock_guard lk(mu_);
+    required_trust_domain_ = std::move(trust_domain);
+}
+
+std::optional<MtlsRegistry::SpiffeId> MtlsRegistry::ParseSpiffeId(
+    const std::string& uri) {
+    static constexpr std::string_view kScheme = "spiffe://";
+    if (uri.size() <= kScheme.size() ||
+        uri.compare(0, kScheme.size(), kScheme) != 0) {
+        return std::nullopt;
+    }
+    const std::size_t after = kScheme.size();
+    // Trust domain runs up to the first '/' (or end of string for a
+    // bare-domain id). Must be non-empty.
+    const std::size_t slash = uri.find('/', after);
+    SpiffeId out;
+    if (slash == std::string::npos) {
+        out.trust_domain = uri.substr(after);
+        // path stays empty
+    } else {
+        out.trust_domain = uri.substr(after, slash - after);
+        out.path = uri.substr(slash);  // includes leading '/'
+    }
+    if (out.trust_domain.empty()) return std::nullopt;
+    // A trailing-slash-only path ("spiffe://td/") is a non-id — reject
+    // a path that is just "/" with nothing after it as malformed.
+    if (out.path == "/") return std::nullopt;
+    return out;
+}
+
+std::optional<Identity> MtlsRegistry::ResolveCert(const CertInfo& cert) const {
+    // SPIFFE-first. Only consult the SPIFFE map when the cert carries a
+    // well-formed id that passes the (optional) trust-domain check.
+    if (cert.spiffe_id.has_value()) {
+        if (auto parsed = ParseSpiffeId(*cert.spiffe_id)) {
+            std::lock_guard lk(mu_);
+            if (!required_trust_domain_.empty() &&
+                parsed->trust_domain != required_trust_domain_) {
+                // Foreign trust domain → SPIFFE path refuses. Do NOT fall
+                // back to CN here: a cert minted under a rogue domain
+                // must not slip through on a CN coincidence.
+                return std::nullopt;
+            }
+            auto it = by_spiffe_.find(*cert.spiffe_id);
+            if (it != by_spiffe_.end()) return it->second;
+            // SPIFFE id present + valid + right domain but unmapped →
+            // fall through to CN (the deployment may not have migrated
+            // this identity to the SPIFFE table yet).
+        }
+        // Malformed spiffe id → ignore it, try CN.
+    }
+    if (!cert.cn.empty()) {
+        std::lock_guard lk(mu_);
+        auto it = by_cn_.find(cert.cn);
+        if (it != by_cn_.end()) return it->second;
+    }
+    return std::nullopt;
 }
 
 bool MtlsRegistry::HasRealParser() noexcept {

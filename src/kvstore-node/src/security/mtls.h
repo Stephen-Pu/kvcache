@@ -61,6 +61,44 @@ class MtlsRegistry {
     std::optional<Identity> Resolve(const std::string& cn) const;
     std::size_t Size() const noexcept;
 
+    // ----- Phase B8.1 — SPIFFE-first authz --------------------------------
+    //
+    // A SPIFFE ID (the URI SAN `spiffe://<trust-domain>/<path>`) is the
+    // modern, SAN-bound identity. The CP publishes a spiffe_id → Tenant
+    // mapping the same way it publishes the CN table; the runtime
+    // authenticates on the SPIFFE ID when the peer cert carries one,
+    // falling back to CN only when it doesn't. SPIFFE-first because the
+    // ID is bound into the cert's SAN extension (can't be spoofed by a
+    // misissued CN) and carries the trust domain explicitly.
+
+    bool UpsertSpiffeMapping(const std::string& spiffe_id, const Identity& id);
+    bool RemoveSpiffeMapping(const std::string& spiffe_id);
+    std::optional<Identity> ResolveBySpiffe(const std::string& spiffe_id) const;
+    std::size_t SpiffeSize() const noexcept;
+
+    // Optional trust-domain enforcement. When set (non-empty), a SPIFFE
+    // ID whose trust domain != this is rejected by ResolveCert even if
+    // its full id happens to be in the map — defends against a cert
+    // minted under a foreign/rogue trust domain. Empty = accept any
+    // trust domain present in the map.
+    void SetRequiredTrustDomain(std::string trust_domain);
+
+    // SPIFFE-first authz entry point. Given a parsed CertInfo:
+    //   1. if it carries a spiffe_id that (a) parses, (b) passes the
+    //      trust-domain check, and (c) is in the SPIFFE map → that Identity.
+    //   2. else fall back to the CN table.
+    //   3. else nullopt (unauthenticated).
+    std::optional<Identity> ResolveCert(const CertInfo& cert) const;
+
+    // Parse + validate a SPIFFE ID. Returns {trust_domain, path} on a
+    // well-formed `spiffe://<trust-domain>/<path>` (non-empty trust
+    // domain; path may be empty for a bare-domain id), nullopt otherwise.
+    struct SpiffeId {
+        std::string trust_domain;
+        std::string path;  // leading '/' included; empty for bare domain
+    };
+    static std::optional<SpiffeId> ParseSpiffeId(const std::string& uri);
+
     // Phase B8 — full leaf-cert parse. When built with OpenSSL
     // (KVCACHE_HAVE_OPENSSL), this does a real PEM → X509 decode and
     // pulls the subject CN + every DNS/URI subjectAltName + the first
@@ -83,6 +121,8 @@ class MtlsRegistry {
    private:
     mutable std::mutex                          mu_;
     std::unordered_map<std::string, Identity>   by_cn_;
+    std::unordered_map<std::string, Identity>   by_spiffe_;   // Phase B8.1
+    std::string                                 required_trust_domain_;
 };
 
 }  // namespace kvcache::node::security

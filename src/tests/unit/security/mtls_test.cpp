@@ -119,3 +119,119 @@ TEST(MtlsRegistryTest, ParsePemRejectsGarbage) {
         "-----END CERTIFICATE-----\n");
     EXPECT_FALSE(info.has_value());
 }
+
+// ===== Phase B8.1 — SPIFFE-first authz =====================================
+
+TEST(SpiffeParseTest, ParsesWellFormedId) {
+    auto id = MtlsRegistry::ParseSpiffeId("spiffe://kvcache.example/node/node-1");
+    ASSERT_TRUE(id.has_value());
+    EXPECT_EQ(id->trust_domain, "kvcache.example");
+    EXPECT_EQ(id->path, "/node/node-1");
+}
+
+TEST(SpiffeParseTest, ParsesBareDomain) {
+    auto id = MtlsRegistry::ParseSpiffeId("spiffe://kvcache.example");
+    ASSERT_TRUE(id.has_value());
+    EXPECT_EQ(id->trust_domain, "kvcache.example");
+    EXPECT_TRUE(id->path.empty());
+}
+
+TEST(SpiffeParseTest, RejectsMalformed) {
+    EXPECT_FALSE(MtlsRegistry::ParseSpiffeId("").has_value());
+    EXPECT_FALSE(MtlsRegistry::ParseSpiffeId("https://kvcache.example/x").has_value());
+    EXPECT_FALSE(MtlsRegistry::ParseSpiffeId("spiffe://").has_value());      // empty td
+    EXPECT_FALSE(MtlsRegistry::ParseSpiffeId("spiffe:///path").has_value()); // empty td
+    EXPECT_FALSE(MtlsRegistry::ParseSpiffeId("spiffe://td/").has_value());   // bare slash
+}
+
+TEST(SpiffeAuthzTest, UpsertResolveRemoveBySpiffe) {
+    MtlsRegistry r;
+    Identity id;
+    id.kind = IdentityKind::kInternal;
+    id.cn = "ignored";
+    id.display_name = "Node One";
+    const std::string sid = "spiffe://kvcache.example/node/node-1";
+    EXPECT_TRUE(r.UpsertSpiffeMapping(sid, id));
+    EXPECT_EQ(r.SpiffeSize(), 1u);
+    auto got = r.ResolveBySpiffe(sid);
+    ASSERT_TRUE(got.has_value());
+    EXPECT_EQ(got->display_name, "Node One");
+    EXPECT_TRUE(r.RemoveSpiffeMapping(sid));
+    EXPECT_FALSE(r.ResolveBySpiffe(sid).has_value());
+}
+
+TEST(SpiffeAuthzTest, ResolveCertPrefersSpiffeOverCn) {
+    MtlsRegistry r;
+    Identity cnId;   cnId.display_name = "via-CN";
+    Identity sidId;  sidId.display_name = "via-SPIFFE";
+    r.UpsertMapping("kvagent-node-1", cnId);
+    r.UpsertSpiffeMapping("spiffe://kvcache.example/node/node-1", sidId);
+
+    CertInfo cert;
+    cert.cn = "kvagent-node-1";
+    cert.spiffe_id = "spiffe://kvcache.example/node/node-1";
+    auto got = r.ResolveCert(cert);
+    ASSERT_TRUE(got.has_value());
+    EXPECT_EQ(got->display_name, "via-SPIFFE") << "SPIFFE must win over CN";
+}
+
+TEST(SpiffeAuthzTest, ResolveCertFallsBackToCnWhenSpiffeUnmapped) {
+    MtlsRegistry r;
+    Identity cnId; cnId.display_name = "via-CN";
+    r.UpsertMapping("kvagent-node-1", cnId);
+    CertInfo cert;
+    cert.cn = "kvagent-node-1";
+    cert.spiffe_id = "spiffe://kvcache.example/node/unmapped";  // valid, not in map
+    auto got = r.ResolveCert(cert);
+    ASSERT_TRUE(got.has_value());
+    EXPECT_EQ(got->display_name, "via-CN");
+}
+
+TEST(SpiffeAuthzTest, ResolveCertCnOnlyWhenNoSpiffe) {
+    MtlsRegistry r;
+    Identity cnId; cnId.display_name = "via-CN";
+    r.UpsertMapping("kvagent-node-1", cnId);
+    CertInfo cert;
+    cert.cn = "kvagent-node-1";  // no spiffe_id
+    auto got = r.ResolveCert(cert);
+    ASSERT_TRUE(got.has_value());
+    EXPECT_EQ(got->display_name, "via-CN");
+}
+
+TEST(SpiffeAuthzTest, TrustDomainMismatchRefusesAndDoesNotFallBack) {
+    MtlsRegistry r;
+    r.SetRequiredTrustDomain("kvcache.example");
+    Identity cnId; cnId.display_name = "via-CN";
+    r.UpsertMapping("kvagent-node-1", cnId);  // CN would otherwise match
+
+    CertInfo cert;
+    cert.cn = "kvagent-node-1";
+    cert.spiffe_id = "spiffe://rogue.evil/node/node-1";  // foreign trust domain
+    auto got = r.ResolveCert(cert);
+    EXPECT_FALSE(got.has_value())
+        << "foreign trust domain must refuse, not fall back to a CN match";
+}
+
+TEST(SpiffeAuthzTest, TrustDomainMatchResolves) {
+    MtlsRegistry r;
+    r.SetRequiredTrustDomain("kvcache.example");
+    Identity sidId; sidId.display_name = "via-SPIFFE";
+    r.UpsertSpiffeMapping("spiffe://kvcache.example/node/node-1", sidId);
+    CertInfo cert;
+    cert.spiffe_id = "spiffe://kvcache.example/node/node-1";
+    auto got = r.ResolveCert(cert);
+    ASSERT_TRUE(got.has_value());
+    EXPECT_EQ(got->display_name, "via-SPIFFE");
+}
+
+TEST(SpiffeAuthzTest, MalformedSpiffeIgnoredFallsBackToCn) {
+    MtlsRegistry r;
+    Identity cnId; cnId.display_name = "via-CN";
+    r.UpsertMapping("kvagent-node-1", cnId);
+    CertInfo cert;
+    cert.cn = "kvagent-node-1";
+    cert.spiffe_id = "not-a-spiffe-uri";  // malformed → ignored
+    auto got = r.ResolveCert(cert);
+    ASSERT_TRUE(got.has_value());
+    EXPECT_EQ(got->display_name, "via-CN");
+}
