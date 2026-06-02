@@ -49,6 +49,11 @@ type NodeDescriptor struct {
 	// on. Consumers (router, kvagent) read this to dial the node.
 	GrpcPort            uint16   `json:"grpc_port,omitempty"`
 	Version             string   `json:"version,omitempty"`
+	// Phase A2.1 — node lifecycle state. The node leaves this empty
+	// ("active"); the ViewPublisher's drain overlay sets it to
+	// "draining" in the published ClusterView so consumers (kvagent
+	// HRW resolver) can exclude it from routing.
+	State               string   `json:"state,omitempty"`
 	PinnedBytes         uint64   `json:"pinned_bytes,omitempty"`
 	DramBytes           uint64   `json:"dram_bytes,omitempty"`
 	NvmeBytes           uint64   `json:"nvme_bytes,omitempty"`

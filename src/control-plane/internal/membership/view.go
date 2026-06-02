@@ -108,11 +108,19 @@ func (p *ViewPublisher) Run(ctx context.Context) error {
 		sort.Slice(latest, func(i, j int) bool {
 			return latest[i].NodeID < latest[j].NodeID
 		})
+		// Phase A2.1 — overlay operator drain markers onto the snapshot
+		// so a drained node is published as DRAINING. Best-effort: a
+		// drain-marker read error must not block the membership view, so
+		// we skip the overlay on error (the next publish retries).
+		nodes := append([]NodeDescriptor(nil), latest...)
+		if drained, err := loadDrainedIDs(ctx, p.Registry); err == nil {
+			nodes = applyDrainOverlay(nodes, drained)
+		}
 		view := ClusterView{
 			Epoch:         p.epoch.Add(1),
 			LeaderID:      p.LeaderID,
 			PublishedAtNs: time.Now().UnixNano(),
-			Nodes:         append([]NodeDescriptor(nil), latest...),
+			Nodes:         nodes,
 		}
 		body, err := json.Marshal(&view)
 		if err != nil {

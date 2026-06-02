@@ -1,6 +1,8 @@
 // LLD §4.1 / §4.2 — ClusterViewWatcher implementation.
 #include "router/cluster_view.h"
 
+#include <cctype>
+
 #include <nlohmann/json.hpp>
 
 namespace kvcache::agent::router {
@@ -24,10 +26,23 @@ std::optional<std::vector<std::string>> ClusterViewWatcher::ParseNodeIds(
     for (const auto& node : *it) {
         if (!node.is_object()) continue;
         auto nid = node.find("node_id");
-        if (nid != node.end() && nid->is_string()) {
-            std::string id = nid->get<std::string>();
-            if (!id.empty()) ids.push_back(std::move(id));
+        if (nid == node.end() || !nid->is_string()) continue;
+        std::string id = nid->get<std::string>();
+        if (id.empty()) continue;
+        // Phase A2.1 — skip DRAINING nodes so the HRW resolver stops
+        // sending NEW prefixes to a node the operator is draining. We
+        // match case-insensitively on the substring "drain" so both
+        // the CP overlay's "draining" and the proto enum's
+        // "NODE_DRAINING" are caught. In-flight work isn't affected —
+        // the engine's existing pulls/seals to that node continue;
+        // only fresh resolution avoids it.
+        if (auto st = node.find("state");
+            st != node.end() && st->is_string()) {
+            std::string state = st->get<std::string>();
+            for (auto& c : state) c = static_cast<char>(std::tolower(c));
+            if (state.find("drain") != std::string::npos) continue;
         }
+        ids.push_back(std::move(id));
     }
     return ids;
 }

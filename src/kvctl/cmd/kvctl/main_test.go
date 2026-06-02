@@ -50,24 +50,15 @@ func TestFilterMetricsByPrefix(t *testing.T) {
 	}
 }
 
-func TestDrainStubExitsWithMessage(t *testing.T) {
-	g := &globalFlags{}
-	c := newDrainCmd(g)
-	c.SetArgs([]string{"node-x"})
-	var errOut, stdOut bytes.Buffer
-	c.SetErr(&errOut)
-	c.SetOut(&stdOut)
-	err := c.Execute()
-	if err == nil {
-		t.Fatal("drain stub must return an error")
+// Phase A2.1 — drainKey must match the CP's membership.DrainKey format
+// byte-for-byte, or kvctl writes a marker the CP never reads. This
+// guards that contract without standing up etcd.
+func TestDrainKeyMatchesCpFormat(t *testing.T) {
+	if got := drainKey("prod", "node-7"); got != "/kvcache/drain/prod/node-7" {
+		t.Errorf("drainKey = %q, want /kvcache/drain/prod/node-7", got)
 	}
-	if !strings.Contains(errOut.String(), "not yet implemented") {
-		t.Errorf("missing helpful stderr message; got: %q", errOut.String())
-	}
-	// The node id must appear in the workaround hint so users can
-	// copy-paste it without retyping.
-	if !strings.Contains(errOut.String(), "node-x") {
-		t.Errorf("workaround hint should mention the node id; got: %q", errOut.String())
+	if got := drainKey(defaultClusterID, "n"); got != "/kvcache/drain/kvcache/n" {
+		t.Errorf("drainKey default cluster = %q", got)
 	}
 }
 

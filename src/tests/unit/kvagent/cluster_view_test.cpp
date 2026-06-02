@@ -71,6 +71,21 @@ TEST(ClusterViewParseTest, SkipsEntriesMissingNodeId) {
     EXPECT_EQ((*ids)[1], "b");
 }
 
+TEST(ClusterViewParseTest, SkipsDrainingNodes) {
+    // Phase A2.1 — a node published as DRAINING is excluded from the
+    // routable set so the HRW resolver stops sending it new prefixes.
+    auto ids = ClusterViewWatcher::ParseNodeIds(R"({"nodes":[
+        {"node_id":"node-a","state":"active"},
+        {"node_id":"node-b","state":"draining"},
+        {"node_id":"node-c","state":"NODE_DRAINING"},
+        {"node_id":"node-d"}
+    ]})");
+    ASSERT_TRUE(ids.has_value());
+    ASSERT_EQ(ids->size(), 2u) << "draining + NODE_DRAINING must be skipped";
+    EXPECT_EQ((*ids)[0], "node-a");
+    EXPECT_EQ((*ids)[1], "node-d");  // no state field → kept
+}
+
 TEST(ClusterViewWatcherTest, RefreshOnceAppliesNodesToResolver) {
     HrwResolver hrw;
     EXPECT_EQ(hrw.NodeCount(), 0u);

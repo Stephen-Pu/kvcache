@@ -258,30 +258,69 @@ func newQuotaCmd(g *globalFlags) *cobra.Command {
 	return cmd
 }
 
-// ---- drain (stub) ---------------------------------------------------------
+// ---- drain ----------------------------------------------------------------
+
+// drainKey mirrors control-plane/internal/membership.DrainKey:
+//   /kvcache/drain/<cluster>/<node_id>
+func drainKey(cluster, nodeID string) string {
+	return "/kvcache/drain/" + cluster + "/" + nodeID
+}
 
 func newDrainCmd(g *globalFlags) *cobra.Command {
-	_ = g
-	return &cobra.Command{
+	var clusterID string
+	var reason string
+	cmd := &cobra.Command{
 		Use:   "drain <node_id>",
-		Short: "Initiate graceful drain (NOT YET IMPLEMENTED)",
-		Args:  cobra.ExactArgs(1),
+		Short: "Mark a node DRAINING (CP overlays it into the cluster view)",
+		Long: "Writes a drain marker to etcd. The control-plane leader " +
+			"overlays it onto /kvcache/cluster/view as State=draining; " +
+			"kvagent routers then stop sending NEW prefixes to the node. " +
+			"In-flight work finishes. Undrain by deleting the marker " +
+			"(kvctl undrain — A2.2) or removing it via etcdctl.",
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			fmt.Fprintln(cmd.ErrOrStderr(),
-				"kvctl drain: not yet implemented.")
-			fmt.Fprintln(cmd.ErrOrStderr(),
-				"  The CP gRPC ControlPlane service (Phase A-6) shipped")
-			fmt.Fprintln(cmd.ErrOrStderr(),
-				"  Register + Heartbeat but no node-state-mutation RPC.")
-			fmt.Fprintln(cmd.ErrOrStderr(),
-				"  Workaround: edit /kvcache/nodes/"+args[0]+" directly")
-			fmt.Fprintln(cmd.ErrOrStderr(),
-				"  via etcdctl and set state=DRAINING. CP-side drain")
-			fmt.Fprintln(cmd.ErrOrStderr(),
-				"  workflow lands in Phase A2.1.")
-			return fmt.Errorf("drain RPC not yet implemented (see message above)")
+			nodeID := args[0]
+			cli, err := g.etcd()
+			if err != nil {
+				return fmt.Errorf("dial etcd: %w", err)
+			}
+			defer cli.Close()
+			ctx, cancel := context.WithTimeout(cmd.Context(), g.timeout)
+			defer cancel()
+
+			// Validate the node exists before draining — a typo'd node id
+			// would otherwise write a marker that never matches anything.
+			nodeKey := "/kvcache/nodes/" + nodeID
+			resp, err := cli.Get(ctx, nodeKey)
+			if err != nil {
+				return fmt.Errorf("get %s: %w", nodeKey, err)
+			}
+			if len(resp.Kvs) == 0 {
+				return fmt.Errorf("node %q not registered (no %s)", nodeID, nodeKey)
+			}
+
+			marker, _ := json.Marshal(map[string]any{
+				"node_id":         nodeID,
+				"reason":          reason,
+				"requested_at_ns": time.Now().UnixNano(),
+			})
+			key := drainKey(clusterID, nodeID)
+			if _, err := cli.Put(ctx, key, string(marker)); err != nil {
+				return fmt.Errorf("put %s: %w", key, err)
+			}
+			fmt.Fprintf(cmd.OutOrStdout(),
+				"drain marker written: %s\n"+
+					"  the CP will publish %s as DRAINING within one view tick;\n"+
+					"  kvagent routers stop sending new prefixes there.\n",
+				key, nodeID)
+			return nil
 		},
 	}
+	cmd.Flags().StringVar(&clusterID, "cluster", defaultClusterID,
+		"cluster id (matches the CP --cluster flag)")
+	cmd.Flags().StringVar(&reason, "reason", "operator drain via kvctl",
+		"free-text reason recorded in the drain marker")
+	return cmd
 }
 
 // ---- trace (stub) ---------------------------------------------------------
