@@ -28,6 +28,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <string>
@@ -35,6 +37,7 @@
 #include <vector>
 
 #include "bloom_view/bloom_view.h"
+#include "router/cluster_view.h"
 #include "router/hrw_resolver.h"
 #include "router/router.h"
 #include "routing_cache/routing_cache.h"
@@ -172,6 +175,30 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "kvagent: HRW resolver seeded with %zu node(s)\n",
                      hrw.NodeCount());
     }
+
+    // Phase A1.8 — keep the node set fresh from the CP's published
+    // cluster view. The Loader reads the JSON snapshot the leader
+    // writes to etcd /kvcache/cluster/view. We don't link an etcd
+    // client into the agent yet (A1.9), so the loader reads a file the
+    // deployment refreshes (KVCACHE_CLUSTER_VIEW_FILE) — a sidecar /
+    // initContainer can `etcdctl get` into it, or a future in-process
+    // etcd client replaces this hook. Absent the env, the watcher
+    // isn't started and the KVCACHE_NODES seed above stands.
+    std::unique_ptr<router::ClusterViewWatcher> view_watcher;
+    if (const char* view_file = std::getenv("KVCACHE_CLUSTER_VIEW_FILE")) {
+        std::string path(view_file);
+        router::ClusterViewWatcher::Options vopts;
+        vopts.loader = [path]() -> std::optional<std::string> {
+            std::ifstream in(path, std::ios::binary);
+            if (!in) return std::string{};  // absent → empty set, not error
+            return std::string(std::istreambuf_iterator<char>(in),
+                               std::istreambuf_iterator<char>());
+        };
+        view_watcher = std::make_unique<router::ClusterViewWatcher>(hrw, vopts);
+        view_watcher->Start();
+        std::fprintf(stderr, "kvagent: cluster-view watcher polling %s\n", path.c_str());
+    }
+
     router::RequestRouter request_router(rcache, bloom, hrw.AsCallback());
 
     std::vector<uint8_t> buf;
@@ -187,6 +214,7 @@ int main(int argc, char** argv) {
     }
 
     std::fprintf(stderr, "kvagent: shutting down\n");
+    if (view_watcher) view_watcher->Stop();
     bloom.Stop();
     // SqCq dtors unlink the shm files since we created them.
     return 0;

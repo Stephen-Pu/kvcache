@@ -10,6 +10,7 @@ set(KVAGENT_LIB_SRCS
     src/bloom_view/bloom_view.cpp
     src/router/router.cpp
     src/router/hrw_resolver.cpp
+    src/router/cluster_view.cpp
     # BloomView wraps kvcache::node::routing::AggregatedBloom and the
     # HrwResolver (Phase A1.7) wraps kvcache::node::routing::HrwRing —
     # pull in those TUs so the agent lib is self-contained at link time.
@@ -31,6 +32,8 @@ target_include_directories(kvagent_lib
 target_link_libraries(kvagent_lib
     PUBLIC
         kvcache_common
+        # Phase A1.8 — ClusterViewWatcher parses the CP's JSON view.
+        nlohmann_json::nlohmann_json
 )
 
 add_executable(kvagent src/main.cpp)
