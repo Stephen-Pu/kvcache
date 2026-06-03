@@ -9,13 +9,10 @@
 #include <cstring>
 #include <string>
 
-#include <cstdlib>
-
 #include "ctx_options.h"  // Phase ABI-1 — BuildCtxOptions
 #include "headless_node.h"
 #include "kvcache/kv_errors.h"
 #include "metrics.h"  // Phase G-3 — kv_metrics_scrape ABI
-#include "transport/nixl_wrapper.h"
 
 extern "C" {
 

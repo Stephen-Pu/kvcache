@@ -6,6 +6,9 @@ build-*/
 *.dylib
 *.a
 
+# Local scratch / run output (never committed)
+output/
+
 # Go
 bin/
 vendor/
