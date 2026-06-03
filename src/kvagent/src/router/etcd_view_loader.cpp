@@ -25,4 +25,33 @@ ViewLoader MakeEtcdViewLoader(kvcache::node::cluster::IEtcdClient& etcd,
     };
 }
 
+// ----- Phase A1.11 — Watch subscription ------------------------------------
+
+EtcdViewSubscription::EtcdViewSubscription(
+    kvcache::node::cluster::IEtcdClient& etcd,
+    std::function<void()> on_change, std::string key)
+    : etcd_(etcd), on_change_(std::move(on_change)), key_(std::move(key)) {}
+
+EtcdViewSubscription::~EtcdViewSubscription() { Stop(); }
+
+void EtcdViewSubscription::Start() {
+    if (watching_) return;
+    // WatchPrefix on the exact key (a key is a prefix of itself) delivers
+    // both Put (view republished) and Delete (view key expired with the
+    // leader's lease) events. We don't inspect the event — any change to
+    // the view key means "re-read it", which on_change does.
+    handle_ = etcd_.WatchPrefix(
+        key_, [this](const kvcache::node::cluster::WatchEvent&) {
+            if (on_change_) on_change_();
+        });
+    watching_ = true;
+}
+
+void EtcdViewSubscription::Stop() {
+    if (watching_) {
+        etcd_.Unwatch(handle_);
+        watching_ = false;
+    }
+}
+
 }  // namespace kvcache::agent::router

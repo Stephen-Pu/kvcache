@@ -21,8 +21,10 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
@@ -74,6 +76,16 @@ class ClusterViewWatcher {
     void Start();
     void Stop();
 
+    // Phase A1.11 — wake the refresh loop to RefreshOnce NOW instead of
+    // waiting for the next poll tick. SAFE to call from any thread,
+    // including an etcd watch-dispatch thread: it only signals a
+    // condition variable; the actual etcd Get happens on the loop
+    // thread. This is the crucial decoupling — calling RefreshOnce
+    // (which does etcd.Get) directly from a watch callback can
+    // re-enter the etcd client under its own lock and deadlock
+    // (InMemoryEtcdClient dispatches callbacks while holding its mutex).
+    void RequestRefresh();
+
     struct Stats {
         uint64_t refreshes_ok     = 0;
         uint64_t refreshes_failed = 0;
@@ -88,6 +100,13 @@ class ClusterViewWatcher {
     Options            opts_;
     std::atomic<bool>  running_{false};
     std::thread        thread_;
+
+    // Wake channel for RequestRefresh — the loop waits on wake_cv_ with
+    // the poll interval as a timeout, so it fires on whichever comes
+    // first: an external request or the periodic tick.
+    std::mutex              wake_mu_;
+    std::condition_variable wake_cv_;
+    bool                    refresh_requested_ = false;
 
     mutable std::atomic<uint64_t> refreshes_ok_{0};
     mutable std::atomic<uint64_t> refreshes_failed_{0};

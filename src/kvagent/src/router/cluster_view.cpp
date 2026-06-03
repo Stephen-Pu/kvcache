@@ -77,25 +77,43 @@ void ClusterViewWatcher::Start() {
 
 void ClusterViewWatcher::Stop() {
     running_.store(false, std::memory_order_relaxed);
+    {
+        // Wake the loop so it observes running_=false and exits its wait
+        // instead of blocking up to a full poll interval.
+        std::lock_guard<std::mutex> lk(wake_mu_);
+        refresh_requested_ = true;
+    }
+    wake_cv_.notify_all();
     if (thread_.joinable()) thread_.join();
 }
 
 ClusterViewWatcher::~ClusterViewWatcher() { Stop(); }
 
+void ClusterViewWatcher::RequestRefresh() {
+    {
+        std::lock_guard<std::mutex> lk(wake_mu_);
+        refresh_requested_ = true;
+    }
+    wake_cv_.notify_one();
+}
+
 void ClusterViewWatcher::RefreshLoop() {
-    // Refresh immediately on start so the resolver has a node set
-    // before the first interval elapses, then on each tick. We sleep in
-    // small slices so Stop() is responsive (doesn't block a full
-    // interval).
+    // Refresh immediately on start so the resolver has a node set before
+    // the first interval elapses, then on each tick OR each external
+    // RequestRefresh (whichever comes first). Waiting on the cv — rather
+    // than sleeping in slices — means a watch-driven RequestRefresh wakes
+    // us within microseconds, while the interval timeout still fires the
+    // periodic poll as a safety net.
     RefreshOnce();
-    const auto slice = std::chrono::milliseconds(100);
-    auto next = std::chrono::steady_clock::now() + opts_.refresh_interval;
     while (running_.load(std::memory_order_relaxed)) {
-        std::this_thread::sleep_for(slice);
-        if (std::chrono::steady_clock::now() >= next) {
-            RefreshOnce();
-            next = std::chrono::steady_clock::now() + opts_.refresh_interval;
+        {
+            std::unique_lock<std::mutex> lk(wake_mu_);
+            wake_cv_.wait_for(lk, opts_.refresh_interval,
+                              [this] { return refresh_requested_; });
+            refresh_requested_ = false;
         }
+        if (!running_.load(std::memory_order_relaxed)) break;
+        RefreshOnce();
     }
 }
 

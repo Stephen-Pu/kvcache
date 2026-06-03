@@ -234,6 +234,19 @@ int main(int argc, char** argv) {
         view_watcher->Start();
     }
 
+    // Phase A1.11 — when reading the view from etcd, also subscribe to a
+    // WatchPrefix on the view key so a CP publish triggers an immediate
+    // RefreshOnce instead of waiting up to the poll interval. The poll
+    // (above) stays as the safety net. Declared after view_watcher so it
+    // destructs first (stop the watch before the watcher it pokes).
+    std::unique_ptr<router::EtcdViewSubscription> view_sub;
+    if (etcd_client && view_watcher) {
+        view_sub = std::make_unique<router::EtcdViewSubscription>(
+            *etcd_client, [&] { view_watcher->RequestRefresh(); });
+        view_sub->Start();
+        std::fprintf(stderr, "kvagent: cluster-view watch subscription active\n");
+    }
+
     router::RequestRouter request_router(rcache, bloom, hrw.AsCallback());
 
     std::vector<uint8_t> buf;
@@ -249,6 +262,7 @@ int main(int argc, char** argv) {
     }
 
     std::fprintf(stderr, "kvagent: shutting down\n");
+    if (view_sub) view_sub->Stop();      // unsubscribe before the watcher goes
     if (view_watcher) view_watcher->Stop();
     bloom.Stop();
     // SqCq dtors unlink the shm files since we created them.

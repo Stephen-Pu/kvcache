@@ -9,7 +9,10 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <chrono>
 #include <string>
+#include <thread>
 
 #include "cluster/etcd_client.h"
 #include "router/cluster_view.h"
@@ -78,6 +81,69 @@ TEST(EtcdViewLoaderTest, LiveUpdateFollowedOnRefresh) {
                          nullptr, &err)) << err;
     EXPECT_EQ(w.RefreshOnce(), 3);
     EXPECT_EQ(hrw.NodeCount(), 3u);
+}
+
+// Phase A1.11 — Watch subscription: a Put on the view key must fire the
+// on_change callback (which in production calls watcher.RefreshOnce),
+// so view changes propagate without waiting for the poll tick. Driven
+// against the real in-process InMemoryEtcdClient.
+TEST(EtcdViewSubscriptionTest, FiresOnChangeOnViewPut) {
+    using kvcache::agent::router::EtcdViewSubscription;
+    using kvcache::agent::router::kClusterViewKey;
+
+    InMemoryEtcdClient etcd;
+    std::atomic<int> fired{0};
+    EtcdViewSubscription sub(etcd, [&] { fired.fetch_add(1, std::memory_order_relaxed); });
+    sub.Start();
+
+    std::string err;
+    ASSERT_TRUE(etcd.Put(kClusterViewKey, kViewJson,
+                         kvcache::node::cluster::kNoLease, nullptr, &err)) << err;
+
+    // The watch callback runs on the etcd dispatch thread — poll for it.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (fired.load() == 0 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    EXPECT_GE(fired.load(), 1) << "view Put should fire the subscription";
+
+    sub.Stop();
+    // After Stop, a further Put must not fire.
+    const int before = fired.load();
+    ASSERT_TRUE(etcd.Put(kClusterViewKey, kViewJson,
+                         kvcache::node::cluster::kNoLease, nullptr, &err)) << err;
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    EXPECT_EQ(fired.load(), before) << "stopped subscription must not fire";
+}
+
+TEST(EtcdViewSubscriptionTest, EndToEndWatchUpdatesResolver) {
+    using kvcache::agent::router::EtcdViewSubscription;
+    using kvcache::agent::router::kClusterViewKey;
+
+    InMemoryEtcdClient etcd;
+    HrwResolver hrw;
+    ClusterViewWatcher::Options opts;
+    opts.loader = MakeEtcdViewLoader(etcd);
+    ClusterViewWatcher w(hrw, opts);
+    // The watcher's loop thread services RequestRefresh. The subscription
+    // callback calls RequestRefresh (NOT RefreshOnce) — it must not
+    // re-enter etcd.Get from the watch-dispatch thread, which holds the
+    // InMemoryEtcdClient mutex and would deadlock. RequestRefresh only
+    // signals; the loop thread does the Get.
+    w.Start();
+    EtcdViewSubscription sub(etcd, [&] { w.RequestRefresh(); });
+    sub.Start();
+
+    std::string err;
+    ASSERT_TRUE(etcd.Put(kClusterViewKey, kViewJson,
+                         kvcache::node::cluster::kNoLease, nullptr, &err)) << err;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (hrw.NodeCount() == 0 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    EXPECT_EQ(hrw.NodeCount(), 2u) << "watch-driven refresh should populate the resolver";
+    sub.Stop();
+    w.Stop();
 }
 
 // Phase A1.10 — the REAL cross-process client (HttpEtcdClient) is now
