@@ -239,6 +239,17 @@ kvcache_add_test(test_g6_alert_thresholds
                   abi/g6_alert_thresholds_test.cpp)
 target_link_libraries(test_g6_alert_thresholds PRIVATE kvcache)
 
+# Phase ABI-1 — BuildCtxOptions is pure (no HeadlessNode singleton), so the
+# test compiles the TU directly instead of linking the kvcache dylib. Needs
+# the core-abi + kvstore-node src include paths for ctx_options.h /
+# headless_node.h (Options struct only — no node methods are called).
+kvcache_add_test(test_ctx_options
+                  abi/ctx_options_test.cpp
+                  ${CMAKE_SOURCE_DIR}/core-abi/src/ctx_options.cpp)
+target_include_directories(test_ctx_options PRIVATE
+                  ${CMAKE_SOURCE_DIR}/core-abi/src
+                  ${CMAKE_SOURCE_DIR}/kvstore-node/src)
+
 # Phase M-1: gRPC NodeData service tests. Only built when grpc is
 # present (the service impl + its headers don't exist otherwise).
 if(KVCACHE_HAVE_GRPC)

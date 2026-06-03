@@ -11,6 +11,7 @@
 
 #include <cstdlib>
 
+#include "ctx_options.h"  // Phase ABI-1 — BuildCtxOptions
 #include "headless_node.h"
 #include "kvcache/kv_errors.h"
 #include "metrics.h"  // Phase G-3 — kv_metrics_scrape ABI
@@ -50,47 +51,14 @@ uint64_t Fnv1a64(const std::string& s) {
     return h;
 }
 
-// Phase M-4 — read NIXL backend selection from the environment so
-// tests (and on-prem operators) can flip "loopback" -> "tcp" without
-// recompiling. Defaults match the demo / unit-test path.
-void ApplyNixlEnvOverrides(kvcache::abi::HeadlessNode::Options* opts) {
-    if (const char* b = std::getenv("KVCACHE_NIXL_BACKEND"); b && *b) {
-        opts->nixl_backend = b;
-    }
-    if (const char* h = std::getenv("KVCACHE_NIXL_BIND_HOST"); h && *h) {
-        opts->nixl_bind_host = h;
-    }
-    if (const char* p = std::getenv("KVCACHE_NIXL_BIND_PORT"); p && *p) {
-        opts->nixl_bind_port = static_cast<uint32_t>(std::atoi(p));
-    }
-    // Phase S-6 — segment-size knob for the priority-preemption bench.
-    // Presence (even "0") counts as an explicit override.
-    if (const char* s = std::getenv("KVCACHE_NIXL_SEGMENT_BYTES"); s && *s) {
-        opts->nixl_segment_bytes_set = true;
-        opts->nixl_segment_bytes =
-            static_cast<uint64_t>(std::strtoull(s, nullptr, 10));
-    }
-}
-
 }  // namespace
 
 KV_API int kv_ctx_open(const kv_ctx_config_t* cfg, kv_ctx_t** out_ctx) {
     if (!cfg || !out_ctx) return KV_E_INVAL;
     if (cfg->abi_version != KVCACHE_ABI_VERSION) return KV_E_VERSION_MISMATCH;
 
-    kvcache::abi::HeadlessNode::Options opts{};
-    // Sensible defaults for headless / demo bring-up. Production callers
-    // override via environment variables (TODO(stephen): expose options on
-    // kv_ctx_config_t).
-    opts.tier.pinned.pool_bytes = 32ull << 20;   // 32 MiB
-    opts.tier.pinned.slot_bytes =  4ull << 20;   //  4 MiB per slot
-    opts.tier.pinned.use_mlock  = false;
-    opts.tier.dram.capacity_bytes    = 64ull << 20;
-    opts.tier.dram.a1out_max_entries = 1024;
-    opts.tier.enable_nvme = false;
-    opts.tier.enable_cold = false;
-    opts.nixl_backend = "loopback";
-    ApplyNixlEnvOverrides(&opts);
+    // Defaults → env overrides → explicit kv_ctx_tuning_t (Phase ABI-1).
+    auto opts = kvcache::abi::BuildCtxOptions(cfg->tuning);
 
     std::string err;
     auto* node = kvcache::abi::HeadlessNode::GetOrCreate(opts, &err);
@@ -116,17 +84,9 @@ KV_API int kv_ctx_open_from_hashes(int32_t abi_version,
 
     // Same headless-node singleton as kv_ctx_open; identity is carried
     // entirely through ctx->tenant_id_hash + ctx->model_id_hash so the
-    // string fields stay empty.
-    kvcache::abi::HeadlessNode::Options opts{};
-    opts.tier.pinned.pool_bytes = 32ull << 20;
-    opts.tier.pinned.slot_bytes =  4ull << 20;
-    opts.tier.pinned.use_mlock  = false;
-    opts.tier.dram.capacity_bytes    = 64ull << 20;
-    opts.tier.dram.a1out_max_entries = 1024;
-    opts.tier.enable_nvme = false;
-    opts.tier.enable_cold = false;
-    opts.nixl_backend = "loopback";
-    ApplyNixlEnvOverrides(&opts);
+    // string fields stay empty. This entry point has no config struct, so
+    // it uses defaults + env only (no per-call tuning).
+    auto opts = kvcache::abi::BuildCtxOptions(nullptr);
 
     std::string err;
     auto* node = kvcache::abi::HeadlessNode::GetOrCreate(opts, &err);

@@ -18,7 +18,7 @@ from typing import Sequence
 
 from . import _ffi
 
-_ABI_VERSION = 1
+_ABI_VERSION = 2  # ABI-1: kv_ctx_config_t gained the trailing `tuning` pointer
 _CHUNK_TOKENS = 16  # LLD §3.2
 
 

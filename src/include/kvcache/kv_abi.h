@@ -22,12 +22,40 @@
 extern "C" {
 #endif
 
-/* ABI version. Bumped on any change to struct layouts or function semantics. */
-#define KVCACHE_ABI_VERSION 1
+/* ABI version. Bumped on any change to struct layouts or function semantics.
+ * v2 (Phase ABI-1): kv_ctx_config_t gained the trailing `tuning` pointer. */
+#define KVCACHE_ABI_VERSION 2
 
 /* ------------------------------------------------------------------------- */
 /* Context lifecycle                                                         */
 /* ------------------------------------------------------------------------- */
+
+/*
+ * kv_ctx_tuning_t — optional knobs for the in-process backend (Phase ABI-1).
+ * Previously these were settable only via KVCACHE_NIXL_* environment
+ * variables (and the tier sizes not at all — they were hardcoded). A caller
+ * passes this through kv_ctx_config_t::tuning; a NULL tuning pointer keeps
+ * the historical env-driven + hardcoded-default behaviour.
+ *
+ * Precedence per field: built-in default  <  environment variable  <  this
+ * struct (an explicit non-default value here wins over the ambient env).
+ * "Unset" sentinels: NULL for string fields, 0 for the integer sizes/port.
+ * nixl_segment_bytes is special — 0 is a meaningful value (disable
+ * segmentation) — so it is applied only when nixl_segment_bytes_set != 0.
+ *
+ * NOTE: the backend is a process singleton created on the FIRST kv_ctx_open;
+ * tuning supplied on later opens (while a node already exists) is ignored.
+ */
+typedef struct {
+    const char* nixl_backend;           /* "loopback" | "tcp"; NULL = default/env */
+    const char* nixl_bind_host;         /* NULL = default/env                     */
+    uint32_t    nixl_bind_port;         /* 0 = default/env                        */
+    uint64_t    nixl_segment_bytes;     /* applied iff nixl_segment_bytes_set      */
+    int32_t     nixl_segment_bytes_set; /* 0 = leave default/env                  */
+    uint64_t    pinned_pool_bytes;      /* pinned-tier pool size;  0 = default     */
+    uint64_t    pinned_slot_bytes;      /* pinned-tier slot size;  0 = default     */
+    uint64_t    dram_capacity_bytes;    /* DRAM tier capacity;     0 = default     */
+} kv_ctx_tuning_t;
 
 typedef struct {
     int32_t      abi_version;     /* must equal KVCACHE_ABI_VERSION         */
@@ -35,6 +63,7 @@ typedef struct {
     const char*  tenant_id;       /* mTLS-validated tenant identifier       */
     const char*  model_id;        /* canonical model_id (LLD §2.1)          */
     uint32_t     flags;           /* reserved                               */
+    const kv_ctx_tuning_t* tuning;/* optional backend knobs; NULL = defaults */
 } kv_ctx_config_t;
 
 int kv_ctx_open (const kv_ctx_config_t* cfg, kv_ctx_t** out_ctx);

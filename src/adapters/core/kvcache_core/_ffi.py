@@ -50,11 +50,23 @@ typedef struct {
 } kv_locator_t;
 
 typedef struct {
+    const char* nixl_backend;
+    const char* nixl_bind_host;
+    uint32_t    nixl_bind_port;
+    uint64_t    nixl_segment_bytes;
+    int32_t     nixl_segment_bytes_set;
+    uint64_t    pinned_pool_bytes;
+    uint64_t    pinned_slot_bytes;
+    uint64_t    dram_capacity_bytes;
+} kv_ctx_tuning_t;
+
+typedef struct {
     int32_t      abi_version;
     const char*  agent_endpoint;
     const char*  tenant_id;
     const char*  model_id;
     uint32_t     flags;
+    const kv_ctx_tuning_t* tuning;
 } kv_ctx_config_t;
 
 int kv_ctx_open (const kv_ctx_config_t* cfg, kv_ctx_t** out_ctx);

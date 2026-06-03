@@ -9,6 +9,7 @@ add_library(kvcache SHARED
     src/kv_abi.cpp
     src/kv_status.cpp
     src/headless_node.cpp
+    src/ctx_options.cpp
 )
 
 target_include_directories(kvcache
