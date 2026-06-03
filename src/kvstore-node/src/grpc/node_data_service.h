@@ -47,6 +47,7 @@
 namespace kvcache::node::cluster { class NodeDirectory; }
 namespace kvcache::node::cluster { class BloomPublisher; }
 namespace kvcache::node::cluster { class DrainGate; }
+namespace kvcache::node::security { class MtlsRegistry; }
 namespace kvcache::node::routing { class HrwRing; }
 
 namespace kvcache::node::grpc_server {
@@ -101,6 +102,16 @@ class NodeDataServiceImpl final : public kvcache::proto::NodeData::Service {
     // a per-tenant leaf. Opt-in so existing TLS tests (whose certs
     // use a generic CN) keep passing. Defaults to OFF.
     void EnableTenantCertBinding(bool enable);
+
+    // Phase B8.2 — point the tenant-cert binding at an MtlsRegistry for
+    // SPIFFE-first / table-driven tenant resolution. When set, the
+    // binding resolves the peer cert's authoritative tenant via
+    // MtlsRegistry::ResolveTenant (table → SPIFFE-path → CN); when
+    // nullptr (default) it still resolves via SPIFFE-path → CN, so a
+    // SPIFFE-SAN cert works even without a published table and a plain
+    // CN cert keeps the historical behaviour. The registry must outlive
+    // the service.
+    void SetMtlsRegistry(const security::MtlsRegistry* reg) { mtls_registry_ = reg; }
 
     // Phase A2.3 — point Reserve at a DrainGate. When the gate reports
     // draining, Reserve rejects NEW writes with FAILED_PRECONDITION so
@@ -218,6 +229,10 @@ class NodeDataServiceImpl final : public kvcache::proto::NodeData::Service {
 
     // Phase A2.3 — optional drain gate (owned elsewhere; see SetDrainGate).
     const cluster::DrainGate*                drain_gate_ = nullptr;
+
+    // Phase B8.2 — optional mTLS registry for table-driven tenant
+    // resolution (owned elsewhere; see SetMtlsRegistry).
+    const security::MtlsRegistry*            mtls_registry_ = nullptr;
 
     // Per-peer NodeData stub cache. The Channel keeps itself reusable
     // across RPCs; the stub is light-weight on top.

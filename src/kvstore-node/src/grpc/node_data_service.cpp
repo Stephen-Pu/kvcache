@@ -28,6 +28,7 @@
 #include "cluster/bloom_publisher.h"  // SketchKeyForTokens
 #include "cluster/drain_gate.h"       // Phase A2.3 — Reserve gate
 #include "cluster/node_directory.h"
+#include "security/mtls.h"            // Phase B8.2 — ResolveTenant
 #include "kvcache/kv_errors.h"
 #include "kvcache/kv_types.h"
 #include "routing/hrw.h"
@@ -189,6 +190,35 @@ static std::string ClientCertCN(::grpc::ServerContext* ctx) {
     if (props.empty()) return {};
     const auto& p = props.front();
     return std::string(p.data(), p.size());
+}
+
+// Phase B8.2 — build a security::CertInfo from the gRPC peer auth
+// context: the subject CN plus every URI SubjectAltName, with the first
+// spiffe:// URI lifted into spiffe_id. This is the runtime (handshake)
+// source of the same CertInfo that security::MtlsRegistry::ParsePem
+// produces offline — so the tenant-resolution decision is identical
+// whether the cert came off the wire or out of a PEM file.
+static security::CertInfo ClientCertInfo(::grpc::ServerContext* ctx) {
+    security::CertInfo info;
+    if (!ctx) return info;
+    auto ac = ctx->auth_context();
+    if (!ac) return info;
+    if (auto cn = ac->FindPropertyValues("x509_common_name"); !cn.empty()) {
+        info.cn.assign(cn.front().data(), cn.front().size());
+    }
+    // gRPC exposes each SAN under "x509_subject_alternative_name". URI
+    // SANs come through as the raw URI (e.g. "spiffe://td/..."); DNS SANs
+    // as the hostname. We can't tell the type apart from the property, so
+    // we treat any spiffe://-prefixed value as the SPIFFE URI and collect
+    // the rest as uri_sans best-effort.
+    for (const auto& san : ac->FindPropertyValues("x509_subject_alternative_name")) {
+        std::string v(san.data(), san.size());
+        if (v.rfind("spiffe://", 0) == 0) {
+            if (!info.spiffe_id) info.spiffe_id = v;
+            info.uri_sans.push_back(std::move(v));
+        }
+    }
+    return info;
 }
 
 void NodeDataServiceImpl::EnableMtlsClient(std::string ca_pem,
@@ -392,15 +422,19 @@ kv_ctx_t* NodeDataServiceImpl::CtxForHandle(uint64_t h) {
     // a chicken-and-egg loop.
     if (tenant_cert_binding_enabled_.load(std::memory_order_relaxed) &&
         !already_forwarded) {
-        const std::string cn = ClientCertCN(context);
-        if (cn.empty()) {
+        // Phase B8.2 — resolve the cert's authoritative tenant via the
+        // table → SPIFFE-path → CN precedence, then require it matches
+        // the request. Replaces the raw CN==tenant_id check.
+        const security::CertInfo cert = ClientCertInfo(context);
+        auto tenant = security::MtlsRegistry::ResolveTenant(cert, mtls_registry_);
+        if (!tenant.has_value()) {
             return {::grpc::StatusCode::UNAUTHENTICATED,
-                     "Lookup: client cert required for tenant binding"};
+                     "Lookup: client cert carries no resolvable tenant identity"};
         }
-        if (cn != request->tenant_id()) {
+        if (*tenant != request->tenant_id()) {
             return {::grpc::StatusCode::UNAUTHENTICATED,
-                     "Lookup: client cert CN '" + cn +
-                         "' does not match tenant_id '" +
+                     "Lookup: cert tenant '" + *tenant +
+                         "' does not match request tenant_id '" +
                          request->tenant_id() + "'"};
         }
     }
@@ -555,20 +589,26 @@ kv_ctx_t* NodeDataServiceImpl::CtxForHandle(uint64_t h) {
     // "tenant-b"'s namespace by handing in the right Locator bytes.
     if (tenant_cert_binding_enabled_.load(std::memory_order_relaxed) &&
         !already_forwarded) {
-        const std::string cn = ClientCertCN(context);
-        if (cn.empty()) {
+        // Phase B8.2 — resolve the cert's authoritative tenant (table →
+        // SPIFFE-path → CN), then require SHA-1(tenant)[:16] equals the
+        // wire's 16-byte Locator.tenant_id. Same byte-binding the engine
+        // computes from its tenant string; only the source of the tenant
+        // string changed (was: raw CN).
+        const security::CertInfo cert = ClientCertInfo(context);
+        auto tenant = security::MtlsRegistry::ResolveTenant(cert, mtls_registry_);
+        if (!tenant.has_value()) {
             return {::grpc::StatusCode::UNAUTHENTICATED,
-                     "Reserve: client cert required for tenant binding"};
+                     "Reserve: client cert carries no resolvable tenant identity"};
         }
         uint8_t expected[SHA_DIGEST_LENGTH];
-        SHA1(reinterpret_cast<const uint8_t*>(cn.data()), cn.size(),
+        SHA1(reinterpret_cast<const uint8_t*>(tenant->data()), tenant->size(),
               expected);
         const std::string& got = request->locator().tenant_id();
         if (got.size() < 16 ||
             std::memcmp(got.data(), expected, 16) != 0) {
             return {::grpc::StatusCode::UNAUTHENTICATED,
                      "Reserve: Locator.tenant_id does not match "
-                     "SHA-1(CN '" + cn + "')[:16]"};
+                     "SHA-1(cert tenant '" + *tenant + "')[:16]"};
         }
     }
     if (ring_ && !already_forwarded && !self_node_id_.empty()) {

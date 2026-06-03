@@ -49,6 +49,12 @@ struct Identity {
     std::string             cn;
     std::array<uint8_t, 16> tenant_id{};
     std::string             display_name;
+    // Phase B8.2 — the authoritative tenant string this identity is
+    // entitled to act as (the value an engine passes as the request's
+    // tenant_id). The CP populates it in the spiffe_id→Identity /
+    // CN→Identity tables. Empty for non-tenant identities (internal /
+    // admin certs).
+    std::string             tenant;
 };
 
 class MtlsRegistry {
@@ -98,6 +104,28 @@ class MtlsRegistry {
         std::string path;  // leading '/' included; empty for bare domain
     };
     static std::optional<SpiffeId> ParseSpiffeId(const std::string& uri);
+
+    // Phase B8.2 — SPIFFE workload-path tenant convention. Given a
+    // SPIFFE id whose path embeds a tenant as `…/tenant/<id>[/…]`,
+    // return <id>. Used as a no-table-needed resolution path: a SPIFFE
+    // id of `spiffe://td/ns/x/tenant/acme/workload/w` resolves to tenant
+    // "acme". Returns nullopt when the path carries no `/tenant/<id>`
+    // segment. The `uri` is the full `spiffe://…` string (it parses it).
+    static std::optional<std::string> TenantFromSpiffePath(const std::string& uri);
+
+    // Phase B8.2 — resolve the authoritative tenant a peer cert is
+    // entitled to act as, in precedence order:
+    //   1. registry table   — registry!=nullptr && ResolveCert(cert)
+    //                          yields an Identity with a non-empty
+    //                          .tenant (the CP-published mapping).
+    //   2. SPIFFE path       — cert.spiffe_id embeds `/tenant/<id>`.
+    //   3. CN                — cert.cn (the historical Scheme-C form).
+    // Returns nullopt when none resolve (cert carries no usable
+    // identity → caller rejects as UNAUTHENTICATED). Static + free of
+    // grpc so the binding decision is unit-testable without a TLS
+    // handshake.
+    static std::optional<std::string> ResolveTenant(const CertInfo& cert,
+                                                     const MtlsRegistry* registry);
 
     // Phase B8 — full leaf-cert parse. When built with OpenSSL
     // (KVCACHE_HAVE_OPENSSL), this does a real PEM → X509 decode and

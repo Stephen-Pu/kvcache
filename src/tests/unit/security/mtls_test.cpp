@@ -235,3 +235,78 @@ TEST(SpiffeAuthzTest, MalformedSpiffeIgnoredFallsBackToCn) {
     ASSERT_TRUE(got.has_value());
     EXPECT_EQ(got->display_name, "via-CN");
 }
+
+// ===== Phase B8.2 — ResolveTenant (binding decision) =======================
+
+TEST(TenantFromSpiffePathTest, ExtractsTenantSegment) {
+    EXPECT_EQ(*MtlsRegistry::TenantFromSpiffePath(
+                  "spiffe://kvcache.example/tenant/acme"), "acme");
+    EXPECT_EQ(*MtlsRegistry::TenantFromSpiffePath(
+                  "spiffe://kvcache.example/ns/x/tenant/acme/workload/w"), "acme");
+}
+
+TEST(TenantFromSpiffePathTest, NulloptWhenNoTenantSegment) {
+    EXPECT_FALSE(MtlsRegistry::TenantFromSpiffePath(
+                     "spiffe://kvcache.example/workload/w").has_value());
+    EXPECT_FALSE(MtlsRegistry::TenantFromSpiffePath("not-a-spiffe").has_value());
+    EXPECT_FALSE(MtlsRegistry::TenantFromSpiffePath(
+                     "spiffe://kvcache.example/tenant/").has_value());  // empty id
+}
+
+TEST(ResolveTenantTest, CnFallbackWhenNoRegistryNoSpiffe) {
+    CertInfo cert;
+    cert.cn = "tenant-a";
+    auto t = MtlsRegistry::ResolveTenant(cert, /*registry=*/nullptr);
+    ASSERT_TRUE(t.has_value());
+    EXPECT_EQ(*t, "tenant-a");  // historical Scheme-C: CN IS the tenant
+}
+
+TEST(ResolveTenantTest, SpiffePathBeatsCnWhenNoRegistry) {
+    CertInfo cert;
+    cert.cn = "cn-tenant";
+    cert.spiffe_id = "spiffe://kvcache.example/tenant/spiffe-tenant";
+    auto t = MtlsRegistry::ResolveTenant(cert, nullptr);
+    ASSERT_TRUE(t.has_value());
+    EXPECT_EQ(*t, "spiffe-tenant") << "SPIFFE path must win over CN";
+}
+
+TEST(ResolveTenantTest, RegistryTableBeatsSpiffePathAndCn) {
+    MtlsRegistry r;
+    Identity id;
+    id.tenant = "table-tenant";
+    r.UpsertSpiffeMapping("spiffe://kvcache.example/node/n1", id);
+
+    CertInfo cert;
+    cert.cn = "cn-tenant";
+    cert.spiffe_id = "spiffe://kvcache.example/node/n1";  // mapped, no /tenant/ seg
+    auto t = MtlsRegistry::ResolveTenant(cert, &r);
+    ASSERT_TRUE(t.has_value());
+    EXPECT_EQ(*t, "table-tenant") << "registry table is highest precedence";
+}
+
+TEST(ResolveTenantTest, FallsThroughTableMissToSpiffePath) {
+    MtlsRegistry r;  // empty table
+    CertInfo cert;
+    cert.cn = "cn-tenant";
+    cert.spiffe_id = "spiffe://kvcache.example/tenant/path-tenant";
+    auto t = MtlsRegistry::ResolveTenant(cert, &r);
+    ASSERT_TRUE(t.has_value());
+    EXPECT_EQ(*t, "path-tenant") << "table miss → SPIFFE path";
+}
+
+TEST(ResolveTenantTest, NulloptWhenNothingResolves) {
+    CertInfo cert;  // no cn, no spiffe
+    EXPECT_FALSE(MtlsRegistry::ResolveTenant(cert, nullptr).has_value());
+}
+
+TEST(ResolveTenantTest, TableEntryWithoutTenantFallsThrough) {
+    MtlsRegistry r;
+    Identity id;  // .tenant left empty (e.g. an internal/admin identity)
+    r.UpsertSpiffeMapping("spiffe://kvcache.example/node/n1", id);
+    CertInfo cert;
+    cert.cn = "cn-tenant";
+    cert.spiffe_id = "spiffe://kvcache.example/node/n1";
+    auto t = MtlsRegistry::ResolveTenant(cert, &r);
+    ASSERT_TRUE(t.has_value());
+    EXPECT_EQ(*t, "cn-tenant") << "empty .tenant → fall through (no /tenant/ seg → CN)";
+}

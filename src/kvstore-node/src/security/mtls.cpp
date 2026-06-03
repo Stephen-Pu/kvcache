@@ -137,6 +137,43 @@ std::optional<Identity> MtlsRegistry::ResolveCert(const CertInfo& cert) const {
     return std::nullopt;
 }
 
+std::optional<std::string> MtlsRegistry::TenantFromSpiffePath(
+    const std::string& uri) {
+    auto parsed = ParseSpiffeId(uri);
+    if (!parsed) return std::nullopt;
+    // Look for "/tenant/" in the path; the tenant is the segment that
+    // follows it, up to the next '/' (or end).
+    static constexpr std::string_view kMarker = "/tenant/";
+    const std::string& path = parsed->path;
+    const std::size_t pos = path.find(kMarker);
+    if (pos == std::string::npos) return std::nullopt;
+    const std::size_t start = pos + kMarker.size();
+    const std::size_t end = path.find('/', start);
+    const std::string id = (end == std::string::npos)
+                               ? path.substr(start)
+                               : path.substr(start, end - start);
+    if (id.empty()) return std::nullopt;
+    return id;
+}
+
+std::optional<std::string> MtlsRegistry::ResolveTenant(
+    const CertInfo& cert, const MtlsRegistry* registry) {
+    // 1. CP-published table (SPIFFE-first inside ResolveCert).
+    if (registry != nullptr) {
+        if (auto id = registry->ResolveCert(cert);
+            id.has_value() && !id->tenant.empty()) {
+            return id->tenant;
+        }
+    }
+    // 2. SPIFFE workload-path convention.
+    if (cert.spiffe_id.has_value()) {
+        if (auto t = TenantFromSpiffePath(*cert.spiffe_id)) return t;
+    }
+    // 3. CN (historical Scheme-C: the CN string IS the tenant).
+    if (!cert.cn.empty()) return cert.cn;
+    return std::nullopt;
+}
+
 bool MtlsRegistry::HasRealParser() noexcept {
 #ifdef KVCACHE_HAVE_OPENSSL
     return true;
