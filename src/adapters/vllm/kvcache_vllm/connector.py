@@ -34,10 +34,11 @@ LLD reference: §6.1.4.
 
 from __future__ import annotations
 
+import array
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Set
 
-from kvcache_core import KVCacheConnector
+from kvcache_core import KVCacheConnector, compress_store
 
 
 @dataclass
@@ -54,6 +55,13 @@ class _RequestEntry:
     handle: int = 0
     finished_load: bool = False
     finished_save: bool = False
+    # Phase A6 — compressed-mode load is two-phase: start_load_kv fetches the
+    # variable-size codec blob into ``comp_buf`` and remembers the engine's
+    # ``dst_buffer``; wait_for_layer_load decodes the blob and copies the
+    # decompressed matched-prefix bytes into that destination. Both stay None
+    # in the uncompressed path (the fetch lands straight in dst_buffer).
+    comp_buf: Optional[bytearray] = None
+    dst_buffer: Optional[bytearray] = None
 
 
 @dataclass
@@ -94,11 +102,21 @@ class VllmKVConnector:
     CHUNK_TOKENS = 16
 
     def __init__(self, tenant_id: str, model_id: str,
-                 bytes_per_token: int) -> None:
+                 bytes_per_token: int, *, compress: bool = False,
+                 compress_bits: int = 8) -> None:
         if bytes_per_token <= 0:
             raise ValueError("bytes_per_token must be positive")
+        # Phase A6 — opt-in lossy KV-tensor compression on the flagship
+        # vLLM hot path (shared kvcache_core helper, same codec as the
+        # SGLang/AIBrix adapters). The KV bytes are fp32 [tokens][elems], so
+        # bytes_per_token must be a whole number of floats.
+        if compress and bytes_per_token % 4 != 0:
+            raise ValueError("compress requires bytes_per_token to be a "
+                             "multiple of 4 (fp32 elements)")
         self._cx = KVCacheConnector(tenant_id=tenant_id, model_id=model_id)
         self._bytes_per_token = bytes_per_token
+        self._compress = compress
+        self._compress_bits = compress_bits
         self._reqs: Dict[str, _RequestEntry] = {}
         self._closed = False
 
@@ -164,6 +182,15 @@ class VllmKVConnector:
         if len(dst_buffer) < n_bytes:
             raise ValueError(
                 f"dst_buffer too small: {len(dst_buffer)} < {n_bytes}")
+        if self._compress:
+            # A6 — the slot holds a variable-size codec blob, not raw KV. Fetch
+            # it into an internal buffer sized via stored_bytes; the decode +
+            # copy-into-dst_buffer happens in wait_for_layer_load once the
+            # async fetch has completed.
+            stored = self._cx.stored_bytes(entry.handle)
+            entry.comp_buf = bytearray(stored)
+            entry.dst_buffer = dst_buffer
+            return self._cx.fetch(entry.handle, entry.comp_buf)
         return self._cx.fetch(entry.handle, dst_buffer)
 
     def wait_for_layer_load(self, request_id: str,
@@ -177,6 +204,16 @@ class VllmKVConnector:
         """
         self._cx.wait(completion_id, timeout_ms=timeout_ms)
         entry = self._reqs.get(request_id)
+        if entry and entry.comp_buf is not None:
+            # A6 — the async fetch has landed the codec blob; decode it and
+            # copy the decompressed matched-prefix KV into the engine buffer
+            # the worker handed us in start_load_kv.
+            floats, _shape = self._cx.decompress_kv(bytes(entry.comp_buf))
+            decoded = array.array("f", floats).tobytes()
+            n_bytes = entry.matched_tokens * self._bytes_per_token
+            entry.dst_buffer[:n_bytes] = decoded[:n_bytes]
+            entry.comp_buf = None
+            entry.dst_buffer = None
         if entry:
             entry.finished_load = True
 
@@ -193,15 +230,22 @@ class VllmKVConnector:
             raise ValueError("token_ids must be non-empty")
         if not kv_bytes:
             raise ValueError("kv_bytes must be non-empty")
-        locator = self._cx.make_locator(token_ids)
-        rsv = self._cx.reserve(locator, len(kv_bytes))
-        if rsv.slot_bytes < len(kv_bytes):
-            raise RuntimeError(
-                f"reserved slot too small: {rsv.slot_bytes} < "
-                f"{len(kv_bytes)}")
-        self._cx.write_into_slot(rsv.slot_addr, kv_bytes)
-        self._cx.publish(rsv.handle, watermark=len(kv_bytes))
-        self._cx.seal(rsv.handle, token_ids)
+        if self._compress:
+            # A6 — compress the fp32 KV and seal the variable-size codec blob
+            # under the token prefix. The decompressed-size bookkeeping the
+            # load path needs is derived from matched_tokens, not the slot.
+            compress_store(self._cx, token_ids, kv_bytes,
+                           self._bytes_per_token, bits=self._compress_bits)
+        else:
+            locator = self._cx.make_locator(token_ids)
+            rsv = self._cx.reserve(locator, len(kv_bytes))
+            if rsv.slot_bytes < len(kv_bytes):
+                raise RuntimeError(
+                    f"reserved slot too small: {rsv.slot_bytes} < "
+                    f"{len(kv_bytes)}")
+            self._cx.write_into_slot(rsv.slot_addr, kv_bytes)
+            self._cx.publish(rsv.handle, watermark=len(kv_bytes))
+            self._cx.seal(rsv.handle, token_ids)
         # Use setdefault so a save-without-prior-lookup (warm-up path)
         # still produces a tracked entry.
         entry = self._reqs.setdefault(request_id, _RequestEntry())
