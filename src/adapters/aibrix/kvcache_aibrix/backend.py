@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from typing import Optional, Sequence, Set
 
-from kvcache_core import KVCacheConnector
+from kvcache_core import KVCacheConnector, compress_retrieve, compress_store
 
 from .async_load import AsyncLoadDriver
 
@@ -38,11 +38,18 @@ class AIBrixKVConnector:
     CHUNK_TOKENS = 16  # LLD §3.2
 
     def __init__(self, tenant_id: str, model_id: str,
-                 bytes_per_token: int) -> None:
+                 bytes_per_token: int, *, compress: bool = False,
+                 compress_bits: int = 8) -> None:
         if bytes_per_token <= 0:
             raise ValueError("bytes_per_token must be positive")
+        # KVZ-4 — optional lossy KV-tensor compression (shared helper).
+        if compress and bytes_per_token % 4 != 0:
+            raise ValueError("compress requires bytes_per_token to be a "
+                             "multiple of 4 (fp32 elements)")
         self._cx = KVCacheConnector(tenant_id=tenant_id, model_id=model_id)
         self._bytes_per_token = bytes_per_token
+        self._compress = compress
+        self._compress_bits = compress_bits
         self._closed = False
 
     # ----- Connector v1 verbs ----------------------------------------------
@@ -70,6 +77,8 @@ class AIBrixKVConnector:
         ``matched_tokens * bytes_per_token`` bytes — possibly shorter
         than the caller-supplied ``key`` if only a prefix is cached.
         """
+        if self._compress:
+            return compress_retrieve(self._cx, key, self._bytes_per_token)
         hit = self._cx.lookup(key)
         if hit is None:
             return None
@@ -86,6 +95,10 @@ class AIBrixKVConnector:
             raise ValueError("key must be non-empty")
         if not value:
             raise ValueError("value must be non-empty")
+        if self._compress:
+            compress_store(self._cx, key, value, self._bytes_per_token,
+                           bits=self._compress_bits)
+            return
         locator = self._cx.make_locator(key)
         rsv = self._cx.reserve(locator, len(value))
         if rsv.slot_bytes < len(value):

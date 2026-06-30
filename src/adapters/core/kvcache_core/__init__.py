@@ -10,10 +10,13 @@ from .connector import (
     LookupResult,
     ReserveResult,
 )
+from .kv_compress import compress_retrieve, compress_store
 
 __all__ = [
     "KVCacheConnector",
     "KVCacheError",
     "LookupResult",
     "ReserveResult",
+    "compress_retrieve",
+    "compress_store",
 ]
