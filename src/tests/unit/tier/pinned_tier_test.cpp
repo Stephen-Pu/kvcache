@@ -4,6 +4,10 @@
 #include <cstring>
 #include <vector>
 
+#if KVCACHE_HAVE_CUDA
+#include <cuda_runtime.h>
+#endif
+
 using kvcache::node::tier::PinnedTier;
 using kvcache::node::tier::SlotDesc;
 
@@ -67,3 +71,39 @@ TEST(PinnedTierTest, MrKeyComesFromCallback) {
     ASSERT_TRUE(s.has_value());
     EXPECT_EQ(s->mr_key, 0xDEADBEEFu);
 }
+
+#if KVCACHE_HAVE_CUDA
+// Phase A2 — when built with -DKVCACHE_ENABLE_CUDA=ON on a box with a GPU, the
+// pool must be genuine cudaHostAlloc pinned+mapped host memory, not plain
+// mmap. The distinguishing, hardware-observable property: cudaPointerGetAttributes
+// reports it as a host allocation and cudaHostGetDevicePointer yields a valid
+// device-side pointer (only possible for MAPPED pinned memory). A plain malloc
+// / mmap pointer fails both. This is what makes zero-copy GPUDirect paths work.
+TEST(PinnedTierCudaTest, PoolIsRealPinnedMappedHostMemory) {
+    PinnedTier::Options o;
+    o.pool_bytes = 2 * (16ull << 20);  // 2 slots
+    o.slot_bytes = 16ull << 20;
+    std::string err;
+    auto t = PinnedTier::Create(o, &err);
+    ASSERT_NE(t, nullptr) << err;
+    auto s = t->Acquire();
+    ASSERT_TRUE(s.has_value());
+
+    // Host-writable like any slot.
+    std::memset(s->addr, 0x5A, 4096);
+    EXPECT_EQ(*static_cast<uint8_t*>(s->addr), 0x5Au);
+
+    // It's registered pinned host memory (not pageable).
+    cudaPointerAttributes attr{};
+    ASSERT_EQ(cudaPointerGetAttributes(&attr, s->addr), cudaSuccess);
+    EXPECT_EQ(attr.type, cudaMemoryTypeHost)
+        << "pool must be CUDA host memory, got type " << attr.type;
+
+    // MAPPED → a device pointer can be derived for zero-copy GPU access.
+    void* dptr = nullptr;
+    EXPECT_EQ(cudaHostGetDevicePointer(&dptr, s->addr, 0), cudaSuccess);
+    EXPECT_NE(dptr, nullptr);
+
+    t->Release(s->id);
+}
+#endif  // KVCACHE_HAVE_CUDA

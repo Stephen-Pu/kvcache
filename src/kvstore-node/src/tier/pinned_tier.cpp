@@ -7,6 +7,10 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#if KVCACHE_HAVE_CUDA
+#include <cuda_runtime.h>
+#endif
+
 #include "logging.h"
 
 namespace kvcache::node::tier {
@@ -26,6 +30,26 @@ std::unique_ptr<PinnedTier> PinnedTier::Create(const Options& opts, std::string*
     t->slot_bytes_ = opts.slot_bytes;
     t->slot_count_ = static_cast<uint32_t>(opts.pool_bytes / opts.slot_bytes);
 
+#if KVCACHE_HAVE_CUDA
+    // Phase A2 — page-locked host memory via CUDA so NIXL (RDMA / GDR / GDS)
+    // can DMA directly with no bounce buffer. cudaHostAllocPortable: usable by
+    // any CUDA context; cudaHostAllocMapped: also mappable into device address
+    // space (cudaHostGetDevicePointer), which is what GPUDirect paths need.
+    // This memory is already pinned, so mlock is unnecessary.
+    {
+        void* p = nullptr;
+        cudaError_t cerr = cudaHostAlloc(
+            &p, t->pool_bytes_, cudaHostAllocPortable | cudaHostAllocMapped);
+        if (cerr != cudaSuccess || p == nullptr) {
+            if (err) *err = std::string("pinned_tier: cudaHostAlloc failed: ") +
+                            cudaGetErrorString(cerr);
+            return nullptr;
+        }
+        t->base_ = p;
+        t->cuda_alloc_ = true;
+        (void)opts.use_mlock;  // cudaHostAlloc memory is page-locked already
+    }
+#else
     // Anonymous mmap; optionally locked into RAM so RDMA can use it.
     int flags = MAP_PRIVATE | MAP_ANONYMOUS;
 #ifdef MAP_LOCKED
@@ -58,6 +82,7 @@ std::unique_ptr<PinnedTier> PinnedTier::Create(const Options& opts, std::string*
             ::kvcache::log::Get("pinned_tier").Warn(buf);
         }
     }
+#endif  // KVCACHE_HAVE_CUDA
 
     // Register the entire pool with NIXL via the caller-supplied callback.
     if (opts.register_region) {
@@ -73,10 +98,15 @@ std::unique_ptr<PinnedTier> PinnedTier::Create(const Options& opts, std::string*
 }
 
 PinnedTier::~PinnedTier() {
-    if (base_) {
-        if (mlocked_) ::munlock(base_, pool_bytes_);
-        ::munmap(base_, pool_bytes_);
+    if (!base_) return;
+#if KVCACHE_HAVE_CUDA
+    if (cuda_alloc_) {
+        cudaFreeHost(base_);
+        return;
     }
+#endif
+    if (mlocked_) ::munlock(base_, pool_bytes_);
+    ::munmap(base_, pool_bytes_);
 }
 
 std::optional<SlotDesc> PinnedTier::Acquire() {

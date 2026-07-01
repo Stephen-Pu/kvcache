@@ -113,6 +113,15 @@ if(KVCACHE_ENABLE_UCX)
     add_compile_definitions(KVCACHE_HAVE_UCX=1)
 endif()
 
+if(KVCACHE_ENABLE_CUDA)
+    # Phase A2 — CUDA runtime for the pinned-tier cudaHostAlloc path. Use
+    # find_package(CUDAToolkit) (CMake >=3.17) — gives the CUDA::cudart imported
+    # target without enabling the CUDA *language* (we only call the runtime API
+    # from .cpp). REQUIRED — the user explicitly asked for the CUDA path.
+    find_package(CUDAToolkit REQUIRED)
+    add_compile_definitions(KVCACHE_HAVE_CUDA=1)
+endif()
+
 # --------------------------------------------------------------------------
 # BLAKE3 — real cryptographic hash (replaces the FNV-1a + SplitMix64 facade).
 # We prefer a system install (`find_package(BLAKE3 CONFIG)`) and fall back to

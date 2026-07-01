@@ -130,6 +130,11 @@ foreach(_tier_t test_pinned_tier test_dram_tier test_nvme_tier test_cold_tier te
     if(OpenSSL_FOUND)
         target_link_libraries(${_tier_t} PRIVATE OpenSSL::Crypto)
     endif()
+    # A2 — pinned_tier.cpp pulls the CUDA runtime when the cudaHostAlloc path
+    # is enabled.
+    if(KVCACHE_ENABLE_CUDA)
+        target_link_libraries(${_tier_t} PRIVATE CUDA::cudart)
+    endif()
 endforeach()
 
 # KVZ-1 — KvTensorCodec (KV-tensor compression). Standalone; the zstd
@@ -164,6 +169,10 @@ foreach(_ing_t test_mutable_buffer test_watermark test_seal)
     # B3.2 — encrypting_cold_tier.cpp (in NODE_TIER_SRCS) needs OpenSSL.
     if(OpenSSL_FOUND)
         target_link_libraries(${_ing_t} PRIVATE OpenSSL::Crypto)
+    endif()
+    # A2 — pinned_tier.cpp (in NODE_TIER_SRCS) needs the CUDA runtime.
+    if(KVCACHE_ENABLE_CUDA)
+        target_link_libraries(${_ing_t} PRIVATE CUDA::cudart)
     endif()
 endforeach()
 

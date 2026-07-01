@@ -106,6 +106,12 @@ if(KVCACHE_ENABLE_UCX)
     target_link_libraries(kvstore_node_core PUBLIC PkgConfig::UCX)
 endif()
 
+# Phase A2 — link the CUDA runtime when the cudaHostAlloc pinned-tier path is
+# enabled. KVCACHE_HAVE_CUDA (top level) gates the CUDA body in pinned_tier.cpp.
+if(KVCACHE_ENABLE_CUDA)
+    target_link_libraries(kvstore_node_core PUBLIC CUDA::cudart)
+endif()
+
 # Phase B8 — security/mtls.cpp uses OpenSSL X.509 when available
 # (KVCACHE_HAVE_OPENSSL defined at the top level). Link Crypto so the
 # X509_*/PEM_*/GENERAL_NAME_* symbols resolve.

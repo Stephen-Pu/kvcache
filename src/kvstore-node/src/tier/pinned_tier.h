@@ -91,6 +91,9 @@ class PinnedTier {
     uint32_t slot_count_ = 0;
     uint32_t mr_key_     = 0;
     bool     mlocked_    = false;
+    // Phase A2 — true when the pool was allocated via cudaHostAlloc (built with
+    // -DKVCACHE_ENABLE_CUDA=ON); selects cudaFreeHost over munmap at teardown.
+    bool     cuda_alloc_ = false;
 
     // Free-list is a vector used as a stack; protected by mu_. Allocation is
     // O(1). The handful of mutex acquisitions per chunk is well within the
