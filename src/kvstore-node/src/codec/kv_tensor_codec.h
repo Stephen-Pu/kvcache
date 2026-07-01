@@ -8,8 +8,16 @@
 //   1. delta along the token axis  — closed-loop DPCM (predict each token
 //      from the *reconstructed* previous token, so quantization error does
 //      NOT accumulate / drift down the sequence),
-//   2. per-token symmetric quantization to int8 / int4 (the lossy step;
-//      `bits` is the rate-distortion knob), and
+//   2. symmetric quantization to int8 / int4 (the lossy step; `bits` is the
+//      rate-distortion knob). Two scale granularities (Phase B2):
+//        * per-channel (default): one scale per element-position, shared
+//          across tokens. KV channels have very different magnitudes (outlier
+//          channels are well-documented), so a per-token scale — driven by a
+//          token's largest channel — over-coarsens its small channels.
+//          Per-channel lets every channel use its full int range → markedly
+//          lower reconstruction error at the same bit-width.
+//        * per-token (opt-in via `per_channel=false`): the original scheme,
+//          one scale per token. Kept for comparison / back-compat.
 //   3. optional entropy coding (zstd) of the small quantized residuals —
 //      gated on KVCACHE_HAVE_ZSTD; without it the quantized bytes are
 //      stored raw (quantization still gives ~4x at int8 / ~8x at int4).
@@ -38,8 +46,9 @@ struct KvShape {
 };
 
 struct KvCodecParams {
-    int  bits  = 8;     // 8 or 4 — the rate-distortion knob
-    bool delta = true;  // closed-loop DPCM along the token axis
+    int  bits         = 8;     // 8 or 4 — the rate-distortion knob
+    bool delta        = true;  // closed-loop DPCM along the token axis
+    bool per_channel  = true;  // B2: per-channel scale (vs per-token if false)
 };
 
 // Encode `data` (n_tokens * elems_per_token fp32 values, row-major by token)

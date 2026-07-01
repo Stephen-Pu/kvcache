@@ -14,8 +14,9 @@ namespace {
 
 constexpr char    kMagic[4] = {'K', 'V', 'T', '1'};
 constexpr uint8_t kVersion  = 1;
-constexpr uint8_t kFlagDelta   = 0x1;
-constexpr uint8_t kFlagEntropy = 0x2;   // payload is zstd-compressed
+constexpr uint8_t kFlagDelta      = 0x1;
+constexpr uint8_t kFlagEntropy    = 0x2;   // payload is zstd-compressed
+constexpr uint8_t kFlagPerChannel = 0x4;   // B2: scales are per-channel (E), not per-token (T)
 // Header: magic(4) ver(1) bits(1) flags(1) rsvd(1) n_tokens(4) elems(4) = 16
 constexpr std::size_t kHeaderSize = 16;
 
@@ -54,33 +55,67 @@ bool EncodeKvTensor(const float* data, KvShape shape,
     const std::size_t T = shape.n_tokens;
     const std::size_t E = shape.elems_per_token;
     const std::size_t N = T * E;
+    const bool per_channel = params.per_channel;
 
-    std::vector<float> scales(T, 1.0f);
+    // scales layout: per-channel → E entries (one per element position);
+    // per-token → T entries (one per token). See the header for why
+    // per-channel wins on KV's heterogeneous channel magnitudes (B2).
+    std::vector<float> scales(per_channel ? E : T, 1.0f);
     std::vector<int8_t> q(N, 0);
     std::vector<float> recon_prev(E, 0.0f);  // reconstructed previous token
 
-    for (std::size_t t = 0; t < T; ++t) {
-        const float* row = data + t * E;
-        const bool predict = params.delta && t > 0;
-        // Pass 1 — residual magnitude → per-token scale.
-        float amax = 0.0f;
-        for (std::size_t e = 0; e < E; ++e) {
-            const float pred = predict ? recon_prev[e] : 0.0f;
-            const float r = row[e] - pred;
-            const float a = std::fabs(r);
-            if (a > amax) amax = a;
+    if (per_channel) {
+        // Pass 0 — per-channel dynamic range from the OPEN-LOOP first
+        // difference (data[t]-data[t-1]). The closed-loop residual is ~equal
+        // in magnitude, so this is a safe (slightly conservative) per-channel
+        // scale that must be fixed before any token is quantized.
+        std::vector<float> amax(E, 0.0f);
+        for (std::size_t t = 0; t < T; ++t) {
+            const float* row = data + t * E;
+            const float* prev = (params.delta && t > 0) ? data + (t - 1) * E : nullptr;
+            for (std::size_t e = 0; e < E; ++e) {
+                const float r = row[e] - (prev ? prev[e] : 0.0f);
+                const float a = std::fabs(r);
+                if (a > amax[e]) amax[e] = a;
+            }
         }
-        const float scale = amax > 0.0f ? amax / static_cast<float>(qmax) : 1.0f;
-        scales[t] = scale;
-        // Pass 2 — quantize residual + reconstruct (closed-loop DPCM).
-        for (std::size_t e = 0; e < E; ++e) {
-            const float pred = predict ? recon_prev[e] : 0.0f;
-            const float r = row[e] - pred;
-            long qi = std::lround(r / scale);
-            if (qi > qmax) qi = qmax;
-            if (qi < -qmax) qi = -qmax;
-            q[t * E + e] = static_cast<int8_t>(qi);
-            recon_prev[e] = pred + static_cast<float>(qi) * scale;
+        for (std::size_t e = 0; e < E; ++e)
+            scales[e] = amax[e] > 0.0f ? amax[e] / static_cast<float>(qmax) : 1.0f;
+        // Pass 1 — closed-loop DPCM quantize with the fixed per-channel scale.
+        for (std::size_t t = 0; t < T; ++t) {
+            const float* row = data + t * E;
+            const bool predict = params.delta && t > 0;
+            for (std::size_t e = 0; e < E; ++e) {
+                const float pred = predict ? recon_prev[e] : 0.0f;
+                long qi = std::lround((row[e] - pred) / scales[e]);
+                if (qi > qmax) qi = qmax;
+                if (qi < -qmax) qi = -qmax;
+                q[t * E + e] = static_cast<int8_t>(qi);
+                recon_prev[e] = pred + static_cast<float>(qi) * scales[e];
+            }
+        }
+    } else {
+        for (std::size_t t = 0; t < T; ++t) {
+            const float* row = data + t * E;
+            const bool predict = params.delta && t > 0;
+            // Pass 1 — residual magnitude → per-token scale.
+            float amax = 0.0f;
+            for (std::size_t e = 0; e < E; ++e) {
+                const float pred = predict ? recon_prev[e] : 0.0f;
+                const float a = std::fabs(row[e] - pred);
+                if (a > amax) amax = a;
+            }
+            const float scale = amax > 0.0f ? amax / static_cast<float>(qmax) : 1.0f;
+            scales[t] = scale;
+            // Pass 2 — quantize residual + reconstruct (closed-loop DPCM).
+            for (std::size_t e = 0; e < E; ++e) {
+                const float pred = predict ? recon_prev[e] : 0.0f;
+                long qi = std::lround((row[e] - pred) / scale);
+                if (qi > qmax) qi = qmax;
+                if (qi < -qmax) qi = -qmax;
+                q[t * E + e] = static_cast<int8_t>(qi);
+                recon_prev[e] = pred + static_cast<float>(qi) * scale;
+            }
         }
     }
 
@@ -101,6 +136,7 @@ bool EncodeKvTensor(const float* data, KvShape shape,
 
     uint8_t flags = 0;
     if (params.delta) flags |= kFlagDelta;
+    if (per_channel)  flags |= kFlagPerChannel;
 
     // Optional entropy stage.
     std::vector<uint8_t> payload;
@@ -130,9 +166,10 @@ bool EncodeKvTensor(const float* data, KvShape shape,
     out->push_back(0);  // reserved
     PutU32LE(out, shape.n_tokens);
     PutU32LE(out, shape.elems_per_token);
-    // Per-token scales (fp32, native — same-build codec).
+    // Scales (fp32, native — same-build codec): E entries if per-channel,
+    // else T. The kFlagPerChannel bit tells the decoder which.
     const auto* sb = reinterpret_cast<const uint8_t*>(scales.data());
-    out->insert(out->end(), sb, sb + T * sizeof(float));
+    out->insert(out->end(), sb, sb + scales.size() * sizeof(float));
     out->insert(out->end(), payload.begin(), payload.end());
     return true;
 }
@@ -153,8 +190,9 @@ bool DecodeKvTensor(const uint8_t* in, std::size_t n,
         return false;
     }
     const uint8_t flags = in[6];
-    const bool delta   = flags & kFlagDelta;
-    const bool entropy = flags & kFlagEntropy;
+    const bool delta       = flags & kFlagDelta;
+    const bool entropy     = flags & kFlagEntropy;
+    const bool per_channel = flags & kFlagPerChannel;
     const uint32_t T = GetU32LE(in + 8);
     const uint32_t E = GetU32LE(in + 12);
     if (T == 0 || E == 0) {
@@ -162,12 +200,13 @@ bool DecodeKvTensor(const uint8_t* in, std::size_t n,
         return false;
     }
     const std::size_t N = static_cast<std::size_t>(T) * E;
-    const std::size_t scales_bytes = static_cast<std::size_t>(T) * sizeof(float);
+    const std::size_t n_scales = per_channel ? E : T;
+    const std::size_t scales_bytes = n_scales * sizeof(float);
     if (n < kHeaderSize + scales_bytes) {
         if (err) *err = "kv_codec: truncated scales";
         return false;
     }
-    std::vector<float> scales(T);
+    std::vector<float> scales(n_scales);
     std::memcpy(scales.data(), in + kHeaderSize, scales_bytes);
 
     const uint8_t* payload = in + kHeaderSize + scales_bytes;
@@ -217,8 +256,8 @@ bool DecodeKvTensor(const uint8_t* in, std::size_t n,
     std::vector<float> recon_prev(E, 0.0f);
     for (std::size_t t = 0; t < T; ++t) {
         const bool predict = delta && t > 0;
-        const float scale = scales[t];
         for (std::size_t e = 0; e < E; ++e) {
+            const float scale = per_channel ? scales[e] : scales[t];
             const float pred = predict ? recon_prev[e] : 0.0f;
             const float val = pred + static_cast<float>(q[t * E + e]) * scale;
             (*out)[t * E + e] = val;

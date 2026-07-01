@@ -48,6 +48,44 @@ double ValueRange(const std::vector<float>& a) {
     return static_cast<double>(hi) - lo;
 }
 
+// B2 — KV with wildly heterogeneous per-channel magnitudes: channel e is
+// scaled by 10^((e%5)-2), i.e. spanning ~0.01 … ~100 across channels, smooth
+// along tokens. This is the realistic "outlier channel" case where a single
+// per-token scale (driven by the biggest channel) crushes the small channels.
+std::vector<float> HeteroKv(uint32_t T, uint32_t E) {
+    std::vector<float> v(static_cast<std::size_t>(T) * E);
+    for (uint32_t e = 0; e < E; ++e) {
+        const double mag = std::pow(10.0, static_cast<double>(e % 5) - 2.0);
+        const double base = mag * (0.3 + 0.1 * (e % 3));
+        const double slope = mag * 0.01;
+        for (uint32_t t = 0; t < T; ++t) {
+            v[static_cast<std::size_t>(t) * E + e] =
+                static_cast<float>(base + slope * t + 0.02 * mag * std::sin(0.1 * (t + e)));
+        }
+    }
+    return v;
+}
+
+// Worst per-channel relative RMS error: max over channels of
+// rms(orig-dec) / rms(orig). Per-channel quant keeps this ~uniform (~1/qmax);
+// per-token quant lets it blow up toward 1.0 on the small-magnitude channels.
+double WorstChannelRelErr(const std::vector<float>& a, const std::vector<float>& b,
+                          uint32_t T, uint32_t E) {
+    double worst = 0.0;
+    for (uint32_t e = 0; e < E; ++e) {
+        double se = 0.0, sref = 0.0;
+        for (uint32_t t = 0; t < T; ++t) {
+            const std::size_t i = static_cast<std::size_t>(t) * E + e;
+            const double d = static_cast<double>(a[i]) - b[i];
+            se += d * d;
+            sref += static_cast<double>(a[i]) * a[i];
+        }
+        const double rel = std::sqrt(se / T) / (std::sqrt(sref / T) + 1e-12);
+        worst = std::max(worst, rel);
+    }
+    return worst;
+}
+
 }  // namespace
 
 TEST(KvTensorCodec, RoundTripWithinErrorBoundInt8) {
@@ -102,6 +140,54 @@ TEST(KvTensorCodec, CompressesBelowRawFp32) {
     std::vector<uint8_t> b4;
     ASSERT_TRUE(EncodeKvTensor(orig.data(), shape, {4, true}, &b4, &err)) << err;
     EXPECT_LT(b4.size(), b8.size()) << "int4 must be smaller than int8";
+}
+
+// B2 — the headline result: on heterogeneous-magnitude channels, per-channel
+// quantization reconstructs the small channels vastly better than the original
+// per-token scheme, at the same bit-width and near-identical blob size.
+TEST(KvTensorCodec, PerChannelBeatsPerTokenOnHeteroMagnitudes) {
+    const KvShape shape{96, 320};
+    auto orig = HeteroKv(shape.n_tokens, shape.elems_per_token);
+    std::string err;
+
+    std::vector<uint8_t> b_pc, b_pt;
+    ASSERT_TRUE(EncodeKvTensor(orig.data(), shape, {8, true, /*per_channel=*/true},
+                               &b_pc, &err)) << err;
+    ASSERT_TRUE(EncodeKvTensor(orig.data(), shape, {8, true, /*per_channel=*/false},
+                               &b_pt, &err)) << err;
+
+    std::vector<float> d_pc, d_pt;
+    KvShape s{};
+    ASSERT_TRUE(DecodeKvTensor(b_pc.data(), b_pc.size(), &d_pc, &s, &err)) << err;
+    ASSERT_TRUE(DecodeKvTensor(b_pt.data(), b_pt.size(), &d_pt, &s, &err)) << err;
+
+    const double rel_pc = WorstChannelRelErr(orig, d_pc, shape.n_tokens, shape.elems_per_token);
+    const double rel_pt = WorstChannelRelErr(orig, d_pt, shape.n_tokens, shape.elems_per_token);
+
+    // Per-token destroys the small channels (worst relative error near 1.0);
+    // per-channel keeps every channel faithful (a few % at int8).
+    EXPECT_LT(rel_pc, 0.05) << "per-channel worst-channel rel err " << rel_pc;
+    EXPECT_GT(rel_pt, 0.30) << "per-token should badly quantize small channels, got " << rel_pt;
+    EXPECT_LT(rel_pc, rel_pt / 4.0)
+        << "per-channel (" << rel_pc << ") must be far better than per-token (" << rel_pt << ")";
+
+    // The R-D win costs essentially nothing in size (scales are E vs T fp32).
+    const double ratio = static_cast<double>(b_pc.size()) / static_cast<double>(b_pt.size());
+    EXPECT_LT(ratio, 1.15) << "per-channel blob " << b_pc.size() << " vs per-token " << b_pt.size();
+}
+
+// B2 back-compat: a per-token-encoded blob still decodes correctly (the flag
+// bit selects the path), so old blobs remain readable.
+TEST(KvTensorCodec, PerTokenModeStillRoundTrips) {
+    const KvShape shape{48, 128};
+    auto orig = SmoothKv(shape.n_tokens, shape.elems_per_token);
+    std::string err;
+    std::vector<uint8_t> blob;
+    ASSERT_TRUE(EncodeKvTensor(orig.data(), shape, {8, true, /*per_channel=*/false},
+                               &blob, &err)) << err;
+    std::vector<float> dec; KvShape s{};
+    ASSERT_TRUE(DecodeKvTensor(blob.data(), blob.size(), &dec, &s, &err)) << err;
+    EXPECT_LT(MaxAbsErr(orig, dec), 0.01 * ValueRange(orig));
 }
 
 TEST(KvTensorCodec, DeltaOffStillRoundTrips) {
