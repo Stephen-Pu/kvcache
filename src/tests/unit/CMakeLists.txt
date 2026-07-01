@@ -386,6 +386,27 @@ if(OpenSSL_FOUND)
     target_link_libraries(test_replica_fetch PRIVATE OpenSSL::Crypto)
 endif()
 
+# Task 2 — A9 DR warm-standby: SealByChunkPath on HeadlessNode.
+#
+# Mirrors test_replica_fetch: compiles headless_node.cpp directly so the
+# non-ABI C++ symbols (SealByChunkPath, SealCommit) are reachable without
+# going through the kvcache dylib's public C surface.
+kvcache_add_test(test_seal_by_chunk_path
+                  replication/seal_by_chunk_path_test.cpp
+                  ${CMAKE_SOURCE_DIR}/core-abi/src/headless_node.cpp
+                  ${CMAKE_SOURCE_DIR}/core-abi/src/ctx_options.cpp
+                  ${CMAKE_SOURCE_DIR}/core-abi/src/kv_status.cpp)
+target_include_directories(test_seal_by_chunk_path PRIVATE
+                  ${CMAKE_SOURCE_DIR}/core-abi/src
+                  ${KVCACHE_NODE_SRC})
+target_link_libraries(test_seal_by_chunk_path PRIVATE
+                  kvstore_node_core
+                  kvcache_common
+                  CURL::libcurl)
+if(OpenSSL_FOUND)
+    target_link_libraries(test_seal_by_chunk_path PRIVATE OpenSSL::Crypto)
+endif()
+
 # Phase A1 — kvagent module tests. Each test links the agent's
 # static lib; the include surface is the kvagent_lib PUBLIC dirs.
 if(KVCACHE_BUILD_AGENT)

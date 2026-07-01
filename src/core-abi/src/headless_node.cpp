@@ -545,29 +545,21 @@ int HeadlessNode::Wait(kv_completion_t /*cid*/, uint32_t /*timeout_ms*/) {
 // Seal
 // ---------------------------------------------------------------------------
 
-int HeadlessNode::Seal(kv_handle_t handle,
-                       const uint32_t* tokens, std::size_t n_tokens) {
-    HandleState st;
-    {
-        std::lock_guard lk(mu_);
-        auto it = handles_.find(handle);
-        if (it == handles_.end()) return KV_E_INVAL;
-        st = it->second;
-    }
-    if (st.kind != HandleKind::kIngest) return KV_E_INVAL;
-    if (n_tokens < node::prefix::kChunkTokens) {
-        // Nothing to seal (smaller than one chunk).
-        wm_->Drop(st.ingest_handle);
-        buffers_->Release(st.ingest_handle);
-        std::lock_guard lk(mu_);
-        handles_.erase(handle);
-        return KV_E_INVAL;
-    }
-
-    // Phase Q-5 — same namespace prefix the matching Lookup will use.
-    const auto ns = node::prefix::NamespaceFingerprint(
-        st.tenant_hash, st.model_hash);
-    auto chunk_path = node::prefix::ChunkifyNS({tokens, n_tokens}, ns);
+// SealCommit — shared commit body used by both Seal() and SealByChunkPath().
+//
+// Caller has already resolved `st` (the HandleState) and supplied
+// `chunk_path` (either computed from tokens by Seal(), or received from the
+// primary via ReplicaFetch() by SealByChunkPath()). This method performs:
+//   1. DRAM staging of the slot bytes.
+//   2. evict_index_ update (Phase G-1).
+//   3. ART insert + KV_EVENT_ADD publish (or RocksDB-backed path).
+//   4. Slot cleanup (wm_->Drop, buffers_->Release, handles_.erase).
+//
+// Must be called WITHOUT mu_ held. Acquires mu_evict_ and mu_ internally at
+// the correct points.
+int HeadlessNode::SealCommit(
+    kv_handle_t handle, const HandleState& st,
+    const std::vector<node::prefix::ChunkHash>& chunk_path) {
 
     // Stage the slot bytes into DRAM so the next Lookup→Fetch can serve from
     // T2. We don't have a structured KV layout in MVP — the bytes are just
@@ -618,11 +610,11 @@ int HeadlessNode::Seal(kv_handle_t handle,
         leaf->tier_residency_bitmap = req.tier_residency_bitmap;
         leaf->bytes_total           = watermark;
         leaf->refcount.Acquire();
-        std::span<const node::prefix::ChunkHash> chunk_path{
+        std::span<const node::prefix::ChunkHash> path_span{
             req.chunk_path.data(), req.chunk_path.size()};
         auto ins = art_wal_
-            ? art_wal_->Insert(chunk_path, std::move(leaf))
-            : art_->Insert(chunk_path, std::move(leaf));
+            ? art_wal_->Insert(path_span, std::move(leaf))
+            : art_->Insert(path_span, std::move(leaf));
         if (ins == node::prefix::ArtIndex::InsertResult::kPathConflict) {
             // Collision today is an MVP limitation of the Node256-only
             // ART (no edge-split); a future phase implements true
@@ -651,6 +643,51 @@ int HeadlessNode::Seal(kv_handle_t handle,
     std::lock_guard lk(mu_);
     handles_.erase(handle);
     return seal_rc;
+}
+
+int HeadlessNode::Seal(kv_handle_t handle,
+                       const uint32_t* tokens, std::size_t n_tokens) {
+    HandleState st;
+    {
+        std::lock_guard lk(mu_);
+        auto it = handles_.find(handle);
+        if (it == handles_.end()) return KV_E_INVAL;
+        st = it->second;
+    }
+    if (st.kind != HandleKind::kIngest) return KV_E_INVAL;
+    if (n_tokens < node::prefix::kChunkTokens) {
+        // Nothing to seal (smaller than one chunk).
+        wm_->Drop(st.ingest_handle);
+        buffers_->Release(st.ingest_handle);
+        std::lock_guard lk(mu_);
+        handles_.erase(handle);
+        return KV_E_INVAL;
+    }
+
+    // Phase Q-5 — same namespace prefix the matching Lookup will use.
+    const auto ns = node::prefix::NamespaceFingerprint(
+        st.tenant_hash, st.model_hash);
+    auto chunk_path = node::prefix::ChunkifyNS({tokens, n_tokens}, ns);
+
+    return SealCommit(handle, st, chunk_path);
+}
+
+// ---------------------------------------------------------------------------
+// SealByChunkPath (Task 2 — A9 DR warm-standby)
+// ---------------------------------------------------------------------------
+
+int HeadlessNode::SealByChunkPath(
+    kv_handle_t handle,
+    const std::vector<node::prefix::ChunkHash>& chunk_path) {
+    HandleState st;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it = handles_.find(handle);
+        if (it == handles_.end()) return KV_E_NOT_FOUND;
+        st = it->second;
+    }
+    if (st.kind != HandleKind::kIngest) return KV_E_INVAL;
+    return SealCommit(handle, st, chunk_path);
 }
 
 // ---------------------------------------------------------------------------

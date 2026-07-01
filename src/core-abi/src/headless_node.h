@@ -122,6 +122,21 @@ class HeadlessNode {
 
     int Wait(kv_completion_t cid, uint32_t timeout_ms);
     int Seal(kv_handle_t handle, const uint32_t* tokens, std::size_t n_tokens);
+
+    // Task 2 — A9 DR warm-standby: token-free replicated commit.
+    //
+    // Commits the reserved handle's bytes into the ART at the supplied
+    // `chunk_path` and emits a KV_EVENT_ADD, exactly as Seal() does after it
+    // derives chunk_path from tokens. The standby has chunk_path from
+    // ReplicaFetch() but does NOT have the original tokens, so it calls this
+    // variant instead of Seal().
+    //
+    // Preconditions: `handle` must be a valid ingest handle (created by
+    // Reserve() + Publish()). Returns KV_E_NOT_FOUND if the handle is unknown,
+    // KV_E_INVAL if it is not an ingest handle, KV_E_INTERNAL on ART conflict.
+    int SealByChunkPath(kv_handle_t handle,
+                        const std::vector<node::prefix::ChunkHash>& chunk_path);
+
     int Release(kv_handle_t handle);
 
     // Persist the in-memory ART to `path` (atomic write-temp + rename).
@@ -268,6 +283,14 @@ class HeadlessNode {
                        DramKeyHasher>                                 evict_index_;
 
     void OnDramEvict(const node::tier::DramKey& key);
+
+    // Shared commit body used by both Seal() and SealByChunkPath().
+    // Caller must have already looked up `st` and (for Seal) computed
+    // `chunk_path`; this method performs the DRAM stage + ART insert +
+    // event publish + slot cleanup.  Must be called WITHOUT mu_ held
+    // (it acquires mu_evict_ and mu_ internally at the right points).
+    int SealCommit(kv_handle_t handle, const HandleState& st,
+                   const std::vector<node::prefix::ChunkHash>& chunk_path);
 
     // ----- Refcount-deferred eviction sweep (Phase G-2) -----
     //
