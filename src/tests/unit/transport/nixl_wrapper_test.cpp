@@ -20,7 +20,9 @@ std::unique_ptr<INixlBackend> Loopback() {
 }  // namespace
 
 TEST(NixlBackendTest, UnknownBackendFails) {
-    BackendOptions o; o.name = "ucx";
+    // A genuinely-unknown name — not "ucx"/"tcp", which are real backends
+    // (ucx when built with -DKVCACHE_ENABLE_UCX=ON, Phase A1).
+    BackendOptions o; o.name = "nonexistent-backend";
     std::string err;
     auto b = CreateBackend(o, &err);
     EXPECT_EQ(b, nullptr);

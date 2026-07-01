@@ -46,6 +46,7 @@ set(NODE_INGEST_SRCS
 set(NODE_TRANSPORT_SRCS
     ${KVCACHE_NODE_SRC}/transport/nixl_wrapper.cpp
     ${KVCACHE_NODE_SRC}/transport/tcp_backend.cpp
+    ${KVCACHE_NODE_SRC}/transport/ucx_backend.cpp  # A1 — CreateUcxBackend (factory ref)
     ${KVCACHE_NODE_SRC}/transport/priority_scheduler.cpp
 )
 
@@ -169,6 +170,16 @@ endforeach()
 kvcache_add_test(test_nixl_wrapper      transport/nixl_wrapper_test.cpp      ${NODE_TRANSPORT_SRCS})
 kvcache_add_test(test_priority_scheduler transport/priority_scheduler_test.cpp ${NODE_TRANSPORT_SRCS})
 kvcache_add_test(test_tcp_backend       transport/tcp_backend_test.cpp       ${NODE_TRANSPORT_SRCS})
+kvcache_add_test(test_ucx_backend       transport/ucx_backend_test.cpp       ${NODE_TRANSPORT_SRCS})
+# A1 — every transport test links ucx_backend.cpp (factory ref). When the UCX
+# backend is enabled, link the UCX lib + propagate KVCACHE_HAVE_UCX so the test
+# exercises the real ucp path; otherwise the stub compiles and the test
+# asserts the "not compiled in" contract.
+if(KVCACHE_ENABLE_UCX)
+    foreach(_tr_t test_nixl_wrapper test_priority_scheduler test_tcp_backend test_ucx_backend)
+        target_link_libraries(${_tr_t} PRIVATE PkgConfig::UCX)
+    endforeach()
+endif()
 
 kvcache_add_test(test_etcd_client       cluster/etcd_client_test.cpp         ${NODE_CLUSTER_SRCS} ${NODE_ROUTING_SRCS})
 target_link_libraries(test_etcd_client PRIVATE CURL::libcurl nlohmann_json::nlohmann_json)
@@ -324,6 +335,10 @@ if(KVCACHE_HAVE_GRPC)
         kvcache
         OpenSSL::Crypto
     )
+    # A1 — this target also pulls NODE_TRANSPORT_SRCS (ucx_backend.cpp).
+    if(KVCACHE_ENABLE_UCX)
+        target_link_libraries(test_cross_process_pull PRIVATE PkgConfig::UCX)
+    endif()
 endif()
 kvcache_add_test(test_trace             obs/trace_test.cpp)
 kvcache_add_test(test_trace_otlp        obs/trace_otlp_test.cpp)

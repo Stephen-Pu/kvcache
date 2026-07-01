@@ -21,6 +21,7 @@
 #include <unordered_map>
 
 #include "transport/tcp_backend.h"
+#include "transport/ucx_backend.h"
 
 namespace kvcache::node::transport {
 
@@ -147,8 +148,13 @@ std::unique_ptr<INixlBackend> CreateBackend(const BackendOptions& opts, std::str
     if (opts.name == "tcp") {
         return CreateTcpBackend(opts, err);
     }
-    // Real RDMA backends plug in behind this same interface:
-    //   "ucx"   — UCX over IB / RoCE (LLD §3.5, D-NET-1) — Phase C-2
+    if (opts.name == "ucx") {
+        // Phase A1 — UCX RMA backend (IB/RoCE/shm/tcp, auto-selected). Only
+        // present when built with -DKVCACHE_ENABLE_UCX=ON; otherwise the
+        // factory returns a clear "not compiled in" error.
+        return CreateUcxBackend(opts, err);
+    }
+    // Other RDMA backends plug in behind this same interface:
     //   "gdr"   — GPUDirect RDMA — Phase C-2
     //   "gds"   — GPUDirect Storage (NVMe → GPU direct, LLD §3.3 T3) — Phase C-2
     //   "nvlink"— intra-host NVLink fabric — Phase C-2

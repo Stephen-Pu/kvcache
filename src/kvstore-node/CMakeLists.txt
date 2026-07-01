@@ -33,6 +33,7 @@ set(NODE_CORE_SRCS
     # transport
     src/transport/nixl_wrapper.cpp
     src/transport/tcp_backend.cpp
+    src/transport/ucx_backend.cpp
     src/transport/priority_scheduler.cpp
     # meta
     src/meta/rocksdb_store.cpp
@@ -96,6 +97,13 @@ endif()
 # ZstdCodec body in block_codec.cpp.
 if(KVCACHE_ENABLE_ZSTD)
     target_link_libraries(kvstore_node_core PUBLIC PkgConfig::ZSTD)
+endif()
+
+# Phase A1 — link UCX when the ucx NIXL backend is enabled. The compile-time
+# KVCACHE_HAVE_UCX define (set at the top level) gates the UcxBackend body in
+# ucx_backend.cpp.
+if(KVCACHE_ENABLE_UCX)
+    target_link_libraries(kvstore_node_core PUBLIC PkgConfig::UCX)
 endif()
 
 # Phase B8 — security/mtls.cpp uses OpenSSL X.509 when available

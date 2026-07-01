@@ -54,6 +54,11 @@ option(KVCACHE_ENABLE_URING   "Build NvmeTier with liburing path" OFF)
 # the standard build needs no extra dep; the codec seam ships an always-on
 # identity codec, and the zstd codec compiles only when this is ON.
 option(KVCACHE_ENABLE_ZSTD    "Build cold-tier zstd compression codec" OFF)
+# Phase A1 — UCX RMA transport backend. Default OFF so the standard build has
+# no UCX dependency; the "ucx" NIXL backend compiles only when this is ON
+# (ucx_backend.cpp ships a "not compiled in" stub otherwise). UCX auto-selects
+# IB/RoCE verbs, shared memory, or TCP at runtime.
+option(KVCACHE_ENABLE_UCX     "Build the UCX RMA NIXL backend" OFF)
 
 if(KVCACHE_ENABLE_ROCKSDB)
     # Phase B10 — prefer the CMake CONFIG package (Homebrew, vcpkg, a
@@ -98,6 +103,14 @@ if(KVCACHE_ENABLE_ZSTD)
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(ZSTD REQUIRED IMPORTED_TARGET libzstd)
     add_compile_definitions(KVCACHE_HAVE_ZSTD=1)
+endif()
+
+if(KVCACHE_ENABLE_UCX)
+    # UCX ships ucx.pc (apt libucx-dev, source install, spack). IMPORTED_TARGET
+    # gives downstream a clean PkgConfig::UCX. REQUIRED — the user asked for it.
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(UCX REQUIRED IMPORTED_TARGET ucx)
+    add_compile_definitions(KVCACHE_HAVE_UCX=1)
 endif()
 
 # --------------------------------------------------------------------------
