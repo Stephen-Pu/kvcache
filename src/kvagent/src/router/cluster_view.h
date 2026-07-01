@@ -28,6 +28,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "router/hrw_resolver.h"
@@ -66,6 +67,15 @@ class ClusterViewWatcher {
     // parses to an empty vector (a real "cluster has no nodes" state),
     // distinct from a parse failure. This is the testable unit.
     static std::optional<std::vector<std::string>> ParseNodeIds(
+        const std::string& json_body);
+
+    // Phase A8+ — like ParseNodeIds, but also lifts each node's optional
+    // `weight` (capacity / traffic weight) so the resolver can do weighted
+    // HRW. Weight defaults to 1.0 when the view omits it (so a CP that
+    // doesn't yet publish weights yields the original uniform behaviour).
+    // DRAINING nodes are skipped exactly as in ParseNodeIds. Returns
+    // (node_id, weight) pairs in snapshot order; nullopt on malformed JSON.
+    static std::optional<std::vector<std::pair<std::string, double>>> ParseNodes(
         const std::string& json_body);
 
     // Synchronous refresh: call Loader once, parse, apply to resolver.

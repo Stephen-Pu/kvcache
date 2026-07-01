@@ -147,3 +147,33 @@ TEST(ClusterViewWatcherTest, UpdatedViewReplacesNodeSet) {
     EXPECT_EQ(w.RefreshOnce(), 2);
     EXPECT_EQ(hrw.NodeCount(), 2u);
 }
+
+// Phase A8+ — ParseNodes lifts per-node weight; absent weight defaults to 1.0,
+// and a non-positive / wrong-typed weight also falls back to 1.0 (never
+// silently zeroes a node out of routing).
+TEST(ClusterViewParseTest, ParseNodesReadsWeightWithDefault) {
+    auto nodes = ClusterViewWatcher::ParseNodes(
+        R"({"nodes":[
+              {"node_id":"heavy","weight":8.5},
+              {"node_id":"plain"},
+              {"node_id":"zero","weight":0},
+              {"node_id":"bad","weight":"x"}
+        ]})");
+    ASSERT_TRUE(nodes.has_value());
+    ASSERT_EQ(nodes->size(), 4u);
+    EXPECT_EQ((*nodes)[0].first, "heavy");
+    EXPECT_DOUBLE_EQ((*nodes)[0].second, 8.5);
+    EXPECT_DOUBLE_EQ((*nodes)[1].second, 1.0) << "absent weight → 1.0";
+    EXPECT_DOUBLE_EQ((*nodes)[2].second, 1.0) << "non-positive weight → 1.0";
+    EXPECT_DOUBLE_EQ((*nodes)[3].second, 1.0) << "wrong-typed weight → 1.0";
+}
+
+// Back-compat: ParseNodeIds still projects just the ids (now delegates to
+// ParseNodes), including the DRAINING skip.
+TEST(ClusterViewParseTest, ParseNodeIdsStillProjectsIds) {
+    auto ids = ClusterViewWatcher::ParseNodeIds(
+        R"({"nodes":[{"node_id":"a","weight":3},{"node_id":"b","state":"DRAINING"}]})");
+    ASSERT_TRUE(ids.has_value());
+    ASSERT_EQ(ids->size(), 1u) << "draining node b skipped";
+    EXPECT_EQ((*ids)[0], "a");
+}

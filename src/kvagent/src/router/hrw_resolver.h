@@ -28,6 +28,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "router/router.h"            // ResolveResult, NodeResolver
@@ -40,10 +41,16 @@ class HrwResolver {
     HrwResolver() = default;
 
     // Replace the node set (copy-on-write inside HrwRing). Thread-safe.
-    // node_ids are the kvstore-node ids the agent learned from the
-    // cluster view; traffic_weight defaults to 1.0 (uniform) until the
-    // agent also ingests per-node weights.
+    // This uniform-weight overload keeps every node at traffic_weight 1.0.
     void SetNodes(const std::vector<std::string>& node_ids);
+
+    // Phase A8+ — capacity-weighted node set: each (node_id, weight) drives
+    // HRW's effective score (eff = hash * weight), so a higher-weight node
+    // wins the rendezvous hash proportionally more often and a weight-0 node
+    // is never chosen (matches a draining/zero-capacity node). Weights come
+    // from the CP-published cluster view (default 1.0 when the view omits
+    // them, preserving the uniform behaviour).
+    void SetNodes(const std::vector<std::pair<std::string, double>>& weighted);
 
     std::size_t NodeCount() const noexcept { return ring_.NodeCount(); }
 

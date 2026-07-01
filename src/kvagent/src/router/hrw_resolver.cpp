@@ -14,6 +14,16 @@ void HrwResolver::SetNodes(const std::vector<std::string>& node_ids) {
     ring_.SetNodes(std::move(entries));
 }
 
+void HrwResolver::SetNodes(
+    const std::vector<std::pair<std::string, double>>& weighted) {
+    std::vector<kvcache::node::routing::NodeEntry> entries;
+    entries.reserve(weighted.size());
+    for (const auto& [id, w] : weighted) {
+        entries.push_back({id, w});
+    }
+    ring_.SetNodes(std::move(entries));
+}
+
 std::optional<ResolveResult> HrwResolver::Resolve(
     const std::array<uint8_t, 16>& tenant_id,
     const std::array<uint8_t, 16>& prefix_hash) const {

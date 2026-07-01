@@ -7,12 +7,12 @@
 
 namespace kvcache::agent::router {
 
-std::optional<std::vector<std::string>> ClusterViewWatcher::ParseNodeIds(
-    const std::string& json_body) {
+std::optional<std::vector<std::pair<std::string, double>>>
+ClusterViewWatcher::ParseNodes(const std::string& json_body) {
     if (json_body.empty()) {
         // Key absent (no leader / fresh cluster) → an empty set, not an
         // error. The resolver will miss and the engine recomputes.
-        return std::vector<std::string>{};
+        return std::vector<std::pair<std::string, double>>{};
     }
     nlohmann::json j = nlohmann::json::parse(json_body, /*cb=*/nullptr,
                                              /*allow_exceptions=*/false);
@@ -21,8 +21,8 @@ std::optional<std::vector<std::string>> ClusterViewWatcher::ParseNodeIds(
     auto it = j.find("nodes");
     if (it == j.end() || !it->is_array()) return std::nullopt;
 
-    std::vector<std::string> ids;
-    ids.reserve(it->size());
+    std::vector<std::pair<std::string, double>> nodes;
+    nodes.reserve(it->size());
     for (const auto& node : *it) {
         if (!node.is_object()) continue;
         auto nid = node.find("node_id");
@@ -42,6 +42,28 @@ std::optional<std::vector<std::string>> ClusterViewWatcher::ParseNodeIds(
             for (auto& c : state) c = static_cast<char>(std::tolower(c));
             if (state.find("drain") != std::string::npos) continue;
         }
+        // Phase A8+ — optional per-node capacity weight (default 1.0). A
+        // non-positive or non-numeric weight falls back to 1.0 so a
+        // malformed field can't silently zero a node out of routing.
+        double weight = 1.0;
+        if (auto w = node.find("weight");
+            w != node.end() && w->is_number()) {
+            const double wv = w->get<double>();
+            if (wv > 0.0) weight = wv;
+        }
+        nodes.emplace_back(std::move(id), weight);
+    }
+    return nodes;
+}
+
+std::optional<std::vector<std::string>> ClusterViewWatcher::ParseNodeIds(
+    const std::string& json_body) {
+    auto nodes = ParseNodes(json_body);
+    if (!nodes) return std::nullopt;
+    std::vector<std::string> ids;
+    ids.reserve(nodes->size());
+    for (auto& [id, w] : *nodes) {
+        (void)w;
         ids.push_back(std::move(id));
     }
     return ids;
@@ -58,15 +80,15 @@ int ClusterViewWatcher::RefreshOnce() {
         refreshes_failed_.fetch_add(1, std::memory_order_relaxed);
         return -1;
     }
-    auto ids = ParseNodeIds(*body);
-    if (!ids) {  // malformed JSON — keep the last-good set
+    auto nodes = ParseNodes(*body);
+    if (!nodes) {  // malformed JSON — keep the last-good set
         refreshes_failed_.fetch_add(1, std::memory_order_relaxed);
         return -1;
     }
-    resolver_.SetNodes(*ids);
+    resolver_.SetNodes(*nodes);  // A8+ — weighted overload (uniform if no weights)
     refreshes_ok_.fetch_add(1, std::memory_order_relaxed);
-    last_node_count_.store(ids->size(), std::memory_order_relaxed);
-    return static_cast<int>(ids->size());
+    last_node_count_.store(nodes->size(), std::memory_order_relaxed);
+    return static_cast<int>(nodes->size());
 }
 
 void ClusterViewWatcher::Start() {
