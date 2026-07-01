@@ -363,6 +363,29 @@ kvcache_add_test(test_trace             obs/trace_test.cpp)
 kvcache_add_test(test_trace_otlp        obs/trace_otlp_test.cpp)
 target_link_libraries(test_trace_otlp PRIVATE kvcache_otlp CURL::libcurl nlohmann_json::nlohmann_json)
 
+# Task 1 — A9 DR warm-standby: ReplicaFetch on HeadlessNode.
+#
+# The test calls HeadlessNode methods directly (not via the C ABI), so we
+# compile headless_node.cpp and ctx_options.cpp into the binary rather than
+# linking the kvcache dylib (which hides non-ABI C++ symbols). We link
+# kvstore_node_core for all node subsystem deps and kvcache_common for
+# metrics/tracing/hashing utilities.
+kvcache_add_test(test_replica_fetch
+                  replication/replica_fetch_test.cpp
+                  ${CMAKE_SOURCE_DIR}/core-abi/src/headless_node.cpp
+                  ${CMAKE_SOURCE_DIR}/core-abi/src/ctx_options.cpp
+                  ${CMAKE_SOURCE_DIR}/core-abi/src/kv_status.cpp)
+target_include_directories(test_replica_fetch PRIVATE
+                  ${CMAKE_SOURCE_DIR}/core-abi/src
+                  ${KVCACHE_NODE_SRC})
+target_link_libraries(test_replica_fetch PRIVATE
+                  kvstore_node_core
+                  kvcache_common
+                  CURL::libcurl)
+if(OpenSSL_FOUND)
+    target_link_libraries(test_replica_fetch PRIVATE OpenSSL::Crypto)
+endif()
+
 # Phase A1 — kvagent module tests. Each test links the agent's
 # static lib; the include surface is the kvagent_lib PUBLIC dirs.
 if(KVCACHE_BUILD_AGENT)

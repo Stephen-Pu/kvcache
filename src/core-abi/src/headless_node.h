@@ -129,6 +129,22 @@ class HeadlessNode {
     // checkpoint timer. Returns true on success; sets *err otherwise.
     bool WriteArtSnapshot(const std::string& path, std::string* err);
 
+    // Task 1 — A9 DR warm-standby: read-only fetch of a sealed chunk's
+    // identity + bytes by locator.
+    //
+    // On KV_OK: fills `*out` with the chunk_path (K 8-byte hashes, as stored
+    // in evict_index_ at Seal time) and the sealed KV bytes from the DRAM
+    // tier.
+    //
+    // Returns KV_E_NOT_FOUND if the locator has no sealed chunk (never sealed,
+    // or evicted since). Returns KV_E_INVAL if `out` is null. Read-only: no
+    // refcount side effects, no tier promotion.
+    struct ReplicaChunk {
+        std::vector<node::prefix::ChunkHash> chunk_path;
+        std::vector<uint8_t>                 bytes;
+    };
+    int ReplicaFetch(const kv_locator_t& locator, ReplicaChunk* out);
+
     // Event subscription (Phase M-2). The poller thread invokes
     // `cb(event, user)` on each Add / Evict / Promote / Demote event
     // observed by the node's EventStream. One subscription per

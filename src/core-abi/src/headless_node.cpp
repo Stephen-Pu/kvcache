@@ -654,6 +654,37 @@ int HeadlessNode::Seal(kv_handle_t handle,
 }
 
 // ---------------------------------------------------------------------------
+// ReplicaFetch (Task 1 — A9 DR warm-standby)
+// ---------------------------------------------------------------------------
+
+int HeadlessNode::ReplicaFetch(const kv_locator_t& locator, ReplicaChunk* out) {
+    if (!out) return KV_E_INVAL;
+
+    const auto key = LocatorContentKey(locator);
+
+    // Resolve the chunk_path from evict_index_ (populated at Seal time).
+    {
+        std::lock_guard<std::mutex> lk(mu_evict_);
+        auto it = evict_index_.find(key);
+        if (it == evict_index_.end()) return KV_E_NOT_FOUND;
+        out->chunk_path = it->second;
+    }
+
+    // Fetch the sealed bytes from the tier stack (DRAM → NVMe → Cold).
+    // This is the same unified path Fetch/FetchWithPriority uses, but
+    // without the NIXL transfer or refcount side effects.
+    std::string err;
+    auto f = tm_->Fetch(key, &err);
+    if (f.hit == node::tier::TierManager::FetchHit::kMiss) {
+        // Chunk was evicted from all tiers since Seal.
+        out->chunk_path.clear();
+        return KV_E_NOT_FOUND;
+    }
+    out->bytes = std::move(f.data);
+    return KV_OK;
+}
+
+// ---------------------------------------------------------------------------
 // Release
 // ---------------------------------------------------------------------------
 
