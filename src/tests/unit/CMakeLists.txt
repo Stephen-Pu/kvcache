@@ -135,6 +135,11 @@ foreach(_tier_t test_pinned_tier test_dram_tier test_nvme_tier test_cold_tier te
     if(KVCACHE_ENABLE_CUDA)
         target_link_libraries(${_tier_t} PRIVATE CUDA::cudart)
     endif()
+    # A3 — nvme_tier.cpp pulls SPDK when the user-space NVMe path is enabled.
+    if(KVCACHE_ENABLE_SPDK)
+        target_include_directories(${_tier_t} PRIVATE ${SPDK_INCLUDE_DIR})
+        target_link_libraries(${_tier_t} PRIVATE ${SPDK_LINK_LIBS})
+    endif()
 endforeach()
 
 # KVZ-1 — KvTensorCodec (KV-tensor compression). Standalone; the zstd
@@ -173,6 +178,11 @@ foreach(_ing_t test_mutable_buffer test_watermark test_seal)
     # A2 — pinned_tier.cpp (in NODE_TIER_SRCS) needs the CUDA runtime.
     if(KVCACHE_ENABLE_CUDA)
         target_link_libraries(${_ing_t} PRIVATE CUDA::cudart)
+    endif()
+    # A3 — nvme_tier.cpp (in NODE_TIER_SRCS) needs SPDK when enabled.
+    if(KVCACHE_ENABLE_SPDK)
+        target_include_directories(${_ing_t} PRIVATE ${SPDK_INCLUDE_DIR})
+        target_link_libraries(${_ing_t} PRIVATE ${SPDK_LINK_LIBS})
     endif()
 endforeach()
 

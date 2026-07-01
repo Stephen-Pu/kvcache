@@ -122,6 +122,45 @@ if(KVCACHE_ENABLE_CUDA)
     add_compile_definitions(KVCACHE_HAVE_CUDA=1)
 endif()
 
+if(KVCACHE_ENABLE_SPDK)
+    # Phase A3 — SPDK user-space NVMe backend. SPDK isn't apt-packaged; the
+    # user points -DSPDK_DIR at a built SPDK tree. Linking SPDK is famously
+    # fiddly: the DPDK PCIe bus driver + SPDK NVMe transport register
+    # themselves via constructors in their static archives, so those archives
+    # MUST be pulled with -Wl,--whole-archive or probe() finds no devices.
+    if(NOT SPDK_DIR)
+        message(FATAL_ERROR "KVCACHE_ENABLE_SPDK=ON requires -DSPDK_DIR=/path/to/spdk (a built SPDK tree)")
+    endif()
+    add_compile_definitions(KVCACHE_HAVE_SPDK=1)
+    set(SPDK_INCLUDE_DIR "${SPDK_DIR}/include" CACHE INTERNAL "")
+    # Pull the pkg-config link line for the archives we use.
+    execute_process(
+        COMMAND ${CMAKE_COMMAND} -E env "PKG_CONFIG_PATH=${SPDK_DIR}/build/lib/pkgconfig"
+                pkg-config --libs spdk_nvme spdk_env_dpdk
+        OUTPUT_VARIABLE _spdk_libs OUTPUT_STRIP_TRAILING_WHITESPACE
+        RESULT_VARIABLE _spdk_rc)
+    # SPDK's own authoritative external-deps list (isa-l, isa-l_crypto, aio,
+    # numa, uuid, ssl, crypto, fuse3, keyutils, …) — so we don't hand-guess the
+    # transitive set. NOT whole-archived (leaf libs, symbols pulled on demand).
+    execute_process(
+        COMMAND ${CMAKE_COMMAND} -E env "PKG_CONFIG_PATH=${SPDK_DIR}/build/lib/pkgconfig"
+                pkg-config --libs --static spdk_syslibs
+        OUTPUT_VARIABLE _spdk_syslibs OUTPUT_STRIP_TRAILING_WHITESPACE
+        RESULT_VARIABLE _spdk_sys_rc)
+    if(NOT _spdk_rc EQUAL 0 OR NOT _spdk_sys_rc EQUAL 0)
+        message(FATAL_ERROR "pkg-config for SPDK failed under ${SPDK_DIR}/build/lib/pkgconfig")
+    endif()
+    separate_arguments(_spdk_libs_list UNIX_COMMAND "${_spdk_libs}")
+    separate_arguments(_spdk_syslibs_list UNIX_COMMAND "${_spdk_syslibs}")
+    # DPDK builds its rte_* libs as shared objects; embed an rpath so the
+    # binaries resolve librte_eal.so.* at runtime without LD_LIBRARY_PATH.
+    set(SPDK_LINK_LIBS
+        -Wl,--whole-archive ${_spdk_libs_list} -Wl,--no-whole-archive
+        ${_spdk_syslibs_list}
+        -Wl,-rpath,${SPDK_DIR}/dpdk/build/lib -Wl,-rpath,${SPDK_DIR}/build/lib
+        CACHE INTERNAL "SPDK whole-archive link line")
+endif()
+
 # --------------------------------------------------------------------------
 # BLAKE3 — real cryptographic hash (replaces the FNV-1a + SplitMix64 facade).
 # We prefer a system install (`find_package(BLAKE3 CONFIG)`) and fall back to

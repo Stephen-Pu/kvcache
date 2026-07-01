@@ -112,6 +112,14 @@ if(KVCACHE_ENABLE_CUDA)
     target_link_libraries(kvstore_node_core PUBLIC CUDA::cudart)
 endif()
 
+# Phase A3 — SPDK user-space NVMe backend. KVCACHE_HAVE_SPDK (top level) gates
+# the SpdkImpl body in nvme_tier.cpp. SPDK_INCLUDE_DIR / SPDK_LINK_LIBS were
+# computed at the top level (whole-archive wrapped).
+if(KVCACHE_ENABLE_SPDK)
+    target_include_directories(kvstore_node_core PUBLIC ${SPDK_INCLUDE_DIR})
+    target_link_libraries(kvstore_node_core PUBLIC ${SPDK_LINK_LIBS})
+endif()
+
 # Phase B8 — security/mtls.cpp uses OpenSSL X.509 when available
 # (KVCACHE_HAVE_OPENSSL defined at the top level). Link Crypto so the
 # X509_*/PEM_*/GENERAL_NAME_* symbols resolve.

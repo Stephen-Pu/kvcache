@@ -13,6 +13,11 @@
 #  include <liburing.h>
 #endif
 
+#if KVCACHE_HAVE_SPDK
+#  include <spdk/env.h>
+#  include <spdk/nvme.h>
+#endif
+
 #include "logging.h"  // Phase B1 — Warn at Create() when use_uring is
                       // ignored because the build doesn't include it.
 
@@ -185,6 +190,117 @@ struct NvmeTier::UringImpl {
 #endif
 };
 
+// ----- SpdkImpl (Phase A3) ----------------------------------------------
+//
+// User-space NVMe via SPDK's low-level driver API (spdk_nvme_*), NOT the
+// bdev/app framework — so no reactor/poller thread is needed. One IO qpair;
+// Put/Get submit a single command and poll it to completion inline. The qpair
+// is not thread-safe, so io_mu serialises all device I/O. spdk_env_init is a
+// process singleton (guarded by a once_flag). Defined unconditionally so the
+// header's unique_ptr<SpdkImpl> dtor has a complete type; the body is gated.
+struct NvmeTier::SpdkImpl {
+#if KVCACHE_HAVE_SPDK
+    spdk_nvme_ctrlr* ctrlr       = nullptr;
+    spdk_nvme_ns*    ns          = nullptr;
+    spdk_nvme_qpair* qpair       = nullptr;
+    uint32_t         sector_size = 0;
+    std::mutex       io_mu;
+
+    struct CbArg { int done = 0; bool error = false; };
+    static void OpDone(void* arg, const struct spdk_nvme_cpl* cpl) {
+        auto* a = static_cast<CbArg*>(arg);
+        a->error = spdk_nvme_cpl_is_error(cpl);
+        a->done  = 1;
+    }
+    // Attach the first controller the probe surfaces (we probed a specific
+    // PCIe traddr, so there's exactly one).
+    static bool ProbeCb(void*, const struct spdk_nvme_transport_id*,
+                        struct spdk_nvme_ctrlr_opts*) { return true; }
+    static void AttachCb(void* cb_ctx, const struct spdk_nvme_transport_id*,
+                         struct spdk_nvme_ctrlr* c,
+                         const struct spdk_nvme_ctrlr_opts*) {
+        auto* self = static_cast<SpdkImpl*>(cb_ctx);
+        if (!self->ctrlr) self->ctrlr = c;
+    }
+
+    ~SpdkImpl() {
+        if (qpair) spdk_nvme_ctrlr_free_io_qpair(qpair);
+        if (ctrlr) {
+            struct spdk_nvme_detach_ctx* dctx = nullptr;
+            spdk_nvme_detach_async(ctrlr, &dctx);
+            if (dctx) { while (spdk_nvme_detach_poll_async(dctx) == -EAGAIN) {} }
+        }
+    }
+
+    bool Init(const std::string& pci_addr, std::string* err) {
+        static std::once_flag env_once;
+        static bool env_ok = false;
+        std::call_once(env_once, [] {
+            struct spdk_env_opts opts;
+            spdk_env_opts_init(&opts);
+            opts.name = "kvcache_nvme_tier";
+            env_ok = (spdk_env_init(&opts) == 0);
+        });
+        if (!env_ok) { if (err) *err = "nvme_tier(spdk): spdk_env_init failed"; return false; }
+
+        struct spdk_nvme_transport_id trid;
+        std::memset(&trid, 0, sizeof(trid));
+        spdk_nvme_trid_populate_transport(&trid, SPDK_NVME_TRANSPORT_PCIE);
+        std::snprintf(trid.traddr, sizeof(trid.traddr), "%s", pci_addr.c_str());
+
+        if (spdk_nvme_probe(&trid, this, ProbeCb, AttachCb, nullptr) != 0 || !ctrlr) {
+            if (err) *err = "nvme_tier(spdk): probe/attach failed for '" + pci_addr + "'";
+            return false;
+        }
+        ns = spdk_nvme_ctrlr_get_ns(ctrlr, 1);
+        if (!ns || !spdk_nvme_ns_is_active(ns)) {
+            if (err) *err = "nvme_tier(spdk): namespace 1 not active";
+            return false;
+        }
+        sector_size = spdk_nvme_ns_get_sector_size(ns);
+        qpair = spdk_nvme_ctrlr_alloc_io_qpair(ctrlr, nullptr, 0);
+        if (!qpair) { if (err) *err = "nvme_tier(spdk): alloc_io_qpair failed"; return false; }
+        return true;
+    }
+
+    // Read/write `n` bytes at device byte-offset `byte_off` (must be sector-
+    // aligned). Uses a DMA bounce buffer sized up to the sector; short tails
+    // are zero-padded on write and truncated on read.
+    bool DoOp(uint64_t byte_off, void* buf, std::size_t n, bool is_write,
+              std::string* err) {
+        std::lock_guard<std::mutex> lk(io_mu);
+        if (sector_size == 0 || byte_off % sector_size != 0) {
+            if (err) *err = "nvme_tier(spdk): unaligned/zero-sector offset";
+            return false;
+        }
+        const uint64_t lba = byte_off / sector_size;
+        const uint32_t lba_count =
+            static_cast<uint32_t>((n + sector_size - 1) / sector_size);
+        const std::size_t dma_len =
+            static_cast<std::size_t>(lba_count) * sector_size;
+        void* dma = spdk_dma_zmalloc(dma_len, sector_size, nullptr);
+        if (!dma) { if (err) *err = "nvme_tier(spdk): dma_zmalloc failed"; return false; }
+        if (is_write) std::memcpy(dma, buf, n);
+
+        CbArg cb;
+        const int rc = is_write
+            ? spdk_nvme_ns_cmd_write(ns, qpair, dma, lba, lba_count, OpDone, &cb, 0)
+            : spdk_nvme_ns_cmd_read(ns, qpair, dma, lba, lba_count, OpDone, &cb, 0);
+        if (rc != 0) {
+            spdk_dma_free(dma);
+            if (err) *err = "nvme_tier(spdk): submit failed";
+            return false;
+        }
+        while (cb.done == 0) spdk_nvme_qpair_process_completions(qpair, 0);
+        const bool ok = !cb.error;
+        if (ok && !is_write) std::memcpy(buf, dma, n);
+        spdk_dma_free(dma);
+        if (!ok && err) *err = "nvme_tier(spdk): I/O completion error";
+        return ok;
+    }
+#endif
+};
+
 namespace {
 ssize_t PwriteAll(int fd, const void* buf, std::size_t n, off_t off) {
     const uint8_t* p = static_cast<const uint8_t*>(buf);
@@ -213,26 +329,33 @@ ssize_t PreadAll(int fd, void* buf, std::size_t n, off_t off) {
 }  // namespace
 
 std::unique_ptr<NvmeTier> NvmeTier::Create(const Options& opts, std::string* err) {
-    if (opts.path.empty() || opts.pool_bytes == 0 || opts.slot_bytes == 0 ||
+    // path is the backing file for the blocking/uring paths; the SPDK path
+    // addresses the device directly and needs spdk_pci_addr instead.
+    if ((!opts.use_spdk && opts.path.empty()) ||
+        opts.pool_bytes == 0 || opts.slot_bytes == 0 ||
         opts.pool_bytes < opts.slot_bytes ||
         opts.pool_bytes % opts.slot_bytes != 0) {
         if (err) *err = "nvme_tier: invalid options";
         return nullptr;
     }
 
-    int flags = O_RDWR | (opts.create_if_missing ? O_CREAT : 0);
-    int fd = ::open(opts.path.c_str(), flags, 0644);
-    if (fd < 0) {
-        if (err) *err = std::string("nvme_tier: open failed: ") + std::strerror(errno);
-        return nullptr;
-    }
-
-    // Pre-allocate the backing file. ftruncate is the portable choice; the
-    // first slot write will fault in extents on POSIX-conforming filesystems.
-    if (::ftruncate(fd, static_cast<off_t>(opts.pool_bytes)) != 0) {
-        if (err) *err = std::string("nvme_tier: ftruncate: ") + std::strerror(errno);
-        ::close(fd);
-        return nullptr;
+    // Open + pre-allocate the backing file — but NOT for the SPDK path, which
+    // bypasses the filesystem and writes device LBAs directly.
+    int fd = -1;
+    if (!opts.use_spdk) {
+        int flags = O_RDWR | (opts.create_if_missing ? O_CREAT : 0);
+        fd = ::open(opts.path.c_str(), flags, 0644);
+        if (fd < 0) {
+            if (err) *err = std::string("nvme_tier: open failed: ") + std::strerror(errno);
+            return nullptr;
+        }
+        // ftruncate is the portable choice; the first slot write faults in
+        // extents on POSIX-conforming filesystems.
+        if (::ftruncate(fd, static_cast<off_t>(opts.pool_bytes)) != 0) {
+            if (err) *err = std::string("nvme_tier: ftruncate: ") + std::strerror(errno);
+            ::close(fd);
+            return nullptr;
+        }
     }
 
     auto t = std::unique_ptr<NvmeTier>(new NvmeTier());
@@ -246,6 +369,31 @@ std::unique_ptr<NvmeTier> NvmeTier::Create(const Options& opts, std::string* err
     t->free_stack_.reserve(t->slot_count_);
     for (uint32_t i = t->slot_count_; i > 0; --i) {
         t->free_stack_.push_back(i - 1);
+    }
+
+    // Phase A3 — wire the SPDK user-space NVMe backend when asked + available.
+    // Takes precedence over io_uring (both can't own the device).
+    if (opts.use_spdk) {
+#if KVCACHE_HAVE_SPDK
+        if (opts.spdk_pci_addr.empty()) {
+            if (err) *err = "nvme_tier(spdk): use_spdk=true requires spdk_pci_addr";
+            return nullptr;
+        }
+        auto s = std::make_unique<SpdkImpl>();
+        if (!s->Init(opts.spdk_pci_addr, err)) return nullptr;  // *err set
+        // Slot offsets must be sector-aligned for direct LBA I/O.
+        if (opts.slot_bytes % s->sector_size != 0) {
+            if (err) *err = "nvme_tier(spdk): slot_bytes must be a multiple of "
+                            "the device sector size";
+            return nullptr;
+        }
+        t->spdk_ = std::move(s);
+        return t;  // SPDK path owns the device; skip the uring/file wiring.
+#else
+        ::kvcache::log::Get("nvme_tier").Warn(
+            "Options::use_spdk=true ignored: built without "
+            "KVCACHE_ENABLE_SPDK — falling back to blocking/uring file path");
+#endif
     }
 
     // Phase B1 — wire io_uring when asked + available.
@@ -309,6 +457,12 @@ bool NvmeTier::Put(const DramKey& key, const uint8_t* data, std::size_t n,
 
     const off_t off = static_cast<off_t>(slot) * static_cast<off_t>(slot_bytes_);
     bool write_ok = false;
+#if KVCACHE_HAVE_SPDK
+    if (spdk_) {
+        write_ok = spdk_->DoOp(static_cast<uint64_t>(off),
+                               const_cast<uint8_t*>(data), n, /*is_write=*/true, err);
+    } else
+#endif
 #ifdef KVCACHE_ENABLE_URING
     if (uring_) {
         // const_cast: io_uring_prep_write takes void*, but we never
@@ -334,7 +488,7 @@ bool NvmeTier::Put(const DramKey& key, const uint8_t* data, std::size_t n,
         }
         return false;
     }
-    if (fdatasync_) {
+    if (fdatasync_ && fd_ >= 0) {  // no fd on the SPDK path
         // fdatasync is Linux-only; macOS falls back to fsync (slightly more
         // work — also flushes inode metadata — but functionally correct).
 #if defined(__APPLE__)
@@ -367,6 +521,14 @@ bool NvmeTier::Get(const DramKey& key, uint8_t* dst, std::size_t dst_capacity,
         return false;
     }
     const off_t off = static_cast<off_t>(e.slot_id) * static_cast<off_t>(slot_bytes_);
+#if KVCACHE_HAVE_SPDK
+    if (spdk_) {
+        if (!spdk_->DoOp(static_cast<uint64_t>(off), dst, e.bytes,
+                         /*is_write=*/false, err)) {
+            return false;
+        }
+    } else
+#endif
 #ifdef KVCACHE_ENABLE_URING
     if (uring_) {
         if (!uring_->DoOp(fd_, dst, e.bytes, off, /*is_write=*/false, err)) {
@@ -386,6 +548,10 @@ bool NvmeTier::Get(const DramKey& key, uint8_t* dst, std::size_t dst_capacity,
 
 bool NvmeTier::UsingUring() const noexcept {
     return uring_ != nullptr;
+}
+
+bool NvmeTier::UsingSpdk() const noexcept {
+    return spdk_ != nullptr;
 }
 
 uint64_t NvmeTier::UringPeakInFlight() const noexcept {

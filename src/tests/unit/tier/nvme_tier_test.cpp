@@ -241,3 +241,46 @@ TEST(NvmeTierTest, UringAchievesConcurrencyAcrossWriters) {
     std::filesystem::remove(o.path);
 #endif
 }
+
+#if KVCACHE_HAVE_SPDK
+// Phase A3 — SPDK user-space NVMe round-trip on a REAL device. This can only
+// run where SPDK is set up: hugepages configured + the target NVMe bound to
+// vfio-pci (SPDK scripts/setup.sh). It's device-specific, so the PCIe address
+// is supplied via $KVCACHE_SPDK_PCI; the test skips (not fails) when unset so
+// CI on boxes without a bound device stays green. Slot offsets are device
+// LBAs — bypassing the kernel block layer entirely.
+TEST(NvmeTierSpdkTest, PutGetRoundTripOnRealDevice) {
+    const char* pci = std::getenv("KVCACHE_SPDK_PCI");
+    if (!pci || !*pci) {
+        GTEST_SKIP() << "KVCACHE_SPDK_PCI unset — no vfio-bound NVMe to test";
+    }
+    NvmeTier::Options o;
+    o.use_spdk      = true;
+    o.spdk_pci_addr = pci;
+    o.pool_bytes    = 8u << 20;   // 8 slots
+    o.slot_bytes    = 1u << 20;   // 1 MiB (multiple of the 512/4096 sector)
+    std::string err;
+    auto t = NvmeTier::Create(o, &err);
+    ASSERT_NE(t, nullptr) << err;
+    EXPECT_TRUE(t->UsingSpdk());
+
+    // Write a recognisable pattern, read it back byte-exact off the device.
+    std::vector<uint8_t> payload(200000);
+    for (std::size_t i = 0; i < payload.size(); ++i)
+        payload[i] = static_cast<uint8_t>((i * 131 + 7) & 0xFF);
+
+    ASSERT_TRUE(t->Put(Key(1), payload.data(), payload.size(), &err)) << err;
+    std::vector<uint8_t> got;
+    ASSERT_TRUE(t->Get(Key(1), &got, &err)) << err;
+    EXPECT_EQ(got, payload) << "SPDK NVMe round-trip must be byte-exact";
+
+    // A second key lands in a different slot/LBA and doesn't disturb the first.
+    std::vector<uint8_t> p2(4096, 0xC3);
+    ASSERT_TRUE(t->Put(Key(2), p2.data(), p2.size(), &err)) << err;
+    std::vector<uint8_t> g2;
+    ASSERT_TRUE(t->Get(Key(2), &g2, &err)) << err;
+    EXPECT_EQ(g2, p2);
+    ASSERT_TRUE(t->Get(Key(1), &got, &err)) << err;
+    EXPECT_EQ(got, payload);
+}
+#endif  // KVCACHE_HAVE_SPDK

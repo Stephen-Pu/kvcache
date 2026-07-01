@@ -58,6 +58,19 @@ class NvmeTier {
         // enough to amortise the submit_and_wait syscall under
         // realistic concurrency, small enough to fit in one page.
         uint32_t    uring_queue_depth = 128;
+        // Phase A3 — opt-in to the SPDK user-space NVMe backend (Linux-only,
+        // requires building with -DKVCACHE_ENABLE_SPDK=ON, hugepages, and the
+        // target device bound to vfio-pci/uio). When true, the tier bypasses
+        // the kernel block layer entirely: it does NOT open `path` as a file;
+        // instead it drives the NVMe namespace directly via LBA read/write.
+        // Slot N maps to byte offset N*slot_bytes on the device. Ignored (with
+        // a warn) on builds without KVCACHE_ENABLE_SPDK — falls back to the
+        // blocking / io_uring file path.
+        bool        use_spdk          = false;
+        // PCIe address of the NVMe controller to attach, e.g. "0000:00:1e.0"
+        // (as shown by SPDK's scripts/setup.sh status). Required when
+        // use_spdk=true.
+        std::string spdk_pci_addr;
     };
 
     static std::unique_ptr<NvmeTier> Create(const Options& opts, std::string* err);
@@ -87,6 +100,10 @@ class NvmeTier {
     // backend live. Operators and tests inspect this to know whether
     // Put/Get is taking the async path.
     bool UsingUring() const noexcept;
+
+    // Phase A3 — true iff the SPDK user-space NVMe backend is live (built with
+    // KVCACHE_ENABLE_SPDK and use_spdk=true attached a controller).
+    bool UsingSpdk() const noexcept;
 
     // Phase B1.1 — high-watermark of concurrent in-flight io_uring
     // ops the reaper has tracked. Returns 0 on non-uring builds or
@@ -128,6 +145,12 @@ class NvmeTier {
     // KVCACHE_ENABLE_URING or when use_uring=false was passed.
     struct UringImpl;
     std::unique_ptr<UringImpl> uring_;
+
+    // Phase A3 — SPDK state. Forward-declared like UringImpl so the header
+    // doesn't pull in <spdk/*.h>. Always nullptr without KVCACHE_ENABLE_SPDK
+    // or when use_spdk=false.
+    struct SpdkImpl;
+    std::unique_ptr<SpdkImpl> spdk_;
 };
 
 }  // namespace kvcache::node::tier
