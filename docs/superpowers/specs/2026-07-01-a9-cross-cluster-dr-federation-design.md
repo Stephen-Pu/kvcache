@@ -136,9 +136,13 @@ existing `cross_process_pull` / `node_data_service` integration patterns:
 - Active/active and 1:N topologies (other federation modes).
 - WAN transport hardening (compression on the replication link — could reuse
   the B2 codec / B3 cold-tier zstd; TLS is via the SPIFFE mTLS link).
-- A10 (FedRAMP/sovereign) will revisit R4: a standby in a *separate*
-  regulatory boundary would move to **distinct trust domains + a SPIFFE
-  federation bundle** instead of a shared domain.
+- A10 (FedRAMP/sovereign) resolution of R4: Regulated Mode **forbids
+  cross-boundary replication** (its BoundaryGuard denies an out-of-boundary
+  target), so a DR standby is always in-boundary and the **shared SPIFFE trust
+  domain (R4) stays correct**. Distinct-trust-domain, cross-boundary federation
+  (SPIFFE federation bundle) is a separate, non-regulated future — not enabled
+  by Regulated Mode. See
+  [A10 §5](2026-07-01-a10-regulated-mode-design.md#5-a9--a10-reconciliation).
 
 ## 10. Reuse ledger (what already exists)
 
