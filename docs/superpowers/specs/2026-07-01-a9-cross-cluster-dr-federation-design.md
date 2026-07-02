@@ -140,6 +140,13 @@ existing `cross_process_pull` / `node_data_service` integration patterns:
 
 ## 9. Deferred / follow-on
 
+- **True resident-tier stamping on ADD events (§6 obligation).** The headless
+  backend currently stamps every `ADD` event as `Tier::Dram` (it has only a
+  DRAM tier), so the warm-set filter requires `max_tier>=3` on this backend and
+  the documented default `max_tier=1` (Hbm) would admit nothing. Once HBM/pinned
+  tiers can seal directly (gRPC / multi-tier backend), `Seal` must stamp the
+  actual resident tier so the default warm policy is meaningful. Tracked at
+  `headless_node.cpp` ADD emission.
 - CP-side failover automation (promotion, fencing token, adapter re-point).
 - Active/active and 1:N topologies (other federation modes).
 - WAN transport hardening (compression on the replication link — could reuse

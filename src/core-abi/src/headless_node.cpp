@@ -624,6 +624,11 @@ int HeadlessNode::SealCommit(
         } else {
             node::prefix::Event ev{};
             ev.type    = node::prefix::EventType::Add;
+            // TODO(A9 gRPC follow-on): stamp the TRUE resident tier here.
+            // The headless backend has only a DRAM tier, so this is always
+            // Dram(3); the A9 warm-set filter therefore requires max_tier>=3
+            // on this backend. Spec §6 asks that the resident tier be stamped
+            // — required once HBM/pinned tiers can seal directly. See spec §9.
             ev.tier    = node::prefix::Tier::Dram;
             ev.locator = st.locator;
             events_->Publish(ev);

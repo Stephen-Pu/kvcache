@@ -52,7 +52,7 @@ TEST(WarmFilter, MaxTierTwoAcceptsPinnedRejectsDram) {
     EXPECT_FALSE(IsWarm(add_dram, p));
 }
 
-TEST(WarmFilter, DefaultPolicyAcceptsHbmAndPinned) {
+TEST(WarmFilter, DefaultPolicyAcceptsHbmOnlyRejectsPinned) {
     WarmPolicy p{};  // default max_tier = 1
 
     Event add_hbm{};
