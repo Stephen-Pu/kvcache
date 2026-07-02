@@ -259,6 +259,13 @@ if(OpenSSL_FOUND)
     target_link_libraries(test_audit PRIVATE OpenSSL::Crypto)
 endif()
 
+# A10 — BoundaryGuard: fail-closed perimeter decision (glob/CIDR/default-deny).
+# Pure stdlib; no extra link deps beyond kvcache_common (already added by
+# kvcache_add_test). boundary_guard.cpp is compiled directly into the binary.
+kvcache_add_test(test_boundary_guard
+                  security/boundary_guard_test.cpp
+                  ${KVCACHE_NODE_SRC}/security/boundary_guard.cpp)
+
 kvcache_add_test(test_metrics           obs/metrics_test.cpp)
 # LLD §6.2 — logging facade. Foundation only; per-callsite migration
 # of fprintf/cerr → KV_LOG_* is per-file follow-on work.
