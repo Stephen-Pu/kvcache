@@ -274,6 +274,14 @@ kvcache_add_test(test_boundary_policy_builder
                   ${KVCACHE_NODE_SRC}/security/boundary_policy_builder.cpp
                   ${KVCACHE_NODE_SRC}/security/boundary_guard.cpp)
 
+# A10 — GuardedHttpTransport: fail-closed boundary check on the cold-tier egress seam.
+# IHttpTransport / HttpResult are header-only (pure virtual + POD in rest_cold_tier.h),
+# so no libcurl dependency is required for this decorator + unit test alone.
+kvcache_add_test(test_guarded_transport
+                  tier/guarded_transport_test.cpp
+                  ${KVCACHE_NODE_SRC}/tier/guarded_transport.cpp
+                  ${KVCACHE_NODE_SRC}/security/boundary_guard.cpp)
+
 kvcache_add_test(test_metrics           obs/metrics_test.cpp)
 # LLD §6.2 — logging facade. Foundation only; per-callsite migration
 # of fprintf/cerr → KV_LOG_* is per-file follow-on work.
