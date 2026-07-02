@@ -128,6 +128,10 @@ class NodeDataServiceImpl final : public kvcache::proto::NodeData::Service {
     // over the handshake auth context. Tests inject an always-allow or always-deny
     // predicate so the gate can be exercised without a real mTLS handshake.
     // The callable must be thread-safe; it is stored as std::function.
+    //
+    // CONTRACT: MUST be called before GrpcServer::Start() / before the server
+    // accepts RPCs. The member is read without a lock on handler threads;
+    // startup-only mutation is race-free because no handlers run until Start().
     using PeerVerifier = std::function<bool(::grpc::ServerContext*)>;
     void SetInternalPeerVerifier(PeerVerifier fn) {
         internal_peer_verifier_ = std::move(fn);
@@ -141,6 +145,10 @@ class NodeDataServiceImpl final : public kvcache::proto::NodeData::Service {
     //
     // ChunkHash mirrors HeadlessNode::prefix::ChunkHash = std::array<uint8_t,8>.
     // ReplicaChunk mirrors HeadlessNode::ReplicaChunk without pulling in the header.
+    //
+    // CONTRACT: MUST be called before GrpcServer::Start() / before the server
+    // accepts RPCs. The member is read without a lock on handler threads;
+    // startup-only mutation is race-free because no handlers run until Start().
     using ChunkHash = std::array<uint8_t, 8>;
     struct ReplicaChunk {
         std::vector<ChunkHash>  chunk_path;

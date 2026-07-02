@@ -231,6 +231,14 @@ int main(int argc, char** argv) {
     }
 
     kvcache::node::grpc_server::NodeDataServiceImpl svc(ctx);
+    // TODO(A9 multi-cluster follow-on): wire SetReplicaFetchBackend to the
+    // in-process HeadlessNode; blocked by dylib hidden visibility —
+    // HeadlessNode::Active() / ::ReplicaFetch() are compiled into libkvcache
+    // with CXX_VISIBILITY_PRESET hidden and are unreachable from this TU.
+    // Fix: add a wiring TU that compiles headless_node.cpp directly (not
+    // via the dylib) into kvstore-node, or export a thin C-ABI shim.
+    // Tracked with the deferred cross-cluster E2E.
+    // Until wired, ReplicaFetch returns INTERNAL "no backend installed".
     kvcache::node::grpc_server::GrpcServer::Options grpc_opts;
     grpc_opts.bind_host         = o.bind_host;
     grpc_opts.port              = o.grpc_port;

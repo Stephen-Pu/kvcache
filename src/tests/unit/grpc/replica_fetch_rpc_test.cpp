@@ -276,4 +276,47 @@ TEST_F(ReplicaFetchRpcTest, NonInternalPeerIsDenied) {
         << st.error_message();
 }
 
+// ---------------------------------------------------------------------------
+// Case (c): internal/authorised peer, but the locator was never sealed
+//           → transport OK, app-level KV_E_NOT_FOUND in the body.
+//
+// This proves the client can distinguish a cache miss from a transport or
+// auth failure: the gRPC Status is OK (no error code set) while the
+// application-level status field carries KV_E_NOT_FOUND, and both
+// chunk_path and data are empty.
+// ---------------------------------------------------------------------------
+TEST_F(ReplicaFetchRpcTest, InternalPeerMissOnUnsealedLocator) {
+    // Distinct model+tokens that are never passed to SealChunkOnNode.
+    // Use a token range well outside the ranges used by the other two
+    // tests (70000-series for case (a), 80000-series for case (b)).
+    const std::string model = "rfetch-rpc-miss-model";
+    const std::vector<uint32_t> tokens = {90000u, 90001u, 90002u, 90003u};
+
+    // The always-allow verifier installed in SetUp is still in place —
+    // we only need auth to succeed so we can reach the backend lookup.
+    kvcache::proto::ReplicaFetchRequest req;
+    *req.mutable_locator() = MakeProtoLocator(model, tokens);
+
+    kvcache::proto::ReplicaFetchResponse resp;
+    ::grpc::ClientContext ctx;
+    auto st = stub_->ReplicaFetch(&ctx, req, &resp);
+
+    // Transport must succeed — the miss is an application-level result,
+    // not a gRPC-level error.
+    ASSERT_TRUE(st.ok())
+        << "transport must be OK for a miss (not an auth/transport error): "
+        << st.error_message();
+
+    // Application-level status: KV_E_NOT_FOUND (not KV_OK).
+    EXPECT_EQ(resp.status(), KV_E_NOT_FOUND)
+        << "app status must be KV_E_NOT_FOUND for a never-sealed locator; "
+        << "got " << resp.status();
+
+    // Payload fields must be empty on a miss.
+    EXPECT_TRUE(resp.chunk_path().empty())
+        << "chunk_path must be empty on a miss";
+    EXPECT_TRUE(resp.data().empty())
+        << "data must be empty on a miss";
+}
+
 #endif  // KVCACHE_HAVE_GRPC
