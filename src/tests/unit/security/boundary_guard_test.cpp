@@ -51,6 +51,7 @@ TEST(HostMatchesGlob, SuffixWildcard) {
     EXPECT_TRUE(HostMatchesGlob("example.com", "example.com"));
     EXPECT_FALSE(HostMatchesGlob("example.com.evil.net", "*.example.com"));
     EXPECT_FALSE(HostMatchesGlob("", "*.example.com"));
+    EXPECT_FALSE(HostMatchesGlob("example.com", "*.example.com")) << "glob must not match apex domain itself";
 }
 
 TEST(IpInCidr, Ipv4Ranges) {
@@ -60,4 +61,16 @@ TEST(IpInCidr, Ipv4Ranges) {
     EXPECT_FALSE(IpInCidr("192.168.2.5", "192.168.1.0/24"));
     EXPECT_FALSE(IpInCidr("not-an-ip", "10.0.0.0/8")) << "malformed → false (fail-closed)";
     EXPECT_FALSE(IpInCidr("10.0.0.1", "garbage")) << "malformed cidr → false";
+    EXPECT_TRUE(IpInCidr("10.0.0.0", "10.0.0.0/32"));
+    EXPECT_FALSE(IpInCidr("10.0.0.1", "10.0.0.0/32"));
+    EXPECT_TRUE(IpInCidr("1.2.3.4", "0.0.0.0/0"));
+    EXPECT_FALSE(IpInCidr("10.0.0.0.0", "10.0.0.0/8")) << "too many octets → false";
+}
+
+TEST(BoundaryGuard, DefaultAllowWhenDefaultDenyFalse) {
+    BoundaryGuard g(BoundaryPolicy{/*allow=*/{}, /*default_deny=*/false});
+    EXPECT_TRUE(g.Check({.host = "unlisted.example.com"}).allow)
+        << "default_deny=false allows unmatched hosts";
+    EXPECT_FALSE(g.Check({.host = ""}).allow)
+        << "empty host is ALWAYS denied, even with default_deny=false";
 }

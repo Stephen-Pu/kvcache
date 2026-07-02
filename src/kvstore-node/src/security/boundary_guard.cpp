@@ -1,7 +1,6 @@
 // src/kvstore-node/src/security/boundary_guard.cpp
 #include "security/boundary_guard.h"
 #include <array>
-#include <cstdlib>
 namespace kvcache::node::security {
 namespace {
 // A rule's purpose gate: kOther means "any purpose".
@@ -59,6 +58,8 @@ Decision BoundaryGuard::Check(const Endpoint& ep) const {
         if (!r.cidr.empty() && IpInCidr(ep.host, r.cidr))
             return {true, ""};
     }
-    return {false, "endpoint '" + ep.host + "' not in allowlist (default-deny)"};
+    if (policy_.default_deny)
+        return {false, "endpoint '" + ep.host + "' not in allowlist (default-deny)"};
+    return {true, ""};   // default_deny == false: allow-by-default
 }
 }  // namespace kvcache::node::security
