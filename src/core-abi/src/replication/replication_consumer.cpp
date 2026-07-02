@@ -1,22 +1,54 @@
 // Task 5 / Task 6 — A9 DR warm-standby: ReplicationConsumer implementation.
 //
-// headless_node.h lives in core-abi/src; callers that compile this TU must
-// add core-abi/src to their include path. The kvcache shared library and the
-// test binary both satisfy this requirement.
+// Task 3 change: chunk fetch is now routed through ReplicaSource& source_.
+// The (HeadlessNode& primary, HeadlessNode& standby, Options) convenience ctor
+// allocates an owned InProcessReplicaSource so all existing callers compile and
+// behave identically. The new (ReplicaSource&, HeadlessNode&, Options) ctor
+// takes an externally-owned source; Start() is a no-op on this path.
+//
+// headless_node.h is included transitively via replica_source.h (already in
+// replication_consumer.h). The kvcache shared library and the test binary both
+// satisfy the core-abi/src include-path requirement.
 #include "replication/replication_consumer.h"
 
 #include <cstring>
 
-#include "headless_node.h"          // kvcache::abi::HeadlessNode (core-abi/src)
 #include "kvcache/kv_errors.h"
 #include "kvcache/kv_types.h"
 
 namespace kvcache::node::replication {
 
+// ---------------------------------------------------------------------------
+// Convenience ctor: in-process path (today's default).
+//
+// Allocates an owned InProcessReplicaSource wrapping `primary`; source_ points
+// to it.  primary is also kept as primary_for_events_ for Start()'s
+// SubscribeEvents call (event subscription stays in-process this task).
+// ---------------------------------------------------------------------------
 ReplicationConsumer::ReplicationConsumer(abi::HeadlessNode& primary,
                                          abi::HeadlessNode& standby,
                                          Options opts)
-    : primary_(primary), standby_(standby), opts_(opts) {}
+    : owned_source_(std::make_unique<InProcessReplicaSource>(primary)),
+      source_(*owned_source_),
+      primary_for_events_(&primary),
+      standby_(standby),
+      opts_(opts) {}
+
+// ---------------------------------------------------------------------------
+// Remote-fetch ctor: externally-owned ReplicaSource (Task 3 seam).
+//
+// source_ points to the caller-owned source; owned_source_ remains nullptr.
+// primary_for_events_ is nullptr — Start() is a documented no-op on this path
+// (remote event subscription is a follow-on task).
+// ---------------------------------------------------------------------------
+ReplicationConsumer::ReplicationConsumer(ReplicaSource& source,
+                                         abi::HeadlessNode& standby,
+                                         Options opts)
+    : owned_source_(nullptr),
+      source_(source),
+      primary_for_events_(nullptr),
+      standby_(standby),
+      opts_(opts) {}
 
 ReplicationConsumer::~ReplicationConsumer() { Stop(); }
 
@@ -27,9 +59,9 @@ bool ReplicationConsumer::ApplyEvent(const prefix::Event& ev) {
     // Step 2: dedup — skip epochs we have already applied.
     if (!cursor_.ShouldApply(ev.epoch)) return false;
 
-    // Step 3: fetch from primary.
+    // Step 3: fetch via source_ (in-process or remote, depending on ctor).
     abi::HeadlessNode::ReplicaChunk chunk;
-    if (primary_.ReplicaFetch(ev.locator, &chunk) != KV_OK) {
+    if (source_.Fetch(ev.locator, &chunk) != KV_OK) {
         // Chunk was evicted from primary since the event was emitted.
         // Advance the cursor so we never retry this epoch and return false
         // (benign miss — the primary simply moved on).
@@ -122,6 +154,13 @@ void ReplicationConsumer::EventCbDispatch(const kv_event_t* raw_ev, void* user) 
 }
 
 void ReplicationConsumer::Start() {
+    // Remote-fetch ctor path: no in-process primary for event subscription.
+    // Start() is a documented no-op on this variant — remote event subscription
+    // is a follow-on task. Return cleanly without crashing.
+    if (primary_for_events_ == nullptr) {
+        return;
+    }
+
     // Idempotent: only one Start() takes effect (CAS false→true).
     bool expected = false;
     if (!running_.compare_exchange_strong(expected, true,
@@ -133,14 +172,14 @@ void ReplicationConsumer::Start() {
     // poller thread that calls EventCbDispatch for each event.
     // sub_id_ mirrors HeadlessNode::SubscriptionId (a uint64_t); the
     // static_assert below guards that assumption at compile time.
-    static_assert(sizeof(decltype(primary_.SubscribeEvents(EventCbDispatch,
-                                                           this))) ==
-                      sizeof(uint64_t),
+    static_assert(sizeof(decltype(primary_for_events_->SubscribeEvents(
+                      EventCbDispatch, this))) == sizeof(uint64_t),
                   "sub_id_ assumes SubscribeEvents returns a uint64_t handle");
     // Store with release so a concurrent Stop() that loads with acquire sees
     // the live handle and never skips UnsubscribeEvents.
     sub_id_.store(
-        static_cast<uint64_t>(primary_.SubscribeEvents(EventCbDispatch, this)),
+        static_cast<uint64_t>(
+            primary_for_events_->SubscribeEvents(EventCbDispatch, this)),
         std::memory_order_release);
 
     // Spawn a lightweight sentinel thread whose sole purpose is to be
@@ -166,9 +205,12 @@ void ReplicationConsumer::Stop() {
     // HeadlessNode poller thread, guaranteeing that EventCbDispatch is never
     // called after UnsubscribeEvents() returns. It is therefore safe to
     // destroy `this` (and cursor_) immediately after Stop() returns.
+    //
+    // primary_for_events_ is non-null only on the in-process ctor path; if it
+    // is null the subscription was never created and sub_id_ is always 0.
     const uint64_t sid = sub_id_.load(std::memory_order_acquire);
-    if (sid != 0) {
-        primary_.UnsubscribeEvents(
+    if (sid != 0 && primary_for_events_ != nullptr) {
+        primary_for_events_->UnsubscribeEvents(
             static_cast<abi::HeadlessNode::SubscriptionId>(sid));
         sub_id_.store(0, std::memory_order_release);
     }

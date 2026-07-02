@@ -37,12 +37,14 @@
 #include "kvcache/kv_types.h"
 #include "prefix/kv_event_stream.h"
 #include "prefix/lpm.h"  // NamespaceFingerprint, ChunkifyNS, kChunkTokens
+#include "replication/replica_source.h"
 #include "replication/replication_consumer.h"
 
 using kvcache::abi::HeadlessNode;
 using kvcache::node::prefix::Event;
 using kvcache::node::prefix::EventType;
 using kvcache::node::prefix::Tier;
+using kvcache::node::replication::InProcessReplicaSource;
 using kvcache::node::replication::ReplicationConsumer;
 using kvcache::node::replication::WarmPolicy;
 
@@ -416,4 +418,44 @@ TEST_F(ReplicationConsumerTest, LiveLoopReplicatesWarmNotCold) {
 
     // Idempotent: a second Stop() must not crash or hang.
     rc.Stop();
+}
+
+// ---------------------------------------------------------------------------
+// Task 3 — ReplicaSource seam: construct consumer via explicit
+// InProcessReplicaSource passed to the (ReplicaSource&, HeadlessNode&, Options)
+// ctor. Proves the abstraction layer works end-to-end without changing the
+// underlying behavior: a warm chunk sealed on "primary" (the singleton) is
+// replicated to "standby" (also the singleton) through the source seam.
+// ---------------------------------------------------------------------------
+TEST_F(ReplicationConsumerTest, FetchesThroughReplicaSource) {
+    // Unique model / token range to avoid ART conflicts with other tests.
+    const std::string     model  = "rc-replica-source-model";
+    std::vector<uint32_t> tokens(32);
+    for (uint32_t i = 0; i < 32; ++i) tokens[i] = 90000u + i;
+
+    // Build the source explicitly — this is the seam being tested.
+    InProcessReplicaSource src(*node_);
+
+    // Construct via the new (ReplicaSource&, HeadlessNode&, Options) ctor.
+    // max_tier = 3 (Dram): headless mode seals all chunks into the DRAM tier,
+    // so warm-filter passes (same as existing MirrorsWarmChunks... test).
+    ReplicationConsumer rc(src, *node_, {.warm = {.max_tier = 3}});
+
+    EXPECT_EQ(rc.CursorEpoch(), 0u) << "cursor starts at zero";
+
+    // Seal a warm chunk on the primary (singleton) and capture the ADD event.
+    Event add = SealAndCaptureEvent(node_, model, tokens, 0xCD);
+    ASSERT_EQ(add.type, EventType::Add) << "captured event must be ADD";
+    EXPECT_GT(add.epoch, 0u) << "EventStream stamps epoch >= 1";
+
+    // Apply through the source seam — should replicate.
+    EXPECT_TRUE(rc.ApplyEvent(add))
+        << "warm chunk must be replicated through InProcessReplicaSource";
+    EXPECT_EQ(rc.CursorEpoch(), add.epoch)
+        << "cursor must advance to add.epoch";
+
+    // Verify the standby (same singleton) can look up the replicated chunk.
+    EXPECT_EQ(LookupMatched(node_, model, tokens),
+              static_cast<uint32_t>(tokens.size()))
+        << "standby Lookup must match all tokens after ReplicaSource fetch";
 }
