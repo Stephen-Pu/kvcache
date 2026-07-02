@@ -407,6 +407,15 @@ if(OpenSSL_FOUND)
     target_link_libraries(test_seal_by_chunk_path PRIVATE OpenSSL::Crypto)
 endif()
 
+# Task 3 — A9 DR warm-standby: WarmSetFilter (header-only predicate).
+#
+# The filter lives in replication/warm_filter.h and has no .cpp of its own.
+# The test only needs NODE_PREFIX_SRCS so the kv_event_stream.h include chain
+# resolves (EventType / Tier enums live there).
+kvcache_add_test(test_warm_filter
+                  replication/warm_filter_test.cpp
+                  ${NODE_PREFIX_SRCS})
+
 # Phase A1 — kvagent module tests. Each test links the agent's
 # static lib; the include surface is the kvagent_lib PUBLIC dirs.
 if(KVCACHE_BUILD_AGENT)
