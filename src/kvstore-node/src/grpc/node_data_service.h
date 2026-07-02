@@ -35,11 +35,14 @@
 #pragma once
 
 #include <cstdint>
+#include <array>
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "kvcache/kv_abi.h"
 #include "node.grpc.pb.h"
@@ -119,6 +122,38 @@ class NodeDataServiceImpl final : public kvcache::proto::NodeData::Service {
     // The gate must outlive the service; nullptr (default) disables the
     // check. The DrainWatcher (Phase A2.2) drives the gate from etcd.
     void SetDrainGate(const cluster::DrainGate* gate) { drain_gate_ = gate; }
+
+    // Phase A11 — injectable internal-peer verifier for the ReplicaFetch gate.
+    // In production the default (nullptr) uses ClientCertInfo + VerifyInternalPeer
+    // over the handshake auth context. Tests inject an always-allow or always-deny
+    // predicate so the gate can be exercised without a real mTLS handshake.
+    // The callable must be thread-safe; it is stored as std::function.
+    using PeerVerifier = std::function<bool(::grpc::ServerContext*)>;
+    void SetInternalPeerVerifier(PeerVerifier fn) {
+        internal_peer_verifier_ = std::move(fn);
+    }
+
+    // Phase A11 — injectable ReplicaFetch backend. The service library is
+    // built without a direct dependency on HeadlessNode C++ symbols (which
+    // have hidden visibility in libkvcache.dylib). Callers install a backend
+    // that delegates to HeadlessNode::Active()->ReplicaFetch. Tests may use a
+    // synthetic backend. When null the handler returns INTERNAL.
+    //
+    // ChunkHash mirrors HeadlessNode::prefix::ChunkHash = std::array<uint8_t,8>.
+    // ReplicaChunk mirrors HeadlessNode::ReplicaChunk without pulling in the header.
+    using ChunkHash = std::array<uint8_t, 8>;
+    struct ReplicaChunk {
+        std::vector<ChunkHash>  chunk_path;
+        std::vector<uint8_t>    bytes;
+    };
+    using ReplicaFetchFn = std::function<int(const kv_locator_t&, ReplicaChunk*)>;
+    void SetReplicaFetchBackend(ReplicaFetchFn fn) {
+        replica_fetch_fn_ = std::move(fn);
+    }
+
+    ::grpc::Status ReplicaFetch(::grpc::ServerContext*                      context,
+                                  const kvcache::proto::ReplicaFetchRequest* request,
+                                  kvcache::proto::ReplicaFetchResponse*      response) override;
 
     ::grpc::Status Lookup(::grpc::ServerContext*               context,
                             const kvcache::proto::LookupRequest* request,
@@ -233,6 +268,14 @@ class NodeDataServiceImpl final : public kvcache::proto::NodeData::Service {
     // Phase B8.2 — optional mTLS registry for table-driven tenant
     // resolution (owned elsewhere; see SetMtlsRegistry).
     const security::MtlsRegistry*            mtls_registry_ = nullptr;
+
+    // Phase A11 — internal-peer verifier for ReplicaFetch. When null (default)
+    // the handler uses ClientCertInfo + MtlsRegistry::VerifyInternalPeer.
+    PeerVerifier                              internal_peer_verifier_;
+
+    // Phase A11 — ReplicaFetch backend (see SetReplicaFetchBackend). When null
+    // the handler returns INTERNAL; callers install a real backend on startup.
+    ReplicaFetchFn                            replica_fetch_fn_;
 
     // Per-peer NodeData stub cache. The Channel keeps itself reusable
     // across RPCs; the stub is light-weight on top.

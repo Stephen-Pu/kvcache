@@ -415,6 +415,32 @@ if(KVCACHE_HAVE_GRPC)
         OpenSSL::Crypto
     )
 
+    # Phase A9 / A11 — ReplicaFetch gRPC handler: VerifyInternalPeer gate
+    # + delegate to HeadlessNode. HeadlessNode C++ methods are hidden-visibility
+    # in the kvcache dylib, so we compile headless_node.cpp directly (same
+    # pattern as test_replica_fetch and test_replication_consumer). This also
+    # supplies the HeadlessNode::Active() symbol needed by node_data_service.cpp's
+    # ReplicaFetch handler when it is linked into this test binary via
+    # kvstore_node_grpc.
+    kvcache_add_test(test_replica_fetch_rpc
+                      grpc/replica_fetch_rpc_test.cpp
+                      ${CMAKE_SOURCE_DIR}/core-abi/src/headless_node.cpp
+                      ${CMAKE_SOURCE_DIR}/core-abi/src/ctx_options.cpp
+                      ${CMAKE_SOURCE_DIR}/core-abi/src/kv_status.cpp)
+    target_compile_definitions(test_replica_fetch_rpc PRIVATE KVCACHE_HAVE_GRPC=1)
+    target_include_directories(test_replica_fetch_rpc PRIVATE
+        ${CMAKE_SOURCE_DIR}/core-abi/src
+        ${KVCACHE_NODE_SRC}
+    )
+    target_link_libraries(test_replica_fetch_rpc PRIVATE
+        kvstore_node_grpc
+        kvcache
+        kvstore_node_core
+        kvcache_common
+        OpenSSL::Crypto
+        CURL::libcurl
+    )
+
     # Phase N-1: mTLS end-to-end. Skips at runtime if openssl(1) isn't
     # on PATH, but still gets built so the credentials surface stays
     # compile-tested.

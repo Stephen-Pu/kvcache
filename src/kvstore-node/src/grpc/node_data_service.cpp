@@ -15,6 +15,7 @@
 #include <grpcpp/grpcpp.h>
 #include <grpcpp/security/auth_context.h>
 
+
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
@@ -895,6 +896,65 @@ kv_ctx_t* NodeDataServiceImpl::CtxForHandle(uint64_t h) {
     int rc = kv_release(ctx, request->server_handle());
     if (rc != KV_OK) return ToGrpcStatus(rc, "kv_release");
     ForgetHandle(request->server_handle());
+    return ::grpc::Status::OK;
+}
+
+// ---- ReplicaFetch (Phase A11 / A9 DR warm-standby) --------------------
+//
+// Internal-only RPC: a standby node pulls the sealed chunk (chunk_path +
+// bytes) for a given locator from this primary. The A11 gate requires the
+// calling peer to be a verified internal cluster workload. Transport
+// errors are surfaced as gRPC status; an application-level miss is
+// KV_E_NOT_FOUND in the response body with transport status OK.
+
+::grpc::Status NodeDataServiceImpl::ReplicaFetch(
+    ::grpc::ServerContext* context,
+    const kvcache::proto::ReplicaFetchRequest* request,
+    kvcache::proto::ReplicaFetchResponse*      response) {
+
+    // Phase A11 — internal-peer gate.
+    // If a test-injectable verifier is installed, use it; otherwise fall
+    // back to the real mTLS SPIFFE check via ClientCertInfo +
+    // MtlsRegistry::VerifyInternalPeer with an empty trust-domain
+    // constraint (any well-formed workload SVID is accepted).
+    bool is_internal = false;
+    if (internal_peer_verifier_) {
+        is_internal = internal_peer_verifier_(context);
+    } else {
+        const security::CertInfo cert = ClientCertInfo(context);
+        is_internal = security::MtlsRegistry::VerifyInternalPeer(
+            cert, /*required_trust_domain=*/{}).has_value();
+    }
+    if (!is_internal) {
+        return {::grpc::StatusCode::PERMISSION_DENIED,
+                "ReplicaFetch requires a verified internal workload peer"};
+    }
+
+    // Convert the proto Locator to the C struct.
+    kv_locator_t loc{};
+    FromProtoLocator(request->locator(), &loc);
+
+    // Delegate to the injectable ReplicaFetch backend.
+    // In production the caller installs a backend over HeadlessNode::Active().
+    // HeadlessNode C++ symbols have hidden visibility in libkvcache, so the
+    // service library does not reference them directly — the backend is the seam.
+    if (!replica_fetch_fn_) {
+        return {::grpc::StatusCode::INTERNAL,
+                "ReplicaFetch: no backend installed — call SetReplicaFetchBackend()"};
+    }
+
+    ReplicaChunk rc;
+    int rv = replica_fetch_fn_(loc, &rc);
+    response->set_status(rv);
+    if (rv == KV_OK) {
+        // chunk_path: each ChunkHash is exactly 8 bytes.
+        for (const auto& h : rc.chunk_path) {
+            response->add_chunk_path(
+                std::string(reinterpret_cast<const char*>(h.data()), h.size()));
+        }
+        response->set_data(
+            std::string(rc.bytes.begin(), rc.bytes.end()));
+    }
     return ::grpc::Status::OK;
 }
 

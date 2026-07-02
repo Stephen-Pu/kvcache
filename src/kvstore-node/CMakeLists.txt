@@ -151,6 +151,9 @@ if(KVCACHE_HAVE_GRPC)
         PUBLIC
             ${CMAKE_CURRENT_SOURCE_DIR}/src
             ${CMAKE_SOURCE_DIR}/include
+            # Phase A11 — ReplicaFetch delegates to HeadlessNode::Active()
+            # whose declaration lives in core-abi/src (not the public C ABI surface).
+            ${CMAKE_SOURCE_DIR}/core-abi/src
     )
     target_link_libraries(kvstore_node_grpc
         PUBLIC
