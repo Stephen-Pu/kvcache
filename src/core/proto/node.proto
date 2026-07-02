@@ -35,6 +35,11 @@ service NodeData {
 
   // Server-side push of KV events (LLD §2.2). Long-lived stream.
   rpc Subscribe (SubscribeRequest) returns (stream Event);
+
+  // Primary-side read for A9 DR replication: resolve a locator to its sealed
+  // chunk_path + bytes. Read-only; gated by VerifyInternalPeer (A11) in the
+  // handler. Deferred cross-cluster surface of the in-process ReplicaFetch.
+  rpc ReplicaFetch (ReplicaFetchRequest) returns (ReplicaFetchResponse);
 }
 
 message LookupRequest {
@@ -142,6 +147,15 @@ message SubscribeRequest {
   string  tenant_id     = 1;
   uint64  start_epoch   = 2;  // 0 = "from now"
   repeated EventType include = 3; // empty = all
+}
+
+message ReplicaFetchRequest {
+  Locator locator = 1;   // the sealed chunk's locator (prefix_hash etc.)
+}
+message ReplicaFetchResponse {
+  int32          status     = 1;  // KV_OK (0) on hit; KV_E_NOT_FOUND otherwise
+  repeated bytes chunk_path = 2;  // K entries, each exactly 8 bytes (a ChunkHash)
+  bytes          data       = 3;  // the sealed KV bytes (empty on miss)
 }
 
 // ============================================================================
