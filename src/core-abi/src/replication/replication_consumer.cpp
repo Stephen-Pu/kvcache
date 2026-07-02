@@ -84,36 +84,26 @@ uint64_t ReplicationConsumer::CursorEpoch() const {
 // Task 6 — Live subscribe/poll loop.
 //
 // Start() subscribes to the primary's EventStream via SubscribeEvents and
-// spawns a background thread that translates incoming kv_event_t callbacks
-// into prefix::Events and drives ApplyEvent.
-//
-// HeadlessNode::SubscribeEvents spawns its OWN per-subscription poller thread
-// internally. That thread delivers kv_event_t via the user callback cb. Our
-// outer thread (thread_) is therefore a thin trampoline that just waits; we
-// use an SPSC queue approach: the SubscribeEvents callback enqueues the event
-// and our thread dequeues it.
-//
-// Simpler alternative: since SubscribeEvents already delivers events through
-// a background thread, we can let the callback itself call ApplyEvent directly
-// and keep thread_ just as a lifecycle handle (start/join). We use a single
-// mutex+condvar so the callback can be called from the HeadlessNode poller
-// thread while ApplyEvent (and cursor mutation) are serialised.
+// spawns a sentinel background thread (thread_) whose sole purpose is to be
+// joinable by Stop(). The actual event delivery happens inside HeadlessNode's
+// own per-subscription poller thread, which calls EventCbDispatch directly.
+// EventCbDispatch translates kv_event_t → prefix::Event and calls ApplyEvent.
 //
 // Concurrency model:
-//   - stop flag (running_) is atomic; set by Stop() before UnsubscribeEvents.
-//   - UnsubscribeEvents() joins the internal HeadlessNode poller thread before
-//     returning, guaranteeing no further cb() calls after it returns.
-//   - After UnsubscribeEvents() returns, thread_ exits its wait loop.
-//   - Stop() then joins thread_.
-//   - cursor_ and the standby writes in ApplyEvent are only touched inside cb()
-//     which is serialised by HeadlessNode's internal per-subscription poller
-//     (SPSC: one producer thread, one consumer poller thread). No additional
-//     lock is needed for cursor_ correctness.
+//   - running_ (atomic bool) guards Start() idempotency (CAS false→true).
+//   - sub_id_ is atomic so a concurrent Stop() always sees the live handle.
+//   - Stop() sets running_=false, then calls UnsubscribeEvents(sub_id_), which
+//     joins HeadlessNode's internal poller — no further cb() calls after it.
+//   - Stop() then joins thread_, which has observed running_=false and exited.
+//   - cursor_ and standby writes in ApplyEvent are serialised by HeadlessNode's
+//     internal per-subscription poller (one caller thread). No extra lock needed.
 // ---------------------------------------------------------------------------
 
-// Callback invoked by HeadlessNode's internal poller thread for every event.
-// `user` points to `this` ReplicationConsumer.
-static void EventCbDispatch(const kv_event_t* raw_ev, void* user) {
+// Static member callback invoked by HeadlessNode's internal poller thread for
+// every event. `user` is always `this` — cast from the void* passed to
+// SubscribeEvents in Start(). Being a static member it has full access to
+// private fields (events_applied_, etc.).
+void ReplicationConsumer::EventCbDispatch(const kv_event_t* raw_ev, void* user) {
     auto* self = static_cast<ReplicationConsumer*>(user);
 
     // Translate kv_event_t (C ABI) → prefix::Event (C++ internal).
@@ -126,7 +116,9 @@ static void EventCbDispatch(const kv_event_t* raw_ev, void* user) {
     // Dispatch to the synchronous ApplyEvent (no additional lock needed:
     // the HeadlessNode poller is the sole caller of this callback for our
     // subscription).
-    self->ApplyEvent(ev);
+    if (self->ApplyEvent(ev)) {
+        self->events_applied_.fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 void ReplicationConsumer::Start() {
@@ -140,8 +132,11 @@ void ReplicationConsumer::Start() {
     // Subscribe to the primary's event stream. HeadlessNode spawns its own
     // poller thread that calls EventCbDispatch for each event.
     // SubscriptionId is uint64_t; static_assert in headless_node.h confirms.
-    sub_id_ = static_cast<uint64_t>(
-        primary_.SubscribeEvents(EventCbDispatch, this));
+    // Store with release so a concurrent Stop() that loads with acquire sees
+    // the live handle and never skips UnsubscribeEvents.
+    sub_id_.store(
+        static_cast<uint64_t>(primary_.SubscribeEvents(EventCbDispatch, this)),
+        std::memory_order_release);
 
     // Spawn a lightweight sentinel thread whose sole purpose is to be
     // joinable by Stop(). The actual work happens in EventCbDispatch via
@@ -166,10 +161,11 @@ void ReplicationConsumer::Stop() {
     // HeadlessNode poller thread, guaranteeing that EventCbDispatch is never
     // called after UnsubscribeEvents() returns. It is therefore safe to
     // destroy `this` (and cursor_) immediately after Stop() returns.
-    if (sub_id_ != 0) {
+    const uint64_t sid = sub_id_.load(std::memory_order_acquire);
+    if (sid != 0) {
         primary_.UnsubscribeEvents(
-            static_cast<abi::HeadlessNode::SubscriptionId>(sub_id_));
-        sub_id_ = 0;
+            static_cast<abi::HeadlessNode::SubscriptionId>(sid));
+        sub_id_.store(0, std::memory_order_release);
     }
 
     // Join the sentinel thread (it will have observed running_=false and exited).

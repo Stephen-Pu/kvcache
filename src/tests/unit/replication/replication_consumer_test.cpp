@@ -315,9 +315,14 @@ TEST_F(ReplicationConsumerTest, NonAddEventsFiltered) {
 // ---------------------------------------------------------------------------
 // Task 6 — Live subscribe/poll loop: Start() + Stop().
 //
-// After Start(), seal 3 warm chunks + 1 cold chunk on the primary (== standby
-// singleton). Poll until the standby's Lookup finds ALL 3 warm chunks. Verify
-// the cold chunk is never found. Then Stop() — must join cleanly, no hang.
+// After Start(), seal 3 warm chunks on the primary (== standby singleton).
+// Wait until EventsApplied() reaches 3 — this proves the live loop actually
+// ran ApplyEvent, not just that the chunks exist in the ART from Seal().
+// Then Stop() — must join cleanly, no hang.
+//
+// Cold-chunk filtering is validated via the synchronous MirrorsWarmChunksNotColdOrDuplicate
+// test; in the loopback headless backend we cannot force a real Cold-tier event
+// from the seal path, so we do not attempt it here.
 //
 // WaitFor: bounded spin-poll (10 ms slices, 2 s budget) — same pattern as
 // node_registry_test / etcd_client_test.
@@ -341,21 +346,19 @@ TEST_F(ReplicationConsumerTest, LiveLoopReplicatesWarmNotCold) {
     // the earlier synchronous tests.
     const std::string model = "rc-live-loop-model";
 
-    // Each warm chunk uses a distinct 32-token window.
-    // Tokens are chosen far from all other test ranges (80000+).
-    std::vector<std::vector<uint32_t>> warm_tokens(3);
-    for (int i = 0; i < 3; ++i) {
+    // 3 warm chunks, each a distinct 32-token window (80000+ range).
+    constexpr int kWarmCount = 3;
+    std::vector<std::vector<uint32_t>> warm_tokens(kWarmCount);
+    for (int i = 0; i < kWarmCount; ++i) {
         warm_tokens[i].resize(32);
         for (uint32_t j = 0; j < 32; ++j)
             warm_tokens[i][j] = 80000u + static_cast<uint32_t>(i) * 100 + j;
     }
 
-    // Cold chunk — distinct range.
-    std::vector<uint32_t> cold_toks(32);
-    for (uint32_t j = 0; j < 32; ++j) cold_toks[j] = 90000u + j;
-
     // max_tier = 3 (Dram) — headless mode seals into DRAM tier.
     ReplicationConsumer rc(*node_, *node_, {.warm = {.max_tier = 3}});
+
+    EXPECT_EQ(rc.EventsApplied(), 0u) << "no events applied before Start()";
 
     // -----------------------------------------------------------------------
     // Start the live loop before sealing any chunks so the loop is listening
@@ -369,51 +372,47 @@ TEST_F(ReplicationConsumerTest, LiveLoopReplicatesWarmNotCold) {
     // The live loop has its OWN separate subscription and will also receive
     // these ADD events (possibly with a slight delay).
     // -----------------------------------------------------------------------
-    for (int i = 0; i < 3; ++i) {
+    for (int i = 0; i < kWarmCount; ++i) {
         Event ev = SealAndCaptureEvent(node_, model, warm_tokens[i],
                                         static_cast<uint8_t>(0x10 + i));
         ASSERT_EQ(ev.type, EventType::Add)
             << "warm chunk " << i << " must emit ADD";
     }
 
-    // Seal the cold chunk — Tier::Cold > max_tier=3, so IsWarm filters it.
-    // We still seal it via the normal path; SealAndCaptureEvent will capture
-    // the event (tier = Dram in headless, since we can't force Cold in the
-    // loopback backend). We verify the live loop doesn't wrongly replicate it
-    // by checking that a LookupMatched on cold_toks finds tokens (the chunk
-    // IS on the node — it was sealed); the real guarantee is that if tier
-    // were Cold, the loop would skip it.
-    //
-    // Instead of trying to produce a real Cold-tier event (not possible in
-    // the loopback headless path), we directly invoke ApplyEvent with a
-    // hand-crafted cold event via the synchronous path. This is tested by
-    // the existing MirrorsWarmChunksNotColdOrDuplicate test. Here we just
-    // verify the live loop works for the warm path without hanging.
-
     // -----------------------------------------------------------------------
-    // Poll until the standby's Lookup finds all 3 warm chunks.
-    // Because primary == standby, the chunks are already in the ART as soon
-    // as SealAndCaptureEvent returns; the live loop may have already processed
-    // them. WaitFor is used to tolerate any scheduling delay.
+    // Wait until the live loop has called ApplyEvent successfully for ALL 3
+    // warm chunks. EventsApplied() is incremented by EventCbDispatch only when
+    // ApplyEvent returns true — so this assertion fails if the loop is a stub
+    // or if Start() were a no-op. The shared-singleton means SealByChunkPath
+    // returns kReplaced (KV_OK), so each warm chunk counts as one application.
     // -----------------------------------------------------------------------
-    for (int i = 0; i < 3; ++i) {
-        bool found = WaitFor([&] {
-            return LookupMatched(node_, model, warm_tokens[i]) ==
-                   static_cast<uint32_t>(warm_tokens[i].size());
-        });
-        EXPECT_TRUE(found) << "standby must find warm chunk " << i
-                           << " within 2 s";
-    }
+    bool loop_ran = WaitFor([&] {
+        return rc.EventsApplied() >= static_cast<uint64_t>(kWarmCount);
+    });
+    EXPECT_TRUE(loop_ran)
+        << "live loop must process all " << kWarmCount
+        << " warm ADD events within 2 s (EventsApplied="
+        << rc.EventsApplied() << ")";
 
-    // Cursor must have advanced beyond zero (the loop replicated at least
-    // the first ADD event it received).
+    // Cursor must have advanced beyond zero.
     EXPECT_GT(rc.CursorEpoch(), 0u)
         << "cursor must advance after the live loop processes events";
 
     // -----------------------------------------------------------------------
-    // Stop — must return (join) within a bounded time; no deadlock.
+    // Stop — joins the background sentinel thread; must return without hanging.
+    // Assertions after Stop() are race-free: the poller is joined and no
+    // further increments to events_applied_ can occur.
     // -----------------------------------------------------------------------
     rc.Stop();  // joins background thread
+
+    // In the single-singleton topology (primary == standby), SealByChunkPath
+    // emits further ADD events that the live loop also processes (cascading
+    // sealed chunks with new epochs, all deduped by the cursor). EventsApplied
+    // is therefore >= kWarmCount, not exactly kWarmCount. The critical proof
+    // that the loop ran is the WaitFor above; this assertion confirms the
+    // final count is at least as large as expected.
+    EXPECT_GE(rc.EventsApplied(), static_cast<uint64_t>(kWarmCount))
+        << "EventsApplied must be >= warm chunk count after Stop()";
 
     // Idempotent: a second Stop() must not crash or hang.
     rc.Stop();

@@ -70,9 +70,18 @@ class ReplicationConsumer {
     // Idempotent — safe to call multiple times or from the destructor.
     void Stop();
 
+    // The number of events for which ApplyEvent returned true (i.e. a chunk
+    // was successfully replicated to the standby). Safe to read from any
+    // thread at any time; after Stop() returns the value is final.
+    uint64_t EventsApplied() const {
+        return events_applied_.load(std::memory_order_acquire);
+    }
+
    private:
-    // Background thread entry point.
-    void PollLoop();
+    // Static member callback passed to HeadlessNode::SubscribeEvents.
+    // Being a static member function it has access to all private fields.
+    // `user` is always `this` — cast from void* inside the function.
+    static void EventCbDispatch(const kv_event_t* raw_ev, void* user);
 
     abi::HeadlessNode& primary_;
     abi::HeadlessNode& standby_;
@@ -83,14 +92,18 @@ class ReplicationConsumer {
     std::atomic<bool>          running_{false};
     std::thread                thread_;
     // Subscription handle returned by primary_.SubscribeEvents; 0 = none.
-    // Written by Start() before the thread is spawned, read only inside the
-    // thread (and by Stop() after the thread sets running_=false).
-    // Protected: Start() writes it before thread creation; Stop() reads it
-    // after the compare_exchange that serialises with any concurrent Stop.
+    // Atomic so a concurrent Stop() (e.g. from the destructor while Start() is
+    // still in progress on another thread) always sees the live sub_id and
+    // can call UnsubscribeEvents rather than silently skipping it.
     // SubscriptionId is uint64_t (HeadlessNode typedef); spelled out here
     // because the header forward-declares HeadlessNode and cannot use its
     // nested types. The .cpp asserts the sizes match.
-    uint64_t sub_id_{0};
+    std::atomic<uint64_t> sub_id_{0};
+
+    // Count of events for which ApplyEvent returned true (a chunk was actually
+    // replicated). Incremented inside EventCbDispatch after a successful Apply.
+    // Read via EventsApplied() for test observability.
+    std::atomic<uint64_t> events_applied_{0};
 };
 
 }  // namespace kvcache::node::replication

@@ -36,3 +36,7 @@ src/control-plane/cp
 # Rust binding build artifacts (Phase A7)
 src/adapters/rust/target/
 src/adapters/rust/Cargo.lock
+.dev-aws/
+
+# Internal SDD scaffolding — never ships in repo history
+.superpowers/
