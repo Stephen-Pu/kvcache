@@ -2,6 +2,7 @@
 #include "tier/cold_tier.h"
 
 #include "tier/rest_cold_tier.h"          // B3  — native-rest backend
+#include "tier/guarded_transport.h"       // A10 — egress boundary guard decorator
 #include "tier/compressing_cold_tier.h"   // B3.1 — compression middleware
 #include "tier/encrypting_cold_tier.h"    // B3.2 — encryption middleware
 #include "tier/metrics_cold_tier.h"       // O-4  — observability middleware
@@ -179,7 +180,16 @@ std::unique_ptr<IColdTier> CreateBaseColdTier(const ColdTierOptions& opts,
         ro.client_cert_pem_path = opts.rest.client_cert_pem_path;
         ro.client_key_pem_path  = opts.rest.client_key_pem_path;
         ro.timeout_ms           = opts.rest.timeout_ms;
-        return RestColdTier::Create(ro, err);
+        if (!opts.guard) {
+            // Null guard: delegate to the standard factory path unchanged.
+            return RestColdTier::Create(ro, err);
+        }
+        // A10 — Regulated Mode: wrap the transport in a GuardedHttpTransport
+        // so every object-store request is boundary-checked before dialing.
+        std::shared_ptr<IHttpTransport> transport = MakeCurlHttpTransport();
+        transport = std::make_shared<GuardedHttpTransport>(
+            std::move(transport), opts.guard, opts.deny_observer);
+        return RestColdTier::CreateWithTransport(ro, std::move(transport), err);
     }
     if (err) *err = "cold_tier: unknown backend type '" + opts.type + "'";
     return nullptr;

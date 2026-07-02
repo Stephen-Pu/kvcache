@@ -34,6 +34,8 @@ set(NODE_TIER_SRCS
     ${KVCACHE_NODE_SRC}/tier/encrypting_cold_tier.cpp  # B3.2 — encryption middleware (OpenSSL)
     ${KVCACHE_NODE_SRC}/tier/metrics_cold_tier.cpp     # O-4  — observability middleware
     ${KVCACHE_NODE_SRC}/tier/sigv4_transport.cpp       # B5   — SigV4 signing decorator (OpenSSL)
+    ${KVCACHE_NODE_SRC}/tier/guarded_transport.cpp     # A10  — egress boundary guard decorator
+    ${KVCACHE_NODE_SRC}/security/boundary_guard.cpp    # A10  — BoundaryGuard (referenced by guarded_transport)
     ${KVCACHE_NODE_SRC}/tier/tier_manager.cpp
 )
 
@@ -290,6 +292,29 @@ kvcache_add_test(test_guarded_transport
                   tier/guarded_transport_test.cpp
                   ${KVCACHE_NODE_SRC}/tier/guarded_transport.cpp
                   ${KVCACHE_NODE_SRC}/security/boundary_guard.cpp)
+
+# A10 — Task 1: BoundaryGuard threaded into the cold-tier factory.
+# Tests that CreateColdTier wraps the native-rest transport in GuardedHttpTransport
+# when opts.guard is set. Links NODE_TIER_SRCS (which now includes
+# guarded_transport.cpp + boundary_guard.cpp). libcurl is required because
+# NODE_TIER_SRCS includes rest_cold_tier.cpp.
+kvcache_add_test(test_cold_tier_guard
+                  tier/cold_tier_guard_test.cpp
+                  ${NODE_TIER_SRCS})
+target_link_libraries(test_cold_tier_guard PRIVATE CURL::libcurl)
+if(KVCACHE_ENABLE_ZSTD)
+    target_link_libraries(test_cold_tier_guard PRIVATE PkgConfig::ZSTD)
+endif()
+if(OpenSSL_FOUND)
+    target_link_libraries(test_cold_tier_guard PRIVATE OpenSSL::Crypto)
+endif()
+if(KVCACHE_ENABLE_CUDA)
+    target_link_libraries(test_cold_tier_guard PRIVATE CUDA::cudart)
+endif()
+if(KVCACHE_ENABLE_SPDK)
+    target_include_directories(test_cold_tier_guard PRIVATE ${SPDK_INCLUDE_DIR})
+    target_link_libraries(test_cold_tier_guard PRIVATE ${SPDK_LINK_LIBS})
+endif()
 
 # A10 — BoundaryDenyObserver: factory that builds a DenyObserver wired to the
 # boundary-deny metric counter and the AuditLog. boundary_deny_observer.h is

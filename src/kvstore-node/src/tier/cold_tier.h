@@ -30,11 +30,14 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
-#include "tier/dram_tier.h"  // DramKey reused as content key
+#include "security/boundary_guard.h"  // BoundaryGuard, Endpoint
+#include "tier/dram_tier.h"           // DramKey reused as content key
 
 namespace kvcache::metrics { class Registry; }  // Phase O-4 — cold metrics
 
@@ -123,6 +126,14 @@ struct ColdTierOptions {
     // OUTERMOST in a MetricsColdTier that records kv_cold_* counters to this
     // registry. nullptr = no metrics (zero overhead).
     metrics::Registry* metrics_registry = nullptr;
+
+    // A10 — Regulated Mode egress guard (optional).
+    // When set, the native-rest backend's HTTP transport is wrapped in a
+    // GuardedHttpTransport so every object-store request is boundary-checked
+    // before dialing. Unset (nullptr) => unchanged behavior (no wrapping).
+    std::shared_ptr<const security::BoundaryGuard> guard;          // default nullptr
+    std::function<void(const security::Endpoint&, std::string_view)>
+                                                   deny_observer;  // default empty
 };
 std::unique_ptr<IColdTier> CreateColdTier(const ColdTierOptions& opts, std::string* err);
 
