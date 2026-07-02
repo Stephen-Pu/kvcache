@@ -5,17 +5,33 @@ namespace kvcache::node::security {
 namespace {
 // A rule's purpose gate: kOther means "any purpose".
 bool PurposeMatches(Purpose rule, Purpose ep) { return rule == Purpose::kOther || rule == ep; }
+
+// Normalize a host or glob for case-insensitive, FQDN-tolerant comparison.
+// - ASCII-lowercases A-Z only (non-ASCII bytes left untouched).
+// - Strips a single trailing '.' (FQDN root label, RFC 4343).
+static std::string Normalize(std::string_view s) {
+    std::string out;
+    out.reserve(s.size());
+    for (unsigned char c : s) {
+        out += (c >= 'A' && c <= 'Z') ? static_cast<char>(c + ('a' - 'A')) : static_cast<char>(c);
+    }
+    if (!out.empty() && out.back() == '.') out.pop_back();
+    return out;
+}
 }  // namespace
 
 bool HostMatchesGlob(std::string_view host, std::string_view glob) {
     if (host.empty() || glob.empty()) return false;
-    if (glob.front() == '*') {
+    const std::string h = Normalize(host);
+    const std::string g = Normalize(glob);
+    if (h.empty() || g.empty()) return false;
+    if (g.front() == '*') {
         // "*.example.com" matches any strict subdomain of example.com.
-        std::string_view suffix = glob.substr(1);  // ".example.com"
-        if (host.size() <= suffix.size()) return false;
-        return host.substr(host.size() - suffix.size()) == suffix;
+        std::string_view suffix(g.data() + 1, g.size() - 1);  // ".example.com"
+        if (h.size() <= suffix.size()) return false;
+        return std::string_view(h).substr(h.size() - suffix.size()) == suffix;
     }
-    return host == glob;  // exact match
+    return h == g;  // exact match
 }
 
 bool IpInCidr(std::string_view ip, std::string_view cidr) {

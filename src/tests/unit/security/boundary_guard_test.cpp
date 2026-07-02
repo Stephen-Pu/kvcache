@@ -74,3 +74,14 @@ TEST(BoundaryGuard, DefaultAllowWhenDefaultDenyFalse) {
     EXPECT_FALSE(g.Check({.host = ""}).allow)
         << "empty host is ALWAYS denied, even with default_deny=false";
 }
+
+TEST(HostMatchesGlob, CaseInsensitiveAndTrailingDot) {
+    EXPECT_TRUE(HostMatchesGlob("S3.GOV.LOCAL", "s3.gov.local"));
+    EXPECT_TRUE(HostMatchesGlob("node.SVC.LOCAL", "*.svc.local"));
+    EXPECT_TRUE(HostMatchesGlob("node.svc.local.", "*.svc.local")) << "trailing dot tolerated";
+    EXPECT_TRUE(HostMatchesGlob("s3.gov.local", "S3.GOV.LOCAL."));   // rule upper + trailing dot
+    // fail-closed invariants must still hold after normalization:
+    EXPECT_FALSE(HostMatchesGlob("example.com", "*.example.com"))   << "apex still rejected";
+    EXPECT_FALSE(HostMatchesGlob("example.com.evil.net", "*.example.com")) << "suffix-confusion still rejected";
+    EXPECT_FALSE(HostMatchesGlob("", "*.svc.local"));
+}
