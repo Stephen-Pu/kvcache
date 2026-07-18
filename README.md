@@ -1,5 +1,7 @@
 # The open data plane for AI state
 
+> **AgentStateStorage** — the unified agent state plane.
+>
 > An AI agent doesn't just answer — it **remembers you across sessions**, **works inside a sandbox**,
 > **calls tools that change the world**, and must **resume a half-finished task after a crash** without
 > redoing them. Beneath every step sit the **KV and checkpoints** that make it affordable to run at all.
@@ -11,7 +13,7 @@
 >
 > **The recompute plane ships today. The memory plane is the frontier no one owns.**
 
-[![CI](https://github.com/Stephen-Pu/kvcache/actions/workflows/ci.yml/badge.svg)](https://github.com/Stephen-Pu/kvcache/actions)
+[![CI](https://github.com/Stephen-Pu/agentStateStorage/actions/workflows/ci.yml/badge.svg)](https://github.com/Stephen-Pu/agentStateStorage/actions)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![C++20](https://img.shields.io/badge/C%2B%2B-20-blue.svg)](https://en.cppreference.com/w/cpp/20)
 [![Go 1.22](https://img.shields.io/badge/Go-1.22+-blue.svg)](https://go.dev/)
@@ -177,7 +179,7 @@ We publish exactly what is built and what is not. This table is the contract, an
 | **Agent long-term memory** | B | — | P3 · durable, governed, vector-indexed, multi-tenant |
 | **Durable execution state** | B | — | P3 · lineage DAG + crash-resume; integrates Temporal-class engines |
 
-✅ shipped · — not yet · P2/P3 roadmap. Full plan: [repositioning proposal](./KV_Cache_到_State_Storage_重定位提案_v0.md).
+✅ shipped · — not yet · P2/P3 roadmap. Full architecture (HLD/LLD) available to active contributors on request.
 
 > **Why publish this?** Because the alternative — an umbrella with no spine and no disclosed edges — is
 > exactly what the hyperscaler narratives are. Our honesty about the boundary *is* the differentiation.
@@ -213,7 +215,7 @@ The recompute-avoidance plane is shipped. The frontier no incumbent owns is the 
 agent's **memory** and its **in-flight execution state** become durable, governed, portable, and
 vendor-neutral. That's the half of "AI state" the market keeps naming and never building openly.
 
-*(The repo is named `kvcache` because KV is the plane we shipped first. The platform is state.)*
+*(KV is the plane we shipped first; the platform — **AgentStateStorage** — is state.)*
 
 ---
 
@@ -225,12 +227,12 @@ decision it implements. **Six verbs, one C ABI** (`lookup / reserve / publish / 
 tier-opaque.
 
 ```bash
-git clone https://github.com/Stephen-Pu/kvcache.git && cd kvcache
+git clone https://github.com/Stephen-Pu/agentStateStorage.git && cd agentStateStorage
 python3 -m venv .venv && source .venv/bin/activate && pip install cffi pytest
 make all      # zero warnings · 210/210 tests pass · ~4 min cold start
 ```
 
-Design principles, API surface, and full setup: [HLD](./KV_Cache_HLD_高阶架构设计.md) · [BUILD.md](./BUILD.md).
+Build & setup: [BUILD.md](./BUILD.md). Design principles and API surface (HLD/LLD) available to active contributors on request.
 
 ---
 
