@@ -1,8 +1,13 @@
 # The open data plane for AI state
 
-> AI shifted from **storing data** to **maintaining state** — KV caches, checkpoints, sandboxes,
-> agent memory, execution state. We treat it as what it actually is: a **distributed memoization layer** —
-> identity-addressed and economically self-aware, multi-tenant and vendor-neutral.
+> An AI agent doesn't just answer — it **remembers you across sessions**, **works inside a sandbox**,
+> **calls tools that change the world**, and must **resume a half-finished task after a crash** without
+> redoing them. Beneath every step sit the **KV and checkpoints** that make it affordable to run at all.
+>
+> All of that is **state** — the context an agent reasons over, the workspace it acts in, the memory it
+> carries, the execution it can't afford to replay. Short-lived or irreplaceable, latency-critical, with
+> no cold tier to fall back on. We treat it as what it is: a **distributed memoization layer** for the
+> state agents run on — identity-addressed, economically self-aware, multi-tenant, vendor-neutral.
 >
 > **The recompute plane ships today. The memory plane is the frontier no one owns.**
 
@@ -42,13 +47,13 @@ flowchart TB
 ## The bottleneck moved. From data to state.
 
 For a decade, infrastructure optimized **data at rest** — store it cheap, keep it forever, tier it cold.
-Then AI stopped answering questions and started **doing work**, and a different kind of data took over:
-**state in motion.**
+Then **agents arrived** — software that acts, remembers, forks sandboxes, and runs for hours — and a
+different kind of data took over: **state in motion.**
 
-KV caches. Checkpoints. Sandboxes. Agent memory. Execution state. Short-lived, latency-critical,
-either reconstructable-at-a-cost or outright irreplaceable — and with **no cold tier to fall back on.**
-A stale checkpoint restored a second late idles a GPU cluster. A missing KV block reruns prefill and
-burns the FLOPs twice. A lost agent memory is gone for good.
+And that state is unforgiving. A **stale checkpoint** restored a second late idles a GPU cluster. A
+**missing KV block** reruns a 100K-token prefill and burns the FLOPs twice. A **crashed agent** that
+can't reload its execution state re-runs tool calls that already charged a card or sent an email. A
+**lost long-term memory** is gone for good — there is no recomputing what a user told you last week.
 
 The industry is scrambling to name this moment — *"State Lake," "context storage," "KV-centric infra."*
 But **every incumbent answer is closed:** welded to one hyperscaler's cloud, or one vendor's silicon.
