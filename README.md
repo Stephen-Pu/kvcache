@@ -176,7 +176,7 @@ We publish exactly what is built and what is not. This table is the contract, an
 | **KV cache** | A | ✅ identity addressing · 5-tier · KV-routing · hard multi-tenancy · vendor-neutral · economic gate *(wired; activation pending cost telemetry)* | — |
 | Sandbox snapshot | A | — | P2 · reuses the spine |
 | Embedding / RAG-chunk | A | — | P2 · reuses the spine |
-| Tool-result memoization | A | — | P2 · idempotent-only |
+| Tool-result memoization | A | — | P2 · idempotent-only · policy + identity landed on the spine (idempotent-gated); engine ingest connector pending |
 | **Agent long-term memory** | B | — | P3 · durable, governed, vector-indexed, multi-tenant |
 | **Durable execution state** | B | — | P3 · lineage DAG + crash-resume; integrates Temporal-class engines |
 

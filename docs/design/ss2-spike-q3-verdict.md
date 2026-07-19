@@ -162,6 +162,30 @@ Not in scope for this spike; tracked as follow-on work:
 
 ---
 
+## Follow-on landed: tool-result generalization (2026-07-19)
+
+The spine was subsequently exercised with a **second real A-class `state_kind`** —
+tool-result memoization — to test the generalization claim beyond the KV+stub pair:
+
+- `StateIdentityForToolResult(tenant, tool_id, args, idempotent)` — `content_hash =
+  hash(tool_id, args)`, `SIF_IDEMPOTENT` per the call's idempotency.
+- `ValuePolicyToolResult::shouldStore` enforces **LLD §2.1c** — a non-idempotent
+  tool result is *never* materialized (the idempotent gate precedes economics) —
+  then applies the same store-vs-recompute economics as KV; `kEvictable` / `kRecompute`.
+- Registered as the **3rd policy** in `HeadlessNode`'s ctor (`SK_TOOL_RESULT`) with
+  **one `registerPolicy` line + one include** and **zero hot-path change**
+  (`headless_node.cpp` unchanged — verified by diff). A 3-way contrast test
+  (KV / tool-result / memory-stub) asserts distinct semantics from one registry.
+  Full suite **534/534**.
+
+This strengthens the Q3 result from "the interface *shape* admits opposite semantics"
+(the KV+stub proof) to "a **second, genuinely different A-class policy** (idempotent
+gate + economics) plugs in with zero spine change." **Still deferred:** the engine-facing
+**ingest connector** (how a runtime actually stores/retrieves a tool result through the
+ABI) — this proved the policy + identity layer, not a wired data path.
+
+---
+
 ## Summary
 
 | Question | Answer |
