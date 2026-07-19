@@ -339,6 +339,9 @@ kvcache_add_test(test_locator           common/locator_test.cpp)
 # needs only kv_types.h + core/common include paths (already provided by
 # kvcache_add_test).
 kvcache_add_test(test_state_identity    common/state_identity_test.cpp)
+# A-plane generalization, Task 1 — StateIdentityForToolResult builder
+# (SK_TOOL_RESULT). Header-only, same include footprint as test_state_identity.
+kvcache_add_test(test_state_identity_toolresult common/state_identity_toolresult_test.cpp)
 # Phase W-2 — canonical FNV-1a-64 golden vectors (cross-language lock).
 kvcache_add_test(test_hashing           common/hashing_test.cpp)
 # SS-2 spine spike, Task 2 — ValuePolicy interface + state_kind-keyed

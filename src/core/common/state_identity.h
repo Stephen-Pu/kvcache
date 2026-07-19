@@ -10,7 +10,9 @@
 
 #include <cstdint>
 #include <cstring>
+#include <string_view>
 
+#include "hashing.h"           // Fnv1a64 (leaf header, no cycle)
 #include "kvcache/kv_types.h"  // kv_locator_t (frozen 64B, C ABI)
 
 namespace kvcache::common {
@@ -73,6 +75,34 @@ inline StateIdentity StateIdentityFromLocator(const kv_locator_t& loc) {
     constexpr size_t kCopyLen =
         sizeof(loc.range) <= sizeof(id.shape) ? sizeof(loc.range) : sizeof(id.shape);
     std::memcpy(id.shape, &loc.range, kCopyLen);
+
+    return id;
+}
+
+// Tool-result memoization projection (A-plane generalization, Task 1):
+// build a StateIdentity for a tool-result memoization entry. content_hash =
+// Fnv1a64(tool_id) folded with Fnv1a64(args) (LLD §2.1b: hash(tool_id,
+// params)); state_kind = SK_TOOL_RESULT; SIF_IDEMPOTENT set iff `idempotent`.
+// tenant_id_lo carries the tenant. recipe_ref = 0 (trivial, identity ≈
+// lineage — matches the KV projection's convention).
+inline StateIdentity StateIdentityForToolResult(uint64_t tenant_id_lo,
+                                                 std::string_view tool_id,
+                                                 std::string_view args,
+                                                 bool idempotent) {
+    StateIdentity id{};
+    id.version      = 2;
+    id.state_kind   = SK_TOOL_RESULT;
+    id.flags        = idempotent ? SIF_IDEMPOTENT : 0;
+    id.tenant_id_lo = tenant_id_lo;
+
+    // content_hash = hash(tool_id, args). Fnv1a64 each, write both into the
+    // 32-byte content_hash (BLAKE3 is the deferred production hash).
+    uint64_t h_tool = Fnv1a64(tool_id);
+    uint64_t h_args = Fnv1a64(args);
+    std::memcpy(id.content_hash,      &h_tool, sizeof(h_tool));   // [0..8)
+    std::memcpy(id.content_hash + 8,  &h_args, sizeof(h_args));   // [8..16)
+
+    id.recipe_ref = 0;
 
     return id;
 }
