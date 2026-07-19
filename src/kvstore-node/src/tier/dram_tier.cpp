@@ -174,59 +174,66 @@ void DramTier::EvictToFit(std::size_t incoming_bytes) {
     while (!a1in_.empty() &&
            a1in_bytes_used_ + incoming_bytes > a1in_capacity_) {
         // kNotEvictable is demote-only (this tier has no colder-tier
-        // handoff of its own — TierManager handles cross-tier demotion),
-        // so we stop this eviction pass rather than discard the victim.
-        // Unreached today: ValuePolicyKv::shouldEvict always returns
-        // kEvictable, so the SAME victims are evicted as before this seam.
-        //
-        // NOTE(B-plane follow-on): `break` (stop this eviction pass) is
-        // deliberate, NOT `continue`. This loop always re-inspects the SAME
-        // unadvanced tail entry (a1in_.back()) — a bare `continue` here
-        // would re-check the identical non-evictable entry forever
-        // (infinite loop). When B-class NOT_EVICTABLE entries can actually
-        // land in DRAM, this needs a real scan restructure (walk toward the
-        // front for the first evictable candidate + a termination
-        // condition, or a demotion hand-off), not a keyword swap. Unreached
-        // today (KV -> kEvictable).
-        if (IsNotEvictable(a1in_.back())) break;
-        // Evict the FIFO tail of A1in into the ghost queue.
-        const Entry& victim = a1in_.back();
-        const DramKey evicted_key = victim.key;
-        a1in_bytes_used_ -= victim.data.size();
-        GhostInsert(victim.key);
-        index_.erase(victim.key);
-        a1in_.pop_back();
+        // handoff of its own — TierManager handles cross-tier demotion), so
+        // we walk tail-to-front skipping NOT_EVICTABLE entries and evict
+        // the first evictable one found; if a full pass finds nothing
+        // evictable, the loop stops (capacity intentionally unsatisfied)
+        // rather than spinning. When every entry is evictable (KV path,
+        // ValuePolicyKv::shouldEvict is unconditionally kEvictable), the
+        // walk finds a1in_.back() immediately, so the victim + order are
+        // byte-identical to the previous pop_back()-only behavior.
+        auto it = a1in_.end();
+        bool found = false;
+        while (it != a1in_.begin()) {
+            --it;
+            if (!IsNotEvictable(*it)) { found = true; break; }
+        }
+        if (!found) break;  // nothing evictable this pass → stop, no hang
+        const DramKey evicted_key = it->key;
+        a1in_bytes_used_ -= it->data.size();
+        GhostInsert(it->key);
+        index_.erase(it->key);
+        a1in_.erase(it);
         if (on_evict_) on_evict_(evicted_key);
     }
     // Now ensure overall capacity is honored. Prefer evicting from Am tail
     // (true LRU) once A1in is at its budget.
     while (a1in_bytes_used_ + am_bytes_used_ + incoming_bytes > capacity_bytes_) {
-        // NOTE(B-plane follow-on): `break` here is deliberate, NOT
-        // `continue`, for the same reason as the A1in loop above. This
-        // loop always re-inspects the SAME unadvanced tail entry
-        // (am_.back(), or a1in_.back() once am_ is empty) — a bare
-        // `continue` would spin on the identical non-evictable entry
-        // forever (infinite loop). Needs a real scan restructure (walk
-        // toward the front for the first evictable candidate + a
-        // termination condition, or a demotion hand-off) when B-class
-        // NOT_EVICTABLE entries can actually land in DRAM, not a keyword
-        // swap. Unreached today (KV -> kEvictable).
+        // Prefer evicting from Am tail (true LRU) once A1in is at its
+        // budget, falling back to A1in once Am is empty. Within whichever
+        // queue is being considered, walk tail-to-front skipping
+        // NOT_EVICTABLE entries and evict the first evictable one found.
+        // A full pass with nothing evictable stops the loop (capacity
+        // intentionally unsatisfied) rather than spinning. When every
+        // entry is evictable (KV path), the walk finds the tail
+        // immediately, so victim + order are byte-identical to the
+        // previous pop_back()-only behavior.
         if (!am_.empty()) {
-            if (IsNotEvictable(am_.back())) break;  // see note above
-            const Entry& victim = am_.back();
-            const DramKey evicted_key = victim.key;
-            am_bytes_used_ -= victim.data.size();
-            index_.erase(victim.key);
-            am_.pop_back();
+            auto it = am_.end();
+            bool found = false;
+            while (it != am_.begin()) {
+                --it;
+                if (!IsNotEvictable(*it)) { found = true; break; }
+            }
+            if (!found) break;  // nothing evictable in Am → stop, no hang
+            const DramKey evicted_key = it->key;
+            am_bytes_used_ -= it->data.size();
+            index_.erase(it->key);
+            am_.erase(it);
             if (on_evict_) on_evict_(evicted_key);
         } else if (!a1in_.empty()) {
-            if (IsNotEvictable(a1in_.back())) break;  // see note above
-            const Entry& victim = a1in_.back();
-            const DramKey evicted_key = victim.key;
-            a1in_bytes_used_ -= victim.data.size();
-            GhostInsert(victim.key);
-            index_.erase(victim.key);
-            a1in_.pop_back();
+            auto it = a1in_.end();
+            bool found = false;
+            while (it != a1in_.begin()) {
+                --it;
+                if (!IsNotEvictable(*it)) { found = true; break; }
+            }
+            if (!found) break;  // nothing evictable in A1in → stop, no hang
+            const DramKey evicted_key = it->key;
+            a1in_bytes_used_ -= it->data.size();
+            GhostInsert(it->key);
+            index_.erase(it->key);
+            a1in_.erase(it);
             if (on_evict_) on_evict_(evicted_key);
         } else {
             break;  // nothing left to evict
