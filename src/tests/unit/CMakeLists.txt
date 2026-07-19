@@ -352,6 +352,15 @@ kvcache_add_test(test_value_policy_registry policy/value_policy_registry_test.cp
 kvcache_add_test(test_value_policy_kv
                   policy/value_policy_kv_test.cpp
                   ${CMAKE_SOURCE_DIR}/core/common/value_policy_kv.cpp)
+
+# SS-2 spine spike, Task 4 — the Q3 validation core: one ValuePolicyRegistry
+# admits two OPPOSITE-semantics policies (ValuePolicyKv = A-class,
+# ValuePolicyPersistentStub = B-class, header-only) with one-line
+# registration each and zero spine change. Links value_policy_kv.cpp for the
+# A-side implementation; the B-side stub is header-only.
+kvcache_add_test(test_value_policy_ab_contrast
+                  policy/value_policy_ab_contrast_test.cpp
+                  ${CMAKE_SOURCE_DIR}/core/common/value_policy_kv.cpp)
 kvcache_add_test(test_node_runtime      runtime/node_runtime_test.cpp
                  ${KVCACHE_NODE_SRC}/runtime/node_runtime.cpp
                  ${KVCACHE_NODE_SRC}/security/regulated_mode.cpp
