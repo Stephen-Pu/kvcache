@@ -12,6 +12,7 @@ add_library(kvcache_common STATIC
     value_policy_tool_result.cpp  # A-plane generalization, Task 3 — headless_node
                                    # registers SK_TOOL_RESULT -> ValuePolicyToolResult,
                                    # so it must resolve the same way ValuePolicyKv does.
+    value_policy_persistent_wal.cpp  # B-ingest — production SK_MEMORY policy
 )
 
 # Sibling lib that ships the OTLP/HTTP exporter (Phase J-2). Kept out of

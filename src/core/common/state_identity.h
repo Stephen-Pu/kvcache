@@ -8,6 +8,7 @@
 // wire struct or the FFI boundary.
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <string_view>
@@ -105,6 +106,15 @@ inline StateIdentity StateIdentityForToolResult(uint64_t tenant_id_lo,
     id.recipe_ref = 0;
 
     return id;
+}
+
+// Project a StateIdentity to a 16-byte content-addressed key (first 16 bytes
+// of content_hash). Node code copies this into a tier::DramKey. Mirrors the KV
+// LocatorContentKey projection but for the generalized identity.
+inline std::array<uint8_t, 16> StateKeyBytesFromIdentity(const StateIdentity& id) {
+    std::array<uint8_t, 16> k{};
+    std::memcpy(k.data(), id.content_hash, 16);
+    return k;
 }
 
 }  // namespace kvcache::common

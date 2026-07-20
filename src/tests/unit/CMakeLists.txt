@@ -389,6 +389,13 @@ kvcache_add_test(test_value_policy_ab_contrast
 # by kvcache_add_test), so it is not compiled as an extra source here.
 kvcache_add_test(test_value_policy_three_way_contrast
                   policy/value_policy_three_way_contrast_test.cpp)
+
+# B-ingest, Task 2 — StateKeyBytesFromIdentity (pure key projection, header-only
+# in state_identity.h) + ValuePolicyPersistentWal (production SK_MEMORY B-class
+# policy; value_policy_persistent_wal.cpp lives in kvcache_common, linked by
+# kvcache_add_test).
+kvcache_add_test(test_value_policy_persistent_wal
+                  policy/value_policy_persistent_wal_test.cpp)
 kvcache_add_test(test_node_runtime      runtime/node_runtime_test.cpp
                  ${KVCACHE_NODE_SRC}/runtime/node_runtime.cpp
                  ${KVCACHE_NODE_SRC}/security/regulated_mode.cpp
