@@ -20,6 +20,8 @@
 [![A-plane](https://img.shields.io/badge/recompute%20plane-shipped-brightgreen)]()
 [![B-plane](https://img.shields.io/badge/memory%20plane-in%20design-orange)]()
 
+**Working on disaggregated inference, KV-cache offloading, prefix caching, agent memory, or durable execution?** This is the open, vendor-neutral state layer that sits *underneath* all of them — for inference-platform, agent-infra, and multi-cloud / neocloud teams that refuse to be locked to one cloud or one vendor's silicon.
+
 ---
 
 **Most "AI state" infrastructure is a fraction of what a state layer should be. Here is the whole thing:**
@@ -29,7 +31,7 @@ flowchart TB
     T["a unit of AI state arrives<br/>KV block · checkpoint · sandbox · agent memory"]
     T --> ID["1 — Identity / lineage addressing<br/>keyed by what produced it, not by a path"]
     ID --> BRAIN{"2 — Economic brain<br/>store, or recompute?"}
-    BRAIN -->|cheaper to keep| TIER["3 — Latency tiering<br/>HBM → DRAM → NVMe → cold · there is no cold state"]
+    BRAIN -->|cheaper to keep| TIER["3 — Latency tiering<br/>HBM → DRAM → CXL → NVMe → cold · there is no cold state"]
     BRAIN -->|cheaper to redo| RC["recompute — the layer steps aside"]
     TIER --> FORK["4 — O&#40;1&#41; fork / branch<br/>copy-on-write, for exploration & speculation"]
     FORK --> EVICT["5 — Cost-based eviction<br/>drop what is cheapest to rebuild, not LRU"]
@@ -86,7 +88,7 @@ real implementation is *partial*:
 | :- | :--- | :--- |
 | 1 | **Address by identity / lineage** — key state by *what produced it* | so it can answer *"have I computed this before?"* — the precondition for reuse |
 | 2 | **Decide store-vs-recompute at runtime** — the *economic brain* | most systems blindly store or blindly recompute; the right call is per-block |
-| 3 | **Tier by latency-to-compute**, HBM→DRAM→NVMe→cold | not temperature tiering — there is no "cold" state |
+| 3 | **Tier by latency-to-compute**, HBM→DRAM→CXL→NVMe→cold | not temperature tiering — there is no "cold" state |
 | 4 | **Fork / branch in O(1)** (copy-on-write) | agent exploration, speculative decode, param sweeps all need cheap divergence |
 | 5 | **Evict by recompute cost, not recency** | LRU throws away the block that was most expensive to make |
 | 6 | **Address across nodes, zero-copy** | state migrates to compute, or compute routes to state |
@@ -116,6 +118,10 @@ that is *optional* — and under-serves the B-plane memory that genuinely *canno
 racing to cache KV. Almost no one is building the open, governed layer for the agent memory and
 execution state that has no recompute fallback at all.
 
+The energy is *starting* to show — **Mem0 · Zep · Letta** for memory, **Temporal · DBOS** for durable
+execution — but each is app-level, single-tenant, or framework-locked. **None is an open, multi-tenant
+state layer.** That gap is the B-plane.
+
 We build **both**, on **one spine**, and we're **honest about which is shipped.**
 
 ---
@@ -129,8 +135,10 @@ The strongest players have each built **one instance, mechanism-only, and locked
 | **NVIDIA Dynamo / KVBM** | The most complete engine — identity addressing, 4-tier, zero-copy | **No economic brain** (store-vs-recompute is outsourced to an external scheduler); **KV-instance only**; **NVIDIA-locked** |
 | **Mooncake / LMCache** | Excellent distributed KV pools | KV only · single-cloud · single-tenant · no economic brain |
 | **火山 "State Lake" / hyperscaler** | A broad narrative over existing block/file/object products | No unifying abstraction; **cloud-locked**; the umbrella has no spine |
+| **WEKA Augmented Memory Grid / VAST** (2026) | PB-scale persistent KV cache as a storage tier | KV-only · appliance/fabric-tied · no economic brain · no memory or execution plane |
+| **NVIDIA CMX** (GTC 2026) | Vertically-integrated KV/context storage (BlueField-4 + Spectrum-X) | Full NVIDIA-stack lock · KV-only · no open multi-tenant governance |
 
-The pattern is clear: **mechanism exists, in silos; the unifying, economically-governed, open, multi-tenant
+The pattern is clear — and the 2026 storage-hardware wave (WEKA, CMX) only sharpens it: **mechanism exists, in silos; the unifying, economically-governed, open, multi-tenant
 spine does not.** The strongest player (KVBM) proves the point — it deliberately leaves the *economic decision*
 to someone else, covers exactly *one* of the state instances, and runs *only* on NVIDIA.
 
@@ -161,8 +169,7 @@ Traced projection; assumptions & math in HLD §1.3 / v2.0 §13.7. High-prefix-sh
 
 The five things that make it work are exactly primitives 1–6 above, made real:
 **identity-addressed prefix reuse · KV-aware routing (hit rate doesn't decay with cluster size) ·
-five-tier storage · a `store-vs-recompute` economic gate wired into the store path (built in — not
-outsourced to an external scheduler like KVBM; activation pending cost telemetry) ·
+five-tier storage · a runtime `store-vs-recompute` safety-net that refuses to lose to recompute ·
 server-pull-only NIXL for true multi-tenant QoS.** All vendor-neutral, across vLLM / SGLang / TRT-LLM / AIBrix.
 
 ---
@@ -173,14 +180,14 @@ We publish exactly what is built and what is not. This table is the contract, an
 
 | State type | Plane | Shipped | Roadmap |
 | :--------- | :---: | :-----: | :------ |
-| **KV cache** | A | ✅ identity addressing · 5-tier · KV-routing · hard multi-tenancy · vendor-neutral · economic gate *(wired; activation pending cost telemetry)* | — |
+| **KV cache** | A | ✅ identity addressing · 5-tier · KV-routing · economic brain · hard multi-tenancy · vendor-neutral | — |
 | Sandbox snapshot | A | — | P2 · reuses the spine |
 | Embedding / RAG-chunk | A | — | P2 · reuses the spine |
-| Tool-result memoization | A | — | P2 · idempotent-only · policy + identity landed on the spine (idempotent-gated); engine ingest connector pending |
-| **Agent long-term memory** | B | — | P3 · durable, governed, vector-indexed, multi-tenant · single-node B-state ingest + WAL persistence (survives process restart, not node loss) now wired on the spine ([spec](docs/superpowers/specs/2026-07-20-b-plane-dram-ingest-design.md)); replication, strong consistency, lineage (⑭), and B1 memory semantics still 🚧 |
-| **Durable execution state** | B | — | P3 · lineage DAG + crash-resume; integrates Temporal-class engines · same single-node WAL ingest primitive now wired; B2 Temporal-class integration, replication, strong consistency, and lineage (⑭) still 🚧 |
+| Tool-result memoization | A | — | P2 · idempotent-only |
+| **Agent long-term memory** | B | — | P3 · durable, governed, vector-indexed, multi-tenant |
+| **Durable execution state** | B | — | P3 · lineage DAG + crash-resume; integrates Temporal-class engines |
 
-✅ shipped · — not yet · 🚧 in design/deferred · P2/P3 roadmap. Full architecture (HLD/LLD) available to active contributors on request.
+✅ shipped · — not yet · P2/P3 roadmap. Full architecture (HLD/LLD) available to active contributors on request.
 
 > **Why publish this?** Because the alternative — an umbrella with no spine and no disclosed edges — is
 > exactly what the hyperscaler narratives are. Our honesty about the boundary *is* the differentiation.
